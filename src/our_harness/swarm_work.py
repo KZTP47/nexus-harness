@@ -47,6 +47,7 @@ from .models import (
 from .safety import confined_path
 from .redaction import bounded_redacted_text
 from .research_tools import RESEARCH_TOOL_DEFINITIONS, RESEARCH_INSTRUCTIONS
+from .harness_tools import TOOL_DEFINITIONS as HARNESS_TOOL_DEFINITIONS
 from .swarm import SwarmError, may_they_talk
 from .verification import analyze_verification
 from .windows_containment import (
@@ -459,7 +460,7 @@ WORK_FORMAT = ResponseFormat("nexus_board_file_work_v1", {
                         "run_selected_verification", {}, [],
                     ),
                     *[_context_tool_call_schema(one["name"], copy.deepcopy(one["input_schema"]["properties"]),
-                        list(one["input_schema"]["required"])) for one in RESEARCH_TOOL_DEFINITIONS],
+                        list(one["input_schema"]["required"])) for one in [*RESEARCH_TOOL_DEFINITIONS, *HARNESS_TOOL_DEFINITIONS]],
                 ],
             },
         },
@@ -9679,6 +9680,7 @@ class _ProjectContextTools:
         reset_execution_budget: bool = False,
         verification_profile: str = "legacy",
         attachments: list[dict[str, Any]] | None = None,
+        git_root: Path | None = None,
     ) -> None:
         data = copy.deepcopy(config.data)
         if verification_profile == "shared_goal_v1" and config.project_root.resolve() != root.resolve():
@@ -9743,6 +9745,7 @@ class _ProjectContextTools:
             },
             prepare_tool=self._prepare_tool,
             attachments=attachments,
+            git_root=git_root,
         )
         # Long-horizon prompt projections retain 12,000 characters per string.
         # Size each file page before serializing so that projection cannot cut

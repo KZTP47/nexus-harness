@@ -346,7 +346,7 @@ if __name__ == '__main__': unittest.main()
     "trust_project_local_config(root)", "project_identity(root)"].join("; "), project],
   {cwd:project, env:environment, encoding:"utf8", timeout:60_000});
   assert.equal(trust.status, 0, trust.stderr || trust.stdout);
-  return {node, browser, playwrightRoot};
+  return {python, node, browser, playwrightRoot};
 }
 
 async function until(read, description, timeout = TIMEOUT) {
@@ -709,6 +709,9 @@ async function main() {
   for(const directory of [project,testProject,coordination,profile])fs.mkdirSync(directory);
   const environment=isolatedEnvironment(profile);
   const bundled=fixture(exe,project,coordination,environment);
+  execute(bundled.python,[path.resolve(__dirname,"../scripts/verify_packaged_toolbox.py"),
+    path.join(path.dirname(exe),"resources","harness","src")],project,environment);
+  console.log("pass  packaged Nexus toolbox, full-access review fallback and interrupted-command recovery");
   const exactAnswer=`  ${project}\nhttps://Example.test/Case%2fKept?q=AbC%2Fz&mode=Play#Chapter-2  `;
   fs.writeFileSync(path.join(coordination,"expected-answer.txt"),exactAnswer,"utf8");
   const protocolFault=process.env.NEXUS_TEAM_PROTOCOL_FAULT === "1";

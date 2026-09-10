@@ -56,6 +56,7 @@ from . import goal_closeout
 from . import workspace_collaboration as collaboration
 from . import agent_workspaces
 from . import goal_access
+from . import goal_tools
 from . import goal_recovery
 from . import collaboration_reply
 from .windows_containment import VERIFICATION_RUNTIME_CONTRACT
@@ -204,6 +205,11 @@ AGENT_ACTION_FORMAT.schema["properties"]["tool_calls"]["items"]["anyOf"].append(
         "offset": {"type": "integer", "minimum": 0},
         "limit": {"type": "integer", "minimum": 1, "maximum": 20_000},
     }, ["path"])
+)
+AGENT_ACTION_FORMAT.schema["properties"]["tool_calls"]["items"]["anyOf"].extend(
+    swarm_work._context_tool_call_schema(one["name"], copy.deepcopy(one["input_schema"]["properties"]),
+                                        list(one["input_schema"]["required"]))
+    for one in goal_tools.DEFINITIONS
 )
 
 for _field, _description in {
@@ -783,7 +789,8 @@ def _project_baseline_manifest(root: Path) -> dict[str, str]:
 def _context_binding(document: dict[str, Any], baseline: dict[str, str] | None = None) -> dict[str, Any]:
     manifest = baseline if baseline is not None else _project_baseline_manifest(_execution_root(document))
     return {
-        "schema_version": 6, "objective_epoch": int(document.get("objective_epoch") or 1),
+        "schema_version": 7, "objective_epoch": int(document.get("objective_epoch") or 1),
+        "toolbox_contract": goal_tools.CONTRACT,
         "verification_runtime_contract": VERIFICATION_RUNTIME_CONTRACT,
         "verification_observation_contract": "json-safe-runner-errors-and-explicit-resume-freshness/v1",
         "verification_observation_epoch": int(document.get("verification_observation_epoch") or 0),
@@ -5634,6 +5641,9 @@ class GoalStore(goal_access.AccessStoreMixin):
                     or current["state"] not in {"running", "pending_apply"}:
                 raise HarnessError("The task lease changed before risk review")
             effect_id = str(current.get("provider_effect_id") or "")
+            if not goal_access.review_fallback_current(document, current, self._review_packet_sha256(current, action)):
+                current.pop("review_approved_effect_id", None)
+                current.pop("full_access_review", None)
             approved = bool(effect_id) and str(current.get("review_approved_effect_id") or "") == effect_id
             needed = (not approved) and (
                 str(action.get("action") or "") == "request_review"
@@ -5702,6 +5712,12 @@ class GoalStore(goal_access.AccessStoreMixin):
                 document["note"] = "Risky proposed work is awaiting independent review before file mutation."
                 return True
 
+            receipt = goal_access.authorize_review_fallback(document, current, packet_sha)
+            if receipt is not None:
+                self._event(db, document, "full_access_review_fallback", task_id=current["id"],
+                            agent_id=current["assigned_agent_id"], payload=receipt)
+                return False
+
             question = user_questions.normalize([{
                 "id": "review-without-independent-agent",
                 "prompt": "This proposed change is high risk, but no independent reviewer is available. Continue using deterministic checks only?",
@@ -5763,6 +5779,46 @@ class GoalStore(goal_access.AccessStoreMixin):
 
         document, staged = self._mutate(goal_id, change)
         return bool(staged), interrupt_ids
+
+    def _recover_full_access_reviews(self, document, db):
+        if goal_access.state(document)["mode"] != "full" or document.get("status") != "waiting_for_user":
+            return False
+        recovered = False
+        for item in document.get("interrupts", []):
+            if item.get("state") != "pending" or item.get("purpose") != "risk_review":
+                continue
+            task = next((one for one in document["tasks"] if one["id"] == item.get("task_id")), None)
+            if not task or task.get("state") != "waiting_review" or not task.get("pending_action") \
+                    or task.get("pending_transaction") or task.get("outcome_unknown"):
+                continue
+            packet = self._review_packet_sha256(task, task["pending_action"])
+            if packet != item.get("review_packet_sha256") or packet != task.get("review_packet_sha256"):
+                continue
+            receipt = goal_access.authorize_review_fallback(document, task, packet)
+            if receipt is None:
+                continue
+            item.update(state="superseded", resolved_ms=_now(), resolution=goal_access.REVIEW_CONTRACT)
+            task["state"] = "pending_apply"
+            self._event(db, document, "full_access_review_fallback", task_id=task["id"],
+                        agent_id=task["assigned_agent_id"], payload={**receipt, "interrupt_id": item["id"]})
+            recovered = True
+        if recovered and not any(one.get("state") == "pending" for one in document.get("interrupts", [])):
+            document["status"] = "queued"
+            document["note"] = "Full access already authorizes this proposal. Nexus is continuing with deterministic checks."
+            if not _automatic_recovery_suppressed(document):
+                queue = document.get("project_queue") or {}
+                document["project_queue"] = self._queue_record("owner", _now(),
+                    queued_ms=int(queue.get("queued_ms") or 0), promoted_ms=int(queue.get("promoted_ms") or 0),
+                    auto_start_pending=True)
+        return recovered
+
+    def recover_full_access_reviews(self, goal_id):
+        def change(document, db):
+            if self._scheduler_live(document) or _automatic_recovery_suppressed(document):
+                return False
+            return self._recover_full_access_reviews(document, db)
+        document, recovered = self._mutate(goal_id, change)
+        return document, recovered
 
     def apply_action(
         self, goal_id: str, task: dict[str, Any], action: dict[str, Any],
@@ -6151,7 +6207,8 @@ class GoalStore(goal_access.AccessStoreMixin):
         if task.get("kind") == "review":
             return False
         if task.get("provider_effect_id") and str(task.get("review_approved_effect_id") or "") \
-                == str(task.get("provider_effect_id") or ""):
+                == str(task.get("provider_effect_id") or "") and goal_access.review_fallback_current(
+                    document, task, GoalStore._review_packet_sha256(task, action)):
             return False
         threshold = str(document.get("policy", {}).get("review_risk") or "high")
         levels = {"low": 0, "medium": 1, "high": 2, "critical": 3}
@@ -8271,7 +8328,11 @@ class LongHorizonRuntime:
             + "\n\nCURRENT WHOLE GOAL\n" + goal["objective"]
             + "\n\nAGENT ACCESS\n" + goal_access.state(goal)["mode"]
             + ": read_only permits inspection only; ask permits edits and requests new command approval; full permits project edits and commands. "
-              "Nexus enforces this setting. A command permission block opens a card for the user; do not repeatedly retry it or treat conversational text as an engine grant."
+              "Nexus enforces this setting. Full access already authorizes the requested project work: proceed without asking again to edit, run commands, or continue without a reviewer. Use provider-native tools when available; Nexus tools supplement them. Ask only for missing task information or genuinely new authority outside the saved grant. A command permission block opens a card for the user; do not repeatedly retry it or treat conversational text as an engine grant."
+            + "\n\nNEXUS TOOLBOX\n" + _canonical([
+                {"name": one["name"], "description": one["description"]}
+                for one in [*swarm_work.HARNESS_TOOL_DEFINITIONS, *goal_tools.DEFINITIONS]
+            ])
             + "\n\nSUCCESS CRITERIA\n- " + "\n- ".join(goal["success_criteria"])
             + "\n\nCURRENT CONCRETE TASK\n" + task["description"]
             + goal_closeout.repair_context(goal, task)
@@ -8317,8 +8378,8 @@ class LongHorizonRuntime:
               "test the launch URL/protocol actually recommended to the user and inspect console/network failures; "
               "a served page and a file:// page are not equivalent. Checks must exercise production behavior, not just "
               "assert that source text or files exist. Read every relevant truncated file through its remaining offsets. "
-              "Use the tools exposed for this turn: this structured Nexus route does not itself provide an interactive "
-              "browser or arbitrary shell. Do not imply that reading HTML/JavaScript or run_selected_verification with "
+              "Use the tools exposed for this turn. Full-access writers can use Nexus run_command in their private copy, "
+              "including installed shell/code/browser tooling, alongside provider-native tools. Do not imply that reading HTML/JavaScript or run_selected_verification with "
               "no commands launched the app. Author runnable checks using the approved project-verification mechanism; "
               "state any remaining visual/runtime observation that the available tools cannot establish. "
               "For local browser deliverables, Nexus's bundled Chromium can execute a contained Playwright subset "
@@ -8334,7 +8395,7 @@ class LongHorizonRuntime:
               "unsupported observations and check dependencies; do not silently substitute HTTP evidence for file://. "
             + "\n\nChoose only the next useful action. " + team_guidance
             + "\n\nACTION FIELD RULES\n" + action_protocol.RULES + "\n"
-            + "Request review only for meaningful risk, broad changes, failed checks, or when you need it. Ask the user only for genuine ambiguity, new authority, risky/irreversible action, missing access, or an unresolved blocker. "
+            + "Request review only for meaningful risk, broad changes, failed checks, or when you need it. Ask the user only for genuine ambiguity, new authority beyond the saved access, missing access, or an unresolved blocker that requires their input. Full access already covers the requested project edits and commands; do not ask for that permission again. "
               "Keep the conversation grounded in useful actions and evidence."
         )
 
@@ -8557,6 +8618,7 @@ class LongHorizonRuntime:
                         project_tools_authority,
                         current_goal["objective"], changed_paths, None,
                         attachments=current_goal.get("input_provider_attachments") or [],
+                        git_root=Path(current_goal["project"]["path"]),
                         **({"verification_profile": "shared_goal_v1"}
                            if current_goal.get("require_all_participants") else {}),
                     )
@@ -8573,9 +8635,22 @@ class LongHorizonRuntime:
                         continue
                     if continuation_route() != "continue":
                         return False
-                    self.store.reserve_context_tool(goal_id, task, call)
+                    first_execution = self.store.reserve_context_tool(goal_id, task, call)
                     try:
-                        if str(call.get("name") or "") in collaboration.TOOLS:
+                        if str(call.get("name") or "") in goal_tools.NAMES:
+                            current_authority = self.store.get(goal_id)
+                            if not first_execution:
+                                result = {"status": "outcome_unknown", "executed_again": False,
+                                          "reason": "This effectful call was reserved before interruption. Inspect the saved private copy and command effects before choosing a new call; Nexus did not replay it."}
+                            elif not agent_workspace or goal_access.state(current_authority)["mode"] != "full" \
+                                    or not collaboration.can_write(current_authority, task):
+                                result = {"status": "unavailable", "reason": "This execution tool requires saved Full project access and the writer's private working copy. Use inspection tools within the current grant."}
+                            else:
+                                try:
+                                    result = goal_tools.execute(self.config, root, call["name"], call.get("arguments", {}))
+                                except (HarnessError, OSError, ValueError) as exc:
+                                    result = {"status": "error", "reason": str(exc), "executed_again": False}
+                        elif str(call.get("name") or "") in collaboration.TOOLS:
                             try:
                                 result = collaboration.execute(self, self.store.get(goal_id), task, call["name"], call.get("arguments") or {})
                             except (HarnessError, OSError) as exc:
@@ -9370,6 +9445,9 @@ class LongHorizonRuntime:
         for goal in self.store.active_authority_goals():
             if goal["status"] == "waiting_for_project":
                 continue
+            goal, access_recovered = self.store.recover_full_access_reviews(goal["goal_id"])
+            if access_recovered:
+                recovered.append(goal)
             if goal["status"] == "cancelling":
                 if self.store._scheduler_live(goal):
                     continue

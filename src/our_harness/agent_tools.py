@@ -33,6 +33,7 @@ from .programmatic_workspace import (
 from .runstate import canonical_json, canonical_json_sha256
 from .safety import confined_path
 from .research_tools import RESEARCH_TOOL_DEFINITIONS, RESEARCH_TOOL_NAMES, RESEARCH_CONTRACT, ResearchTools
+from .harness_tools import TOOL_DEFINITIONS as HARNESS_TOOL_DEFINITIONS, TOOL_NAMES as HARNESS_TOOL_NAMES, CONTRACT as HARNESS_TOOL_CONTRACT, HarnessTools
 from .staged_coding import StagedCandidate, StagedCodingWorkspace, TextReplacement
 
 
@@ -103,6 +104,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
 
 
 TOOL_DEFINITIONS.extend(RESEARCH_TOOL_DEFINITIONS)
+TOOL_DEFINITIONS.extend(HARNESS_TOOL_DEFINITIONS)
 
 TEAM_TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
@@ -373,6 +375,7 @@ class AgentToolSession:
         extra_read_only_tools: dict[str, Callable[[object], dict[str, Any]]] | None = None,
         prepare_tool: Callable[[str, object, Deadline], None] | None = None,
         attachments: list[dict[str, Any]] | None = None,
+        git_root: Path | None = None,
     ):
         self.config = config
         self.memory = memory
@@ -380,6 +383,7 @@ class AgentToolSession:
         self.emit = emit
         self.run_id = run_id
         self.root = config.project_root.resolve()
+        self.git_root = git_root.resolve() if git_root is not None else self.root
         self.research_tools = ResearchTools(self.root, read_project=self._stable_regular_bytes, attachments=attachments)
         self.ignore_policy = IgnorePolicy(self.root, set(config.get("project.ignore", [])))
         self.max_calls = int(config.get("workflow.max_tool_calls"))
@@ -604,8 +608,10 @@ class AgentToolSession:
         scope_prefix = canonical_json([TOOL_IDENTITY_CONTRACT, node, execution_scope]) + "\n" if execution_scope else ""
         research_contract = [RESEARCH_CONTRACT, str(self.root), self.config.get("project.max_file_bytes"),
                              self.per_call_bytes, self.read_file_output_bytes]
-        if name in RESEARCH_TOOL_NAMES:
+        if name in RESEARCH_TOOL_NAMES | HARNESS_TOOL_NAMES:
             scope_prefix += canonical_json(research_contract) + "\n"
+        if name in HARNESS_TOOL_NAMES:
+            scope_prefix += canonical_json([HARNESS_TOOL_CONTRACT, str(self.git_root), self.config.get("mcp.servers", []), node, call_id]) + "\n"
         cache_key = hashlib.sha256(
             f"{scope_prefix}{nonce}\n{capability_node}\n{volatile_call_id}\n{name}\n{canonical_arguments}".encode("utf-8")
         ).hexdigest()
@@ -618,8 +624,10 @@ class AgentToolSession:
             canonical_json([TOOL_IDENTITY_CONTRACT, node, execution_scope, call_id]).encode("utf-8")
         ).hexdigest() if execution_scope else legacy_call_id_digest
         arguments_sha256 = hashlib.sha256(canonical_arguments.encode("utf-8")).hexdigest()
-        if name in RESEARCH_TOOL_NAMES:
+        if name in RESEARCH_TOOL_NAMES | HARNESS_TOOL_NAMES:
             arguments_sha256 = canonical_json_sha256([research_contract, arguments])
+        if name in HARNESS_TOOL_NAMES:
+            arguments_sha256 = canonical_json_sha256([HARNESS_TOOL_CONTRACT, str(self.git_root), research_contract, self.config.get("mcp.servers", []), arguments])
         call_id_collision = (
             binding_key in self.call_ids and self.call_ids[binding_key] != cache_key
         ) or (
@@ -899,6 +907,8 @@ class AgentToolSession:
         return content, byte_count, truncated
 
     def _dispatch(self, name: str, arguments: object, *, node: str, call_id: str) -> dict[str, Any]:
+        if name in HARNESS_TOOL_NAMES:
+            return HarnessTools(self).execute(name, arguments)
         if name in RESEARCH_TOOL_NAMES:
             return self.research_tools.execute(name, arguments, output_limit=min(
                 12000, self.per_call_bytes, self.read_file_output_bytes, max(0, self.total_bytes_limit - self.total_bytes)))

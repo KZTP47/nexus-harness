@@ -14477,6 +14477,13 @@ function aChatToolActivityRow(speaker, activity, at, className) {
   const heading = make("summary", "chat-tool-heading");
   const name = ({read_file: "Read file", request_file_context: "Read project files",
     search_workspace: "Search project", list_directory: "List files",
+    glob_search: "Find files", grep_search: "Search file contents", tool_search: "Find Nexus tools",
+    git_status: "Git status", git_diff: "Git diff", git_log: "Git history", git_show: "Read Git revision", git_blame: "Git line history",
+    code_navigation: "Navigate code", read_notebook: "Read notebook", edit_notebook: "Prepare notebook edit",
+    edit_file: "Prepare file edit", read_local_skill: "Read project skill", web_search: "Search web",
+    list_mcp_resources: "List MCP resources", list_mcp_resource_templates: "List MCP templates", read_mcp_resource: "Read MCP resource",
+    run_command: "Run command in agent copy", write_file: "Write file in agent copy",
+    tool_config: "Inspect tool settings", mcp_status: "Check MCP connection", sleep: "Wait briefly", language_server: "Query language server",
     run_selected_verification: "Run verification", read_proposed_change: "Read proposed changes",
     read_shared_conversation: "Read earlier conversation"})[activity.name] || activity.name.replaceAll("_", " ");
   const target = activity.arguments?.path || activity.arguments?.query || "";

@@ -17,6 +17,35 @@ CONTRACT = "goal-project-access/v1"
 COMMAND_WAIT_NOTE = "Command permission needed. Choose Deny, Run once, or Always allow in this chat."
 MODES = {"read_only", "ask", "full"}
 BLOCKS = {"discovered_command_approval_required", "command_access_denied", "read_only_access"}
+REVIEW_CONTRACT = "full-access-deterministic-review/v1"
+
+
+def authorize_review_fallback(document, task, packet_sha):
+    """Apply the saved user grant to an exact proposal, never model authority."""
+    access = state(document)
+    if access["mode"] != "full" or not task.get("provider_effect_id"):
+        return None
+    receipt = {"schema_version": 1, "contract": REVIEW_CONTRACT,
+               "access_fingerprint": context_fingerprint(document),
+               "review_packet_sha256": packet_sha,
+               "provider_effect_id": task["provider_effect_id"]}
+    receipt["fingerprint"] = fingerprint(receipt)
+    task["full_access_review"] = receipt
+    task["review_approved_effect_id"] = task["provider_effect_id"]
+    return receipt
+
+
+def review_fallback_current(document, task, packet_sha):
+    receipt = task.get("full_access_review")
+    if receipt is None:
+        return True  # Existing independent review or exact user decision.
+    return isinstance(receipt, dict) and receipt.get("schema_version") == 1 \
+        and receipt.get("contract") == REVIEW_CONTRACT \
+        and state(document)["mode"] == "full" \
+        and receipt.get("access_fingerprint") == context_fingerprint(document) \
+        and receipt.get("review_packet_sha256") == packet_sha \
+        and receipt.get("provider_effect_id") == task.get("provider_effect_id") \
+        and receipt.get("fingerprint") == fingerprint({k: v for k, v in receipt.items() if k != "fingerprint"})
 
 
 def fingerprint(value):
@@ -161,6 +190,8 @@ class AccessStoreMixin:
                 raise HarnessError("Choose Deny, Run once, or Always allow")
             access["revision"] = revision
             document["agent_access"] = access
+            if mode == "full":
+                self._recover_full_access_reviews(document, db)
             for task in document["tasks"]:
                 for step in task.get("context_steps", []):
                     if any(call.get("name") == "run_selected_verification" for call in step.get("calls", [])):
