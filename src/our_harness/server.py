@@ -5397,7 +5397,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                         "request_id": body.get("request_id", ""),
                         "expected_revision": body.get("expected_revision"),
                         "pending_ids": body.get("pending_ids") if isinstance(body.get("pending_ids"), list) else [],
-                        "decision_snapshot": body.get("decision_snapshot"),
+                        **({"decision_snapshot": body["decision_snapshot"]} if "decision_snapshot" in body else {}),
                     })
                 self._json({"goal": goal})
             elif self.path == "/api/long-horizon/reconsider":

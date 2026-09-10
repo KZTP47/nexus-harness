@@ -65,6 +65,19 @@ class DecisionEndpointTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertIs(runtime.resume.call_args.args[1]["expected_revision"], True)
 
+    def test_answer_forwards_the_exact_optional_decision_snapshot(self):
+        runtime = self.runtime()
+        snapshot = {"schema_version": 1, "fingerprint": "a" * 64}
+        with mock.patch.object(self.server, "require_project_execution_authority"):
+            status, result = self.call("/api/long-horizon/answer", {
+                **self.payload(), "answers": {"q1": "Keep this answer"}, "decision_snapshot": snapshot,
+            })
+        self.assertEqual(status, 200, result)
+        runtime.resume.assert_called_once_with("goal-alpha", {
+            "answers": {"q1": "Keep this answer"}, "request_id": "", "expected_revision": 7,
+            "pending_ids": ["q1"], "decision_snapshot": snapshot,
+        })
+
 
 if __name__ == "__main__":
     unittest.main()
