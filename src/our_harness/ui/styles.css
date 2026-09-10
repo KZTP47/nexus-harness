@@ -2515,7 +2515,7 @@ button.compact { min-height: 32px; padding: 4px 8px; margin: 2px 0; }
 .chat-team-goal-summary.needs-user-input { background: #49391f; border-color: #ffc65a; animation: chat-input-glow 2.4s ease-in-out infinite; }
 .chat-team-goal-body { padding-top: 8px; min-width: 0; }
 .the-big-chat-transcript .chat-team-goal-body { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; }
-.the-big-chat-transcript .chat-team-goal-body > p { margin: 0; flex: 1; }
+.the-big-chat-transcript .chat-team-goal-body > p { margin: 0; flex: 1 1 280px; }
 .the-big-chat-transcript .chat-team-goal-body > .chat-goal-details { min-height: 28px; padding: 3px 7px; font-size: .72rem; }
 .the-big-chat-transcript .chat-team-goal-body > .chat-goal-question-set { flex-basis: 100%; }
 .the-big-chat-transcript > .chat-team-goal:has(.chat-team-goal-disclosure[open] .chat-goal-question-set) { max-height: none; align-content: start; }

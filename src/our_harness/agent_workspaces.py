@@ -7,6 +7,7 @@ mutable copy and uses the same authenticated storage as goal workspaces.
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import json
 import os
@@ -18,6 +19,7 @@ from . import cancellation
 from . import goal_workspaces as gw
 from .changes import atomic_write
 from .models import HarnessError
+from .filesystem_paths import filesystem_path
 from .safety import ProjectTransactionLock, confined_path, portable_relative_path_key
 
 CONTRACT = "nexus-agent-workspace/v1"
@@ -29,16 +31,16 @@ def inventory(root: Path) -> dict:
     pending = [root]
     while pending:
         folder = pending.pop()
-        for path in sorted(folder.iterdir()):
+        for path in sorted(filesystem_path(folder).iterdir()):
             cancellation.checkpoint()
             if path.name.casefold() in _GENERATED:
                 continue
-            relative = path.relative_to(root).as_posix()
+            relative = path.relative_to(filesystem_path(root)).as_posix()
             key = portable_relative_path_key(relative)
             if key in keys:
                 raise HarnessError("Agent workspace contains aliased paths: " + relative)
             keys.add(key)
-            safe = confined_path(root, relative, allow_missing=False)
+            safe = filesystem_path(confined_path(root, relative, allow_missing=False))
             info = safe.stat()
             if stat.S_ISDIR(info.st_mode):
                 pending.append(safe)
@@ -106,6 +108,51 @@ def existing_root(goal, agent, runtime_root):
     return project
 
 
+def preserve_reconnected_copy(before, after, agent_id, runtime_root):
+    """Stage the authenticated draft under its reviewed new provider binding.
+
+    Retain the old copy until and after the goal transaction commits. A failed
+    copy can therefore be retried without either losing work or rebinding the
+    still-paused original goal to a partially written directory.
+    """
+    old_agent = next(a for a in before["agents"] if a["id"] == agent_id)
+    agent = next(a for a in after["agents"] if a["id"] == agent_id)
+    if binding(before, old_agent) == binding(after, agent):
+        return
+    original = existing_root(before, old_agent, runtime_root)
+    if original is None:
+        return
+    old_home, old_folder, _ = layout(before, old_agent, runtime_root)
+    home, folder, project = layout(after, agent, runtime_root)
+    with ProjectTransactionLock(old_folder).held(), ProjectTransactionLock(folder).held():
+        old_state = _read(old_home, old_folder)
+        files = inventory(original)
+        intent = {"schema_version": 1, "contract": "agent-workspace-reconnect/v1",
+                  "from_binding": binding(before, old_agent), "to_binding": binding(after, agent),
+                  "source_sha256": gw._digest([files, old_state])}
+        filesystem_path(folder).mkdir(parents=True, exist_ok=True)
+        if (folder / "state.json").exists():
+            state = _read(home, folder)
+            if state.get("reconnect_copy") != intent:
+                raise HarnessError("The reconnected draft changed; retain both copies for inspection")
+        else:
+            filesystem_path(project).mkdir(exist_ok=True)
+            if any(filesystem_path(project).iterdir()):
+                raise HarnessError("An unowned directory occupies the reconnected draft")
+            state = {**copy.deepcopy(old_state), "binding": binding(after, agent),
+                     "identity": gw._source_identity(project), "reconnect_copy": intent}
+            _write(home, folder, state)
+        if state.get("identity") != gw._source_identity(gw._direct(project)):
+            raise HarnessError("Reconnected draft directory ownership changed")
+        held = inventory(project)
+        if any(name not in files or held[name] != files[name] for name in held):
+            raise HarnessError("Reconnected draft files changed; retain both copies for inspection")
+        for name in files.keys() - held.keys():
+            gw._copy_file(original, project, name, files[name])
+        if inventory(project) != files or inventory(original) != files or _read(old_home, old_folder) != old_state:
+            raise HarnessError("The saved draft changed while reconnecting; retry after inspection")
+
+
 @contextmanager
 def workspace(goal, agent, runtime_root):
     """Serialize an agent's tasks; synchronize accepted work without losing edits.
@@ -156,7 +203,7 @@ def workspace(goal, agent, runtime_root):
             if actual != gw._content(update["before"]):
                 raise gw.WorkspaceConflict("Agent file changed during synchronization", [path])
             if update["after"] is None:
-                confined_path(project, path, allow_missing=False).unlink()
+                filesystem_path(confined_path(project, path, allow_missing=False)).unlink()
             else:
                 gw._copy_file(source, project, path, update["after"])
         if inventory(source) != incoming:
@@ -181,7 +228,7 @@ class AgentWorkspace:
                 one["delete"] = True
             else:
                 one["mode"] = current[path]["mode"] & 0o777
-                raw = confined_path(self.root, path, allow_missing=False).read_bytes()
+                raw = filesystem_path(confined_path(self.root, path, allow_missing=False)).read_bytes()
                 if hashlib.sha256(raw).hexdigest() != current[path]["sha256"]:
                     raise HarnessError("Agent changed its output while Nexus collected it: " + path)
                 total += len(raw)
@@ -237,7 +284,7 @@ def inspect(goal, runtime_root, workspace_id, relative="", *, cursor=""):
         root = existing_root(goal, agent, runtime_root)
         if root is None:
             raise HarnessError("This agent's copy will be created when it starts work")
-    target = root if relative in ("", ".") else confined_path(root, relative, allow_missing=False)
+    target = filesystem_path(root if relative in ("", ".") else confined_path(root, relative, allow_missing=False))
     if any(part.casefold() in _GENERATED for part in Path(relative).parts):
         raise HarnessError("Runtime and dependency folders are not shown in the workspace viewer")
     if target.is_dir():
@@ -245,9 +292,9 @@ def inspect(goal, runtime_root, workspace_id, relative="", *, cursor=""):
         for path in sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name.casefold())):
             if path.name.casefold() in _GENERATED:
                 continue
-            path = confined_path(root, path.relative_to(root).as_posix(), allow_missing=False)
+            path = confined_path(root, path.relative_to(filesystem_path(root)).as_posix(), allow_missing=False)
             entries.append({"name": path.name, "path": path.relative_to(root).as_posix(),
-                            "directory": path.is_dir()})
+                            "directory": filesystem_path(path).is_dir()})
             if len(entries) > 2000:
                 raise HarnessError("This folder has too many entries for the workspace viewer")
         return {"kind": "directory", "path": relative, "entries": entries, "root": str(root)}

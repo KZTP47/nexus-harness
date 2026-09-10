@@ -16,6 +16,7 @@ from typing import Any
 
 from . import chat, swarm_chats
 from .models import HarnessError
+from .provider_compatibility import reviewable_dispatch_contract
 from .providers.base import create_provider
 from .providers.registry import ProviderRegistry
 
@@ -23,16 +24,16 @@ CONTRACT = "saved-chat-provider-reconnect/v1"
 _DIGEST = "effective_dispatch_fingerprint_sha256"
 _BASE_FIELDS = (
     "route", "failure_context_version", "route_fingerprint_sha256",
-    "transport_contract", "effective_dispatch_version", "effective_dispatch_contract",
+    "transport_contract", "effective_dispatch_version",
 )
 
 
 def compatible(held: dict, current: dict) -> bool:
-    """Only the observed executable fingerprint may change, never its contract."""
+    """Review executable changes and explicitly supported engine upgrades."""
     return bool(held and current) and all(
         held.get(key) is not None and held.get(key) == current.get(key)
         for key in _BASE_FIELDS
-    ) and all(
+    ) and reviewable_dispatch_contract(held.get("effective_dispatch_contract"), current.get("effective_dispatch_contract")) and all(
         re.fullmatch(r"[0-9a-f]{64}", str(value.get(_DIGEST) or "")) is not None
         for value in (held, current)
     )
@@ -62,7 +63,8 @@ def goal_routes(store, document: dict) -> list[dict]:
         # current account-slot/config material under the SAVED dispatch digest
         # reconstructs the old principal before accepting its replacement.
         _kind, former = chat._route_failure_context(
-            store.config, route, principal_dispatch_fingerprint_override=str(held.get(_DIGEST) or ""))
+            store.config, route, principal_dispatch_fingerprint_override=str(held.get(_DIGEST) or ""),
+            effective_dispatch_contract_override=str(held.get("effective_dispatch_contract") or ""))
         if held.get("binding_schema_version") != 3 or not compatible(held, current) or any(
             held.get(key) != former.get(key) for key in (
                 "provider_principal_version", "provider_principal_fingerprint_sha256",
@@ -73,6 +75,7 @@ def goal_routes(store, document: dict) -> list[dict]:
         if held[_DIGEST] != current[_DIGEST]:
             _require_available(store.config, route)
         result.append({**held, _DIGEST: current[_DIGEST],
+                       "effective_dispatch_contract": current["effective_dispatch_contract"],
                        "provider_principal_fingerprint_sha256": current["provider_principal_fingerprint_sha256"]})
     return result
 

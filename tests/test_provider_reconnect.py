@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest import mock
 import unittest
 
-from our_harness import chat, goal_access, long_horizon, provider_reconnect, swarm_chats
+from our_harness import chat, goal_access, long_horizon, provider_reconnect, swarm_chats, workspace_collaboration
 from our_harness.models import HarnessError
 from tests import test_long_horizon_dialogue as fixtures
 
@@ -29,7 +29,7 @@ class ProviderReconnectTests(unittest.TestCase):
         self.assertNotIn("..", destination["collaboration_path"])
         self.assertTrue((root / destination["transcript_path"]).is_file())
 
-    def prepare(self, *, interrupted=False, goal=True, kind="local"):
+    def prepare(self, *, interrupted=False, goal=True, kind="local", isolated=False):
         self.executable = self.base / "portable-assistant.cmd"
         self.executable.write_text("first executable")
         self.executable.chmod(0o755)
@@ -46,6 +46,7 @@ class ProviderReconnectTests(unittest.TestCase):
                            filed_as=self.conversation["filed_as"])
         if goal:
             self.goal = self.runtime.store.create(self.board, "game", ["Finish existing work"], "reconnect-fixture",
+                isolated_workspace=isolated,
                 lead_id="builder", participant_ids=["builder", "peer"], conversation_id=self.chat_id,
                 policy={"agent_access_mode": "full"})
             if interrupted:
@@ -122,6 +123,63 @@ class ProviderReconnectTests(unittest.TestCase):
         with mock.patch.dict("os.environ", {"ARBITRARY_LOGIN_TOKEN": "rotated"}):
             self.assertFalse(swarm_chats.resolve(self.config, self.board, "builder", self.chat_id).get("binding_problem"))
             self.assertFalse(self.runtime.store.public(self.runtime.store.get(self.goal["goal_id"]))["provider_setup_changed"])
+
+    def test_reconnect_preserves_versioned_collaboration_policy(self):
+        self.prepare(isolated=True)
+        store = self.runtime.store
+        def install(goal, db):
+            workspace_collaboration.install(goal, {"mode": "fixed", "writer_id": "builder", "reviewer_id": "peer"})
+        store._mutate(self.goal["goal_id"], install)
+        before = workspace_collaboration.state(store.get(self.goal["goal_id"]))
+        from our_harness import agent_workspaces as aw, goal_workspaces as gw
+        old = store.get(self.goal["goal_id"])
+        agent = next(a for a in old["agents"] if a["id"] == "builder")
+        with aw.workspace(old, agent, store.root) as work:
+            draft = work.root
+            (draft / "unsubmitted.txt").write_text("keep this draft", encoding="utf-8")
+        self.replace_executable()
+        with mock.patch.object(gw, "_copy_file", side_effect=OSError("interrupted reconnect")):
+            with self.assertRaisesRegex(OSError, "interrupted reconnect"):
+                self.apply(self.review())
+        self.assertEqual(store.get(self.goal["goal_id"])["agents"], old["agents"])
+        self.assertEqual((draft / "unsubmitted.txt").read_text(), "keep this draft")
+        self.apply(self.review())
+        after = store.get(self.goal["goal_id"])
+        self.assertEqual(workspace_collaboration.state(after), before)
+        self.assertEqual(goal_access.state(after)["mode"], "full")
+        new_agent = next(a for a in after["agents"] if a["id"] == "builder")
+        with aw.workspace(after, new_agent, store.root) as work:
+            self.assertNotEqual(work.root, draft)
+            self.assertEqual((work.root / "unsubmitted.txt").read_text(), "keep this draft")
+            self.assertEqual(work.changes()[0]["content"], "keep this draft")
+
+    def test_native_workspace_upgrade_can_reconnect_without_losing_goal(self):
+        from our_harness.providers.subscription_cli import SubscriptionCLIProvider
+        with mock.patch.object(SubscriptionCLIProvider, "_effective_dispatch_version", return_value={"version": "test"}):
+            with mock.patch.object(SubscriptionCLIProvider, "_effective_dispatch_contract", return_value="claude-cli/effective-dispatch/v1"):
+                self.prepare(kind="claude-cli")
+            before = self.runtime.store.get(self.goal["goal_id"])
+            conversation = swarm_chats.resolve(self.config, self.board, "builder", self.chat_id, allow_binding_drift=True)
+            self.assertTrue(conversation["binding_problem"]["can_review_reconnect"])
+            self.apply(self.review())
+            after = self.runtime.store.get(self.goal["goal_id"])
+            for field in ("objective", "tasks", "budget", "execution_contract", "policy"):
+                self.assertEqual(after.get(field), before.get(field), field)
+            self.assertFalse(self.runtime.store.public(after)["provider_setup_changed"])
+            self.assertIsNone(swarm_chats.resolve(self.config, self.board, "builder", self.chat_id)["binding_problem"])
+            self.runtime.close()
+            self.runtime = long_horizon.LongHorizonRuntime(self.config)
+            self.addCleanup(self.runtime.close)
+            self.assertFalse(self.runtime.store.public(self.runtime.store.get(after["goal_id"]))["provider_setup_changed"])
+            resumed = self.runtime.store.control(after["goal_id"], "resume")
+            result, seen = self.run_replies(resumed, [fixtures.reply(), fixtures.reply()])
+            self.assertEqual(result["status"], "complete", result["note"])
+            self.assertEqual(len(seen), 2)
+
+    def test_unknown_dispatch_upgrade_cannot_reconnect(self):
+        before = {key: "unchanged" for key in provider_reconnect._BASE_FIELDS}
+        before.update(effective_dispatch_contract="arbitrary/v1", effective_dispatch_fingerprint_sha256="a" * 64)
+        self.assertFalse(provider_reconnect.compatible(before, {**before, "effective_dispatch_contract": "arbitrary/v2"}))
 
     def test_reviewed_reconnect_preserves_ask_grants_and_consumed_once(self):
         self.prepare()

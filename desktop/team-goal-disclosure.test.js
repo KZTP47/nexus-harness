@@ -28,7 +28,13 @@ test("team panel remembers collapse, expands for fresh input, preserves drafts a
       const userQuestionFields=q=>{const n=make('input');n.setAttribute('aria-label',q.prompt);return n;};
       const goalAnswerAudience=panel=>{const n=make('select');panel.append(n);return n;};
       const appendGoalAccessControls=panel=>panel.append(make('button','','Review command permissions'));
-      window.render=()=>fillChatGoalPanel(document.getElementById('panel'),'agent',{goal:window.goal,problem:''});
+      window.problem='';window.repair=null;window.reconnect=null;window.actions=[];
+      const chatGoalParticipants=conversation=>conversation.pair;
+      const createConversationFor=(...args)=>window.actions.push(['fresh',...args]);
+      const appendProviderReconnectControl=(panel,agent,conversation)=>{
+        const button=make('button','','Reconnect saved chat');button.onclick=()=>window.actions.push(['reconnect',agent,conversation.id]);panel.append(button);
+      };
+      window.render=()=>fillChatGoalPanel(document.getElementById('panel'),'agent',{goal:window.goal,problem:window.problem,repairChat:window.repair,reconnectChat:window.reconnect});
       window.change=values=>{Object.assign(window.goal,values);render();};render();
     `});
     const details = page.locator("#panel details");
@@ -81,6 +87,24 @@ test("team panel remembers collapse, expands for fresh input, preserves drafts a
     assert.equal(await details.evaluate(n=>n.open),true);
     await page.evaluate(()=>change({status:'running',resume_recovery:null}));
     assert.equal(await details.evaluate(n=>n.open),false);
+    // The screenshot failure: setup drift hid the questions but still announced
+    // input needed. Its visible action must resolve setup before any answers.
+    await page.evaluate(()=>{
+      window.problem='Saved provider contract changed';
+      window.repair={id:'saved-chat',pair:['agent','peer'],binding_problem:{action_label:'Start fresh with current setup'}};
+      change({status:'waiting_for_user',pending_interrupts:[{id:'old-question',questions:[{id:'old',prompt:'Hidden until setup is fixed'}]}]});
+    });
+    assert.equal(await details.evaluate(n=>n.open),true);
+    assert.equal(await page.getByLabel('Hidden until setup is fixed').count(),0);
+    await page.getByRole('button',{name:'Start fresh with current setup'}).click();
+    assert.deepEqual(await page.evaluate(()=>actions.pop()),['fresh','agent','peer','']);
+    await page.evaluate(()=>{window.reconnect=window.repair;render();});
+    await page.getByRole('button',{name:'Reconnect saved chat'}).click();
+    assert.deepEqual(await page.evaluate(()=>actions.pop()),['reconnect','agent','saved-chat']);
+    assert.equal(await page.getByRole('button',{name:'Start fresh with current setup'}).count(),0);
+    await page.screenshot({path:path.join(output,'setup-recovery-action.png')});
+    await page.evaluate(()=>{window.problem='';window.reconnect=null;window.repair=null;change({status:'running',pending_interrupts:[]});});
+    assert.equal(await summary.locator('.chat-team-input-needed').count(),0);
     console.log('Team panel screenshots: '+output);
   } finally {await browser.close();}
 });

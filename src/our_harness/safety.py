@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Iterator
 
 from .models import HarnessError
+from .filesystem_paths import filesystem_path
 
 
 CONTROL_COMPONENTS = {".git", ".harness"}
@@ -203,7 +204,7 @@ class ProjectTransactionLock:
 
 def _is_reparse(path: Path) -> bool:
     try:
-        attrs = path.stat(follow_symlinks=False).st_file_attributes
+        attrs = filesystem_path(path).stat(follow_symlinks=False).st_file_attributes
     except (AttributeError, OSError):
         return False
     return bool(attrs & stat.FILE_ATTRIBUTE_REPARSE_POINT)
@@ -231,15 +232,16 @@ def confined_path(
     cursor = root
     for part in raw.parts:
         cursor = cursor / part
-        if cursor.exists() or cursor.is_symlink():
-            if cursor.is_symlink() or _is_reparse(cursor):
+        native_cursor = filesystem_path(cursor)
+        if native_cursor.exists() or native_cursor.is_symlink():
+            if native_cursor.is_symlink() or _is_reparse(cursor):
                 raise HarnessError(f"Linked path components are not accepted: {relative}")
-    resolved_parent = candidate.parent.resolve(strict=False)
+    resolved_parent = filesystem_path(candidate.parent).resolve(strict=False)
     try:
-        resolved_parent.relative_to(root)
+        resolved_parent.relative_to(filesystem_path(root))
     except ValueError as exc:
         raise HarnessError(f"Path escapes the project: {relative}") from exc
-    if not allow_missing and not candidate.exists():
+    if not allow_missing and not filesystem_path(candidate).exists():
         raise HarnessError(f"Path does not exist: {relative}")
     return candidate
 

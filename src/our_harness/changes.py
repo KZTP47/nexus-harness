@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Iterable, Iterator
 
 from .models import ChangePlan, HarnessError
+from .filesystem_paths import filesystem_path
 from .safety import ProjectTransactionLock, confined_path, portable_component_key, portable_relative_path_key
 
 
@@ -37,6 +38,10 @@ def _content_bytes(entry: ChangePlan) -> bytes | None:
 
 
 def atomic_write(path: Path, content: bytes, mode: int | None = None) -> None:
+    # Same-directory temporary names can exceed MAX_PATH even when the final
+    # filename fits. Use the Unicode filesystem namespace for this entire I/O
+    # operation; this works without the machine's LongPathsEnabled policy.
+    path = filesystem_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     # The file is written under a temporary name first and then moved into
     # place. Building that name out of the real one made it longer than the
@@ -65,7 +70,7 @@ def atomic_write(path: Path, content: bytes, mode: int | None = None) -> None:
         if mode is not None:
             path.chmod(mode)
     finally:
-            temporary.unlink(missing_ok=True)
+        temporary.unlink(missing_ok=True)
 
 
 def _canonical_file_patch(path: str, before: bytes | None, after: bytes | None) -> str:
@@ -108,6 +113,7 @@ class _FileSnapshot:
 
 
 def _read_snapshot(path: Path) -> _FileSnapshot:
+    path = filesystem_path(path)
     try:
         with path.open("rb") as stream:
             before = os.fstat(stream.fileno())
@@ -150,7 +156,7 @@ class _ExclusiveTarget:
     """An exclusive, identity-stable target lease for the mutation window."""
 
     def __init__(self, path: Path, expected: _FileSnapshot) -> None:
-        self.path = path
+        self.path = filesystem_path(path)
         self.expected = expected
         self.created = False
         self.handle: int | None = None
@@ -326,7 +332,7 @@ class FileTransaction:
     def _verified_backup(backup_root: Path, record: dict[str, object]) -> bytes:
         backup = confined_path(backup_root, Path("files") / str(record["path"]), allow_missing=False)
         try:
-            content = backup.read_bytes()
+            content = filesystem_path(backup).read_bytes()
         except OSError as exc:
             raise HarnessError(f"Rollback backup is unavailable: {record['path']}") from exc
         expected_hash = record.get("backup_sha256", record.get("before_sha256"))
@@ -485,7 +491,7 @@ class FileTransaction:
                 # goals pass no root grant and therefore remain exact.
                 if allowed_exact_capabilities is not None:
                     capability = "DELETE" if entry.delete else (
-                        "MODIFY" if confined_path(self.root, relative).exists() else "CREATE"
+                        "MODIFY" if filesystem_path(confined_path(self.root, relative)).exists() else "CREATE"
                     )
                     allowed = {
                         str(one).upper()
@@ -518,7 +524,7 @@ class FileTransaction:
                         else:
                             lease.write(_content_bytes(entry) or b"")
                             if entry.mode is not None:
-                                path.chmod(entry.mode)
+                                filesystem_path(path).chmod(entry.mode)
                         record = next(item for item in manifest["changes"] if item["path"] == entry.path)
                         if not entry.delete:
                             applied_hash = (
@@ -658,7 +664,7 @@ class FileTransaction:
     @staticmethod
     def _restore_rollback_record(path: Path, before: bytes | None, record: dict[str, object]) -> None:
         if before is None:
-            path.unlink(missing_ok=True)
+            filesystem_path(path).unlink(missing_ok=True)
         else:
             atomic_write(path, before, record.get("before_mode"))
 

@@ -4161,13 +4161,20 @@ class GoalStore(goal_access.AccessStoreMixin):
             if current != reviewed["after"]:
                 raise HarnessError("The provider changed. Review reconnection again.")
             saved_access = goal_access.state(document)
+            saved_collaboration = collaboration.state(document)
+            previous = copy.deepcopy(document)
             for agent, binding in zip(document["agents"], current):
                 agent["route_binding"] = binding
+            if document.get("agent_workspace_contract") == agent_workspaces.CONTRACT:
+                for agent in document["agents"]:
+                    agent_workspaces.preserve_reconnected_copy(previous, document, agent["id"], self.root)
             # This exact reviewed compatible reconnect changes transport
             # identity, not the user's access decision. Rebind the already
             # validated access; a stale prior record stays read-only/no-grants.
             saved_access["binding"] = goal_access.binding(document)
             document["agent_access"] = saved_access
+            if saved_collaboration is not None:
+                collaboration.install(document, saved_collaboration)
             # Keep task/effect state, evidence, budget, approvals and admission
             # provenance intact. Resume remains a separate execution decision.
             document["status"] = "paused"

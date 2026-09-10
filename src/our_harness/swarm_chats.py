@@ -28,6 +28,7 @@ from . import swarm as swarm_lab
 from . import pipeline_runs
 from .config import LoadedConfig
 from .models import HarnessError
+from .provider_compatibility import reviewable_dispatch_contract
 from .providers.base import effective_dispatch_fingerprint
 from .redaction import CredentialRedactor
 
@@ -974,11 +975,9 @@ def _binding_problem(
             )
         )
         if base_changed or effective_changed:
-            reconnectable = reconnectable and not base_changed and all(
-                held.get(key) == current.get(key) for key in (
-                    "effective_dispatch_version", "effective_dispatch_contract",
-                )
-            )
+            reconnectable = (reconnectable and not base_changed
+                and held.get("effective_dispatch_version") == current.get("effective_dispatch_version")
+                and reviewable_dispatch_contract(held.get("effective_dispatch_contract"), current.get("effective_dispatch_contract")))
             kind = (
                 "route_changed" if held.get("route") != current.get("route")
                 else "route_settings_changed" if base_changed

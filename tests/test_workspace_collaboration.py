@@ -46,6 +46,21 @@ class WorkspaceCollaborationTests(unittest.TestCase):
                 changes=[{"path": "app.txt", "content": "stale overwrite", "reason": "stale"}])
         self.assertEqual((self.project / "app.txt").read_text(), "original")
 
+    def test_team_can_prepare_files_added_to_real_project_after_goal_admission(self):
+        self.create()
+        late = self.project / "extracted-repository" / "source.txt"
+        late.parent.mkdir()
+        late.write_text("newly extracted source", encoding="utf-8")
+        listed = self.call("workspace_read", workspace_id="real", path="extracted-repository/source.txt")
+        draft = self.call("workspace_read", workspace_id="lead", path="app.txt")
+        self.call("workspace_edit", workspace_id="lead", expected_fingerprint=draft["fingerprint"],
+            changes=[{"path": "extracted-repository/source.txt", "content": listed["content"], "reason": "Prepare source for implementation"}])
+        self.assertEqual(self.call("workspace_read", workspace_id="lead", path="extracted-repository/source.txt")["content"], "newly extracted source")
+        prompt = wc.prompt(self.runtime.store.get(self.goal["goal_id"]), self.task, self.runtime.store.root)
+        self.assertIn("Do not ask the user to copy, synchronize, or extract", prompt)
+        self.assertEqual(self.runtime.store.get(self.goal["goal_id"])["interrupts"], [])
+        self.assertEqual(late.read_text(encoding="utf-8"), "newly extracted source")
+
     def test_fixed_roles_block_peer_drafts_review_edits_and_unauthorized_real_writes(self):
         self.create("fixed")
         for target in ("reviewer", "real"):

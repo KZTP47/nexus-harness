@@ -7409,6 +7409,7 @@ function chatLongGoalContext(agentId, snapshots = longGoals) {
         || "This saved goal uses an older collaboration engine. Open advanced goal details to keep its history and cancel it, then start a fresh Work together goal."
       : "");
   return {goal, problem: String(problem || ""),
+    ...(matches && conversation.binding_problem ? {repairChat: conversation} : {}),
     ...(matches && conversation.binding_problem?.can_review_reconnect
       ? {reconnectChat: conversation} : {})};
 }
@@ -7954,18 +7955,18 @@ function fillChatGoalPanel(container, agentId, context) {
   const chatKey = swarmChatKey(agentId);
   const storageKey = `nexus.chat-team-panel.v1:${JSON.stringify([chatKey, goal?.project?.id || ""])}`;
   const terminal = ["complete", "cancelled", "cancelling"].includes(goal?.status);
-  const inputReason = context.reconnectChat ? "Reconnect this chat to continue."
+  const inputReason = problem ? (context.reconnectChat ? "Reconnect this chat to continue." : "Resolve the team setup to continue.")
     : terminal ? ""
     : pending.length || goal?.status === "waiting_for_user" ? "The team needs your answers before it can continue."
     : goal?.command_request?.state === "pending" ? "Review the command request to continue."
     : goal?.resume_recovery?.items?.length ? "Review the interrupted agent turn to continue." : "";
   const inputKey = inputReason ? JSON.stringify([goal?.goal_id, inputReason, pending,
-    goal?.command_request, goal?.resume_recovery, context.reconnectChat]) : "";
+    goal?.command_request, goal?.resume_recovery, context.reconnectChat, context.repairChat]) : "";
   // Keep in-progress answers intact during the background status polls.
   const signature = JSON.stringify([storageKey, goal?.goal_id, goal?.status, problem, pending,
     goal?.execution_workspace, goal?.workspace_publication, goal?.workspace_path, goal?.decision_reconsideration,
     goal?.agent_access, goal?.command_request, goal?.scheduler_live,
-    goal?.resume_recovery?.items?.length ? goal.resume_recovery : null, context.reconnectChat]);
+    goal?.resume_recovery?.items?.length ? goal.resume_recovery : null, context.reconnectChat, context.repairChat]);
   if (container.dataset.snapshot === signature) return;
   const sameChat = container.dataset.disclosureKey === storageKey;
   const previousOpen = sameChat ? container.querySelector("details")?.open : undefined;
@@ -8005,11 +8006,23 @@ function fillChatGoalPanel(container, agentId, context) {
     ? "The team needs your answers before it can continue."
     : "Send a message below to steer both agents. Their replies and progress stay in this chat.")));
   if (context.reconnectChat) appendProviderReconnectControl(panel, agentId, context.reconnectChat);
+  else if (context.repairChat) {
+    const conversation = context.repairChat;
+    const fresh = make("button", "primary chat-team-repair", conversation.binding_problem.action_label || "Start fresh with current setup");
+    fresh.type = "button";
+    fresh.addEventListener("click", () => {
+      const members = chatGoalParticipants(conversation);
+      const peer = members.find(id => id !== String(agentId)) || "";
+      return createConversationFor(agentId, peer, peer ? "" : "single");
+    });
+    panel.append(fresh);
+  }
   if (!problem && goal?.execution_workspace) {
     const activity = chatGoalActivity({goal, problem: ""});
     panel.append(make("p", "hint chat-workspace-status", `${activity.stage}. ${activity.detail}`));
   }
-  const details = make("button", "compact chat-goal-details", "Advanced goal details");
+  const details = make("button", "compact chat-goal-details", problem && !context.repairChat && !context.reconnectChat
+    ? "Resolve team issue" : "Advanced goal details");
   details.type = "button";
   details.addEventListener("click", () => void openChatGoalDetails(goal));
   panel.append(details);

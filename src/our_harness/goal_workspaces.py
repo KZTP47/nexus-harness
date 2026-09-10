@@ -21,6 +21,7 @@ from typing import Any, Iterator
 
 from .changes import FileTransaction, atomic_write
 from .models import ChangePlan, HarnessError
+from .filesystem_paths import filesystem_path
 from .safety import ProjectTransactionLock, confined_path, portable_relative_path_key
 
 _EXCLUDED = {".git", ".harness", ".nexus-verification"}
@@ -146,15 +147,15 @@ def _manifest(project: Path, *, independent: bool = False) -> dict[str, dict[str
     pending = [project]
     while pending:
         directory = pending.pop()
-        for path in sorted(directory.iterdir()):
+        for path in sorted(filesystem_path(directory).iterdir()):
             if path.name.casefold() in _EXCLUDED:
                 continue
-            relative = path.relative_to(project).as_posix()
+            relative = path.relative_to(filesystem_path(project)).as_posix()
             key = portable_relative_path_key(relative)
             if key in keys:
                 raise HarnessError("Goal workspace contains portable path aliases: " + relative)
             keys.add(key)
-            safe = confined_path(project, relative, allow_missing=False)
+            safe = filesystem_path(confined_path(project, relative, allow_missing=False))
             metadata = safe.stat()
             if stat.S_ISDIR(metadata.st_mode):
                 pending.append(safe)
@@ -192,7 +193,7 @@ def _contents(manifest: dict[str, dict[str, Any]]) -> dict[str, Any]:
 def _copy_file(source: Path, destination: Path, relative: str, expected: dict[str, Any]) -> None:
     origin = confined_path(source, relative, allow_missing=False)
     target = confined_path(destination, relative)
-    data = origin.read_bytes()
+    data = filesystem_path(origin).read_bytes()
     if hashlib.sha256(data).hexdigest() != expected["sha256"]:
         raise HarnessError("Goal workspace source changed during copy: " + relative)
     atomic_write(target, data, mode=expected["mode"])
@@ -453,7 +454,7 @@ def prepare_publish(document: dict[str, Any], runtime_root: Path) -> dict[str, A
         if relative in current:
             _copy_file(source, project, relative, current[relative])
         else:
-            confined_path(project, relative).unlink(missing_ok=True)
+            filesystem_path(confined_path(project, relative)).unlink(missing_ok=True)
     if _manifest(source) != current:
         raise WorkspaceConflict("Selected project changed during goal rebase; retry publication", list(current))
     # Rebase has no source effects. Persist the new comparison base so a retry
@@ -490,7 +491,7 @@ def publish(document: dict[str, Any], runtime_root: Path, receipt: dict[str, Any
     plans = []
     for relative in verified["changed"]:
         before, after = verified["source"].get(relative), verified["workspace"].get(relative)
-        content = confined_path(project, relative).read_bytes() if after else None
+        content = filesystem_path(confined_path(project, relative)).read_bytes() if after else None
         if after and hashlib.sha256(content).hexdigest() != after["sha256"]:
             raise WorkspaceConflict("Goal workspace changed while its publication bytes were read", [relative])
         plans.append(ChangePlan(relative, before["sha256"] if before else None,

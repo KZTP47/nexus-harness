@@ -3068,6 +3068,31 @@ class LongHorizonTests(unittest.TestCase):
         self.assertEqual(runtime.store.active_overlapping_project(self.project, except_goal_id=waiter["goal_id"]), [])
         self.assertEqual(len(runtime.store.list(100)), 2)
 
+    def test_failed_project_copy_retries_same_chat_prompt_after_restart_without_duplicate_goal(self):
+        from our_harness import goal_workspaces
+        runtime = long_horizon.LongHorizonRuntime(self.config)
+        exact = "Read the project document and let both agents finish the requested work"
+        with mock.patch.object(runtime, "_enable_auto_start_watcher"), mock.patch.object(
+            runtime, "start_background"
+        ) as start, mock.patch.object(goal_workspaces, "_copy_file", side_effect=FileNotFoundError("temporary copy filename")):
+            (self.project / "project-document.txt").write_text("requested project work", encoding="utf-8")
+            with self.assertRaises(FileNotFoundError):
+                runtime.start(self.board, "project", [exact], "retry-project-copy", conversation_id="saved-chat")
+            start.assert_not_called()
+        runtime.close()
+        runtime = long_horizon.LongHorizonRuntime(self.config)
+        self.addCleanup(runtime.close)
+        with mock.patch.object(runtime, "_enable_auto_start_watcher"), mock.patch.object(
+            runtime, "start_background", side_effect=lambda goal_id, answers=None: runtime.store.get(goal_id)
+        ):
+            recovered = runtime.start(self.board, "project", [exact], "retry-project-copy", conversation_id="saved-chat")
+            replayed = runtime.start(self.board, "project", [exact], "retry-project-copy", conversation_id="saved-chat")
+        self.assertEqual(recovered["goal_id"], replayed["goal_id"])
+        self.assertEqual(recovered["objective"], exact)
+        self.assertEqual(recovered["conversation_id"], "saved-chat")
+        self.assertEqual(len(runtime.store.list(100)), 1)
+        self.assertEqual((long_horizon._execution_root(recovered) / "project-document.txt").read_text(), "requested project work")
+
     def test_waiting_goal_controls_cannot_bypass_project_owner(self):
         runtime = long_horizon.LongHorizonRuntime(self.config)
         self.addCleanup(runtime.close)
