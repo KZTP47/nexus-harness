@@ -192,6 +192,26 @@ class SwarmRunStoreTests(unittest.TestCase):
         accepted, _ = store.accept(request, snapshot or {"objective": "test"})
         return store, store.start(accepted["run_id"])["run_id"]
 
+    def _run_crash_fixture(self, target, marker: Path) -> None:
+        process = multiprocessing.get_context("spawn").Process(
+            target=target, args=(str(self.root), str(self.runtime), str(marker)),
+        )
+        process.start()
+        try:
+            # Windows spawn includes importing the test module and initializing
+            # the private journal. Allow bounded startup on a busy CI runner.
+            process.join(30)
+            self.assertEqual(process.exitcode, 0, "Crash fixture did not finish successfully")
+        finally:
+            # Never remove the journal/key while its worker is still writing.
+            if process.is_alive():
+                process.terminate()
+                process.join(5)
+            if process.is_alive():
+                process.kill()
+                process.join(5)
+            process.close()
+
     def test_active_runs_returns_every_verified_active_run(self) -> None:
         store, older_run = self._running("older-active", {"kind": "work", "name": "older"})
         accepted, _ = store.accept("newer-active", {"kind": "chat", "name": "newer"})
@@ -880,14 +900,7 @@ class SwarmRunStoreTests(unittest.TestCase):
 
     def test_restart_closes_dispatched_effect_as_delivery_unknown_without_resend(self) -> None:
         marker = self.container / "run-id"
-        context = multiprocessing.get_context("spawn")
-        process = context.Process(
-            target=_leave_provider_effect_dispatched,
-            args=(str(self.root), str(self.runtime), str(marker)),
-        )
-        process.start()
-        process.join(10)
-        self.assertEqual(process.exitcode, 0)
+        self._run_crash_fixture(_leave_provider_effect_dispatched, marker)
         run_id = marker.read_text(encoding="utf-8")
         store = SwarmRunStore(self.config)
         recovered = store.projection(run_id)
@@ -905,13 +918,7 @@ class SwarmRunStoreTests(unittest.TestCase):
 
     def test_restart_closes_dead_accepted_lease_instead_of_leaving_it_stuck(self) -> None:
         marker = self.container / "accepted-run-id"
-        process = multiprocessing.get_context("spawn").Process(
-            target=_leave_accepted,
-            args=(str(self.root), str(self.runtime), str(marker)),
-        )
-        process.start()
-        process.join(10)
-        self.assertEqual(process.exitcode, 0)
+        self._run_crash_fixture(_leave_accepted, marker)
         recovered = SwarmRunStore(self.config).get(marker.read_text(encoding="utf-8"))
         self.assertEqual(recovered["status"], "interrupted")
         self.assertFalse(recovered["result"])
@@ -922,13 +929,7 @@ class SwarmRunStoreTests(unittest.TestCase):
 
     def test_restart_marks_acknowledged_but_uncheckpointed_provider_outcome_unknown(self) -> None:
         marker = self.container / "ack-run-id"
-        process = multiprocessing.get_context("spawn").Process(
-            target=_leave_acknowledged_without_checkpoint,
-            args=(str(self.root), str(self.runtime), str(marker)),
-        )
-        process.start()
-        process.join(10)
-        self.assertEqual(process.exitcode, 0)
+        self._run_crash_fixture(_leave_acknowledged_without_checkpoint, marker)
         store = SwarmRunStore(self.config)
         recovered = store.get(marker.read_text(encoding="utf-8"))
         self.assertEqual(recovered["status"], "outcome_unknown")
