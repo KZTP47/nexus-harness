@@ -1403,14 +1403,15 @@ class WorkflowTests(unittest.TestCase):
         class SlowEmbeddingProvider:
             def __init__(self) -> None:
                 self.timeouts: list[float] = []
+                self.elapsed = 0.0
 
             def embed(self, texts, timeout_seconds=None):
                 self.timeouts.append(timeout_seconds)
                 work_seconds = 0.35
                 if timeout_seconds < work_seconds:
-                    time.sleep(timeout_seconds)
+                    self.elapsed += timeout_seconds
                     raise HarnessError("fixture embedding timed out")
-                time.sleep(work_seconds)
+                self.elapsed += work_seconds
                 return [[1.0, 0.0] for _ in texts]
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -1428,19 +1429,19 @@ class WorkflowTests(unittest.TestCase):
                 encoding="utf-8",
             )
             provider = SlowEmbeddingProvider()
-            started = time.monotonic()
+            # Only provider work advances this deadline. Hosted-runner file I/O
+            # must not consume the fixture's one-second budget before the third
+            # embedding stage is reached. The real deadline checks still run.
             with patch("our_harness.providers.create_embedding_provider", return_value=provider), patch(
                 "our_harness.workflow.create_embedding_provider", return_value=provider
+            ), patch(
+                "our_harness.workflow.time", SimpleNamespace(monotonic=lambda: provider.elapsed)
             ), HarnessApplication(load_config(root)) as app, self.assertRaisesRegex(HarnessError, "deadline expired"):
                 app.run_task("Keep the value unchanged")
-            elapsed = time.monotonic() - started
             self.assertEqual(len(provider.timeouts), 3)
-            self.assertGreater(provider.timeouts[0], provider.timeouts[1])
-            self.assertGreater(provider.timeouts[1], provider.timeouts[2])
-            # The budget is one second. What matters is that the run stops when
-            # it is spent rather than carrying on: a slower machine crosses the
-            # same line a little later, and that is not a failure.
-            self.assertLess(elapsed, 5.0)
+            for actual, expected in zip(provider.timeouts, (1.0, 0.65, 0.3)):
+                self.assertAlmostEqual(actual, expected)
+            self.assertAlmostEqual(provider.elapsed, 1.0)
 
     def test_episode_embedding_uses_memory_provider(self) -> None:
         class FixtureEmbedder:
