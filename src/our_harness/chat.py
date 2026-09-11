@@ -38,6 +38,7 @@ import re
 import threading
 import time
 import uuid
+from .filesystem_paths import filesystem_path
 from urllib.parse import urlsplit
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -403,7 +404,7 @@ def keep_attachments(
     provider_files: list[dict[str, Any]] = []
     text_blocks: list[str] = []
     folder = _attachment_folder(config, route, filed_as)
-    folder.mkdir(parents=True, exist_ok=True)
+    filesystem_path(folder).mkdir(parents=True, exist_ok=True)
     for position, raw in enumerate(supplied):
         if not isinstance(raw, dict):
             raise ChatError("An attachment is malformed.")
@@ -481,12 +482,12 @@ def keep_attachments(
         suffix = IMAGE_EXTENSIONS[mime] if image_info else Path(name).suffix[:16]
         stored = folder / f"{attachment_id}{suffix}"
         beside = folder / f".{attachment_id}.part"
-        descriptor = os.open(beside, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        descriptor = os.open(filesystem_path(beside), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         with os.fdopen(descriptor, "wb") as stream:
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(beside, stored)
+        os.replace(filesystem_path(beside), filesystem_path(stored))
         public = {
             "id": attachment_id,
             "name": name,
@@ -1345,6 +1346,9 @@ _CORRELATION_TEXT_LIMITS = {
     "delivery_contract": 80,
     "delivery_state": 80,
     "delivery_project": 32768,
+    "delivery_workspace": 32768,
+    "execution_mode": 80,
+    "verification_status": 80,
     "delivery_locations": 1500000,
 }
 
@@ -2971,6 +2975,13 @@ def _long_horizon_status_text(goal: dict[str, Any]) -> str:
     if status == "cancelled":
         return f"Durable goal {short_id} was cancelled. It was not reported as complete."
     if status == "complete":
+        if goal.get("execution_mode") == "facilitator":
+            verification = goal.get("verification") or {}
+            return (f"Agent work for goal {short_id} finished. Working folder: "
+                    + str(goal["project"]["path"]) + "\nChecks: "
+                    + str(verification.get("status") or "unverified") + ". "
+                    + str(verification.get("reason") or "")
+                    + "\nAgent completion is separate from test results; see the recorded output for details.")
         if goal.get("delivery_problem"):
             return f"Durable goal {short_id} was previously marked complete. " + str(goal["delivery_problem"])
         receipt = goal.get("delivery_receipt") or {}

@@ -146,6 +146,7 @@ class ProviderWorkspaceContext:
     project_id: str
     project_path: str
     execution_path: str
+    execution_mode: str = "isolated"
 
 
 @dataclass(frozen=True)

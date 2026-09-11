@@ -32,13 +32,24 @@ def file_references(goal: dict[str, Any]) -> set[str]:
 def report_metadata(goal: dict[str, Any]) -> dict[str, str]:
     # Provider turns precede the final verification/publication transaction.
     # This remains a historical fact when reopening an already completed goal.
+    if goal.get("execution_mode") == "facilitator":
+        return {"delivery_contract": CONTRACT, "delivery_state": "project_work_report",
+                "delivery_project": str(goal["project"]["path"]),
+                "delivery_workspace": str(goal["project"]["path"])}
     if not goal.get("execution_workspace"):
         return {}
+    from . import long_horizon
+    workspace = goal.get("workspace_path") or str(Path(long_horizon._base()) / goal["execution_workspace"]["path"])
     return {"delivery_contract": CONTRACT, "delivery_state": "working_copy_report",
+            "delivery_workspace": workspace,
             "delivery_project": str(goal.get("project", {}).get("path") or "")}
 
 
 def status_metadata(goal: dict[str, Any]) -> dict[str, str]:
+    if goal.get("execution_mode") == "facilitator":
+        return {"delivery_contract": CONTRACT, "execution_mode": "facilitator",
+                "verification_status": str((goal.get("verification") or {}).get("status") or "unverified"),
+                "delivery_locations": json.dumps([str(goal["project"]["path"])], ensure_ascii=False)}
     held = goal.get("delivery_receipt") or {}
     if held.get("contract") != CONTRACT or held.get("state") != "delivered" or goal.get("delivery_problem"):
         return {}
