@@ -7825,7 +7825,7 @@ function appendGoalAccessControls(panel, goal, afterAction, binding = {}) {
   select.disabled = !settled;
   label.append(select);
   box.append(label, make("p", "hint", settled
-    ? "Read only: inspect files. Ask: allow project edits and ask before new commands. Full project access: allow native tools, edits and commands in each agent copy. Copies are not security sandboxes; native commands can affect files outside them. Nexus reviews and verifies publication. Applies to every agent in this chat."
+    ? "Read only: inspect files. Ask: allow project edits and ask before new commands. Full project access: allow native tools, edits and commands in the working folder. New teams work directly in the selected project. Files are available as agents save them; test and review results are reported separately. Applies to every agent in this chat."
     : "Pause the team to change access. The setting applies to every agent in this chat."));
   const status = make("p", "hint chat-access-status");
   status.setAttribute("role", "status");
@@ -7873,7 +7873,7 @@ function appendGoalAccessControls(panel, goal, afterAction, binding = {}) {
       card.setAttribute("aria-label", "Command permission request");
       const approved = goal.command_request?.state === "approved" || select.value === "full";
       card.append(make("strong", "", approved ? "Command permission is saved" : "Allow this command?"),
-        make("p", "hint", `Project: ${preview.project_path}. Runs in Nexus's protected verification copy.`),
+        make("p", "hint", `Project: ${preview.project_path}. ${goal.execution_mode === "facilitator" ? "Runs in the selected project folder." : "Runs in Nexus's protected verification copy."}`),
         make("pre", "", preview.commands.map(command => JSON.stringify(command)).join("\n")));
       if (preview.resolved_commands && JSON.stringify(preview.resolved_commands) !== JSON.stringify(preview.commands)) {
         card.querySelector("pre").textContent += "\nRuns: "
@@ -8318,7 +8318,7 @@ function fillChatComposerPermissions(host, agentId, context) {
       fillChatComposerPermissions(host, agentId, chatLongGoalContext(agentId));
     });
     label.append(select);
-    panel.append(label, make("p", "hint", "Read only: inspect files. Ask: allow project edits and ask before new commands. Full project access: allow native tools, edits and commands in agent copies. Copies are not security sandboxes; native commands can affect files outside them. Nexus reviews and verifies publication."),
+    panel.append(label, make("p", "hint", "Read only: inspect files. Ask: allow project edits and ask before new commands. Full project access: allow native tools, edits and commands in the selected project. Saved files are immediately available; tests and reviewer feedback are reported separately."),
       make("p", "hint", "Saved for project work in this chat. Asking agents questions does not grant file-editing access."));
   }
   host.append(button, popup);
@@ -10577,9 +10577,29 @@ function showActivityInPanel(panel, activity) {
   panel.querySelector(".chat-activity-elapsed").textContent = elapsed;
 }
 
+function facilitatorCompletionDetail(goal) {
+  const checks = goal.verification?.status === "failed" ? "Checks failed."
+    : goal.verification?.status === "passed" ? "Recorded checks passed."
+    : "No passing check result is recorded.";
+  return `The agents have finished their turns. Files they saved are available in ${goal.workspace_path || goal.project_path || "the selected project folder"}. ${checks} Agent completion claims and check results are separate.`;
+}
+
+function goalWorkspaceWords(goal) {
+  if (goal?.execution_mode === "facilitator") return " Agents work directly in the selected project; saved files are immediately available. Checks and reviews are reported separately.";
+  return goal?.execution_workspace ? " This team has an independent working copy; checked results will be applied to the project." : "";
+}
+
+function goalReviewer(goal, task) {
+  const owner = goal?.agents?.find(one => one.id === task?.assigned_agent_id);
+  return goal?.agents?.find(one => one.id !== task?.assigned_agent_id
+    && (goal.execution_mode === "facilitator" || (one.provider_identity_sha256
+      && owner?.provider_identity_sha256 && one.provider_identity_sha256 !== owner.provider_identity_sha256)));
+}
+
 function chatGoalActivity({goal, problem}) {
   if (!goal && !problem) return null;
-  const isolated = Boolean(goal?.execution_workspace);
+  const direct = goal?.execution_mode === "facilitator";
+  const isolated = !direct && Boolean(goal?.execution_workspace);
   const publication = goal?.workspace_publication || {};
   const status = (state, stage, detail) => ({state, stage,
     detail: isolated && ["working", "waiting"].includes(state)
@@ -10616,6 +10636,13 @@ function chatGoalActivity({goal, problem}) {
     "Nexus is waiting for the current work to stop safely.");
   if (goal.status === "waiting_for_project") return status("waiting", "Waiting for project access",
     "Another saved goal is using this project. This team will continue when access is available.");
+  if (direct && goal.status === "complete") return status(
+    goal.verification?.status === "failed" ? "attention" : "waiting", "Agent work finished",
+    facilitatorCompletionDetail(goal));
+  if (isolated && publication.state === "publishing" && goal.verification?.status === "failed") {
+    return status("attention", "Checks failed; working files retained",
+      "Verification failed. Open the working files to inspect the saved work; no delivery is confirmed.");
+  }
   if (isolated && publication.state === "publishing") return status("working", "Applying checked results",
     "Nexus is applying this team's checked changes to the project. Other teams keep their independent working copies.");
   if (isolated && goal.status === "complete" && publication.state !== "published") {
@@ -10882,11 +10909,11 @@ function longHorizonAdmissionWords(goal) {
   }
   if (status === "queued") {
     return {stage: "Goal accepted and queued", detail: `Goal ${goalId} was accepted into the queue. Follow the agents and current status in this chat.`
-      + (goal?.execution_workspace ? " This team has an independent working copy; checked results will be applied to the project." : "")};
+      + goalWorkspaceWords(goal)};
   }
   if (status === "running") {
     return {stage: "Goal accepted", detail: `Goal ${goalId} was accepted. Follow the agents and current status in this chat.`
-      + (goal?.execution_workspace ? " This team has an independent working copy; checked results will be applied to the project." : "")};
+      + goalWorkspaceWords(goal)};
   }
   if (status === "paused") {
     return {stage: "Goal accepted but paused", detail: `Durable goal ${goalId} is paused and is not complete.`};
@@ -10895,6 +10922,7 @@ function longHorizonAdmissionWords(goal) {
     return {stage: "Goal needs your input", detail: `Goal ${goalId} was accepted with a question for you. Answer the team's question in this chat.`};
   }
   if (status === "complete") {
+    if (goal?.execution_mode === "facilitator") return {stage: "Agent work finished", detail: facilitatorCompletionDetail(goal)};
     if (goal?.execution_workspace && goal.workspace_publication?.state !== "published") {
       return {stage: "Result awaiting publication", detail: `Goal ${goalId} has not published its independent result to the project. Open its goal details to inspect the saved status.`};
     }
@@ -14276,15 +14304,17 @@ function chatPhaseName(phase) { return chatPhaseNames[phase] || ""; }
 function chatDeliveryNotice(one) {
   const evidence = one?.correlation;
   if (evidence?.schema_version !== 1 || evidence.delivery_contract !== "selected-project-delivery/v1"
-      || evidence.delivery_state !== "working_copy_report"
+      || !["working_copy_report", "project_work_report"].includes(evidence.delivery_state)
       || !["long_horizon_agent_event", "long_horizon_recovered_dialogue"].includes(evidence.kind)) return "";
-  return "Not delivered at this point. This agent reply describes work in the team's private copy. "
-    + "Use Nexus's delivery confirmation for the files available in your project."
+  if (evidence.delivery_state === "project_work_report") return "Agent work report. Files saved in the working folder are available immediately. Test and review results are reported separately; this reply alone does not prove checks passed."
+    + (evidence.delivery_workspace ? ` Working folder: ${evidence.delivery_workspace}` : "");
+  return "Retained working files. This agent reply describes work in the team's private copy. "
+    + "Open working files to inspect that copy. Delivery to the destination is not confirmed by this reply."
     + (evidence.delivery_project ? ` Destination: ${evidence.delivery_project}` : "");
 }
 
-function locationOpenButton(location) {
-  const button = make("button", "compact chat-location-open", "OPEN");
+function locationOpenButton(location, label = "OPEN") {
+  const button = make("button", "compact chat-location-open", label);
   button.type = "button";
   button.title = `Open folder or show file in its folder: ${location}`;
   button.addEventListener("click", async () => {
@@ -14298,12 +14328,54 @@ function locationOpenButton(location) {
   return button;
 }
 
+function historicalWorkingFolder(evidence, goals = longGoals) {
+  if (evidence.delivery_state !== "working_copy_report" || !evidence.goal_id) return "";
+  const goal = goals.find(item => item.goal_id === evidence.goal_id);
+  if (!goal) return "";
+  // An old provider turn continues to describe its old private workspace even
+  // after recovery switches this goal to the selected project.
+  if (goal.execution_mode === "facilitator") return goal.retained_workspaces?.find(item => item.path)?.path || "";
+  return goal.workspace_path || "";
+}
+
+const historicalWorkingFolderReads = new Map();
+function readHistoricalWorkingFolder(evidence) {
+  const goalId = evidence.goal_id;
+  if (!goalId) return Promise.resolve("");
+  if (!historicalWorkingFolderReads.has(goalId)) {
+    const ticket = beginGoalSnapshotRead();
+    const pending = request(`/api/long-horizon/goal?id=${encodeURIComponent(goalId)}`)
+      .then(answer => {
+        if (answer.goal?.goal_id !== goalId) return "";
+        const goal = rememberChatGoalSnapshot(answer.goal, ticket);
+        return historicalWorkingFolder(evidence, goal ? [goal] : []);
+      }).finally(() => historicalWorkingFolderReads.delete(goalId));
+    historicalWorkingFolderReads.set(goalId, pending);
+  }
+  return historicalWorkingFolderReads.get(goalId);
+}
+
 function appendChatDeliveryNotice(container, one) {
   const notice = chatDeliveryNotice(one);
   if (!notice) return;
   const row = make("div", "chat-delivery-notice");
   row.append(make("span", "", notice));
-  if (one.correlation.delivery_project) row.append(locationOpenButton(one.correlation.delivery_project));
+  const evidence = one.correlation;
+  const working = evidence.delivery_workspace || historicalWorkingFolder(evidence)
+    || (evidence.delivery_state === "project_work_report" ? evidence.delivery_project : "");
+  if (working) row.append(locationOpenButton(working, "Open working files"));
+  if (evidence.delivery_state === "working_copy_report" && evidence.delivery_project
+      && evidence.delivery_project !== working) row.append(locationOpenButton(evidence.delivery_project, "Open destination"));
+  if (!working && evidence.delivery_state === "working_copy_report" && evidence.goal_id) {
+    const finding = make("span", "hint", "Locating retained working files…");
+    row.append(finding);
+    readHistoricalWorkingFolder(evidence).then(path => {
+      if (path) {
+        finding.remove();
+        row.append(locationOpenButton(path, "Open working files"));
+      } else finding.textContent = "Retained working folder is unavailable in the saved goal details.";
+    }).catch(() => { finding.textContent = "Could not load the retained working folder. Reopen this chat to retry."; });
+  }
   container.append(row);
 }
 
@@ -14322,6 +14394,8 @@ function normalizedLongHorizonCorrelation(one) {
     goalId: String(raw.goal_id),
     status: String(raw.goal_status || "unknown"),
     deliveryLocations,
+    executionMode: String(raw.execution_mode || ""),
+    verificationStatus: String(raw.verification_status || ""),
   };
 }
 
@@ -14397,11 +14471,14 @@ function aChatGoalCompletionRow(text, at, correlation, className) {
   heading.append(aChatTurnFace({speaker_id: "nexus"}, null, "chat-goal-completion-icon", 32));
   const title = make("div", "chat-goal-completion-titles");
   title.append(make("span", "chat-goal-completion-speaker", "Nexus Harness"));
-  title.append(make("strong", "chat-goal-completion-title", "Task completed"));
+  title.append(make("strong", "chat-goal-completion-title",
+    correlation.executionMode === "facilitator" ? "Agent work finished" : "Task completed"));
   heading.append(title);
   row.append(heading);
   row.append(make("p", "chat-goal-completion-text",
-    "This goal is marked complete. Open its details to review the result and verification evidence."));
+    correlation.executionMode === "facilitator"
+      ? `The agents have finished their turns. ${correlation.verificationStatus === "passed" ? "Recorded checks passed." : correlation.verificationStatus === "failed" ? "Checks failed; saved files remain available." : "No passing check result is recorded."}`
+      : "This goal is marked complete. Open its details to review the result and verification evidence."));
   appendLongHorizonGoalLink(row, correlation);
   // A historical completion status alone is not proof that checks passed.
   // Preserve its exact original wording as a saved record, without upgrading
@@ -14410,13 +14487,15 @@ function aChatGoalCompletionRow(text, at, correlation, className) {
   record.append(make("summary", "", "Saved status record"));
   // Delivery locations are actionable results, so expose the engine's full
   // status by default when it includes its destination readback receipt.
-  record.open = String(text).includes("\nDelivery checked in: ");
+  record.open = correlation.executionMode === "facilitator"
+    || String(text).includes("\nDelivery checked in: ");
   for (const line of String(text).split("\n")) {
     const location = line.startsWith("Delivery checked in: ") ? line.slice("Delivery checked in: ".length) : line;
     const trusted = correlation.deliveryLocations?.includes(location);
     if (trusted) {
       const item = make("div", "chat-delivery-location");
-      item.append(make("span", "", line), locationOpenButton(location)); record.append(item);
+      item.append(make("span", "", line), locationOpenButton(location,
+        correlation.executionMode === "facilitator" ? "Open working files" : "OPEN")); record.append(item);
     } else appendChatText(record, line);
   }
   if (at) record.append(make("p", "hint", at));
@@ -16480,17 +16559,12 @@ function renderMissionControl() {
     || !["ready", "blocked", "failed", "waiting"].includes(selectedTask.state);
   $("missionRetry").disabled = immutable || providerSetupChanged || hasPendingDecision || !selectedTask
     || !["blocked", "failed"].includes(selectedTask.state);
-  const selectedOwner = longGoal?.agents?.find(
-    (one) => one.id === selectedTask?.assigned_agent_id);
-  const independentReviewerAvailable = (longGoal?.agents || []).some(
-    (one) => one.id !== selectedTask?.assigned_agent_id
-      && one.provider_identity_sha256
-      && selectedOwner?.provider_identity_sha256
-      && one.provider_identity_sha256 !== selectedOwner.provider_identity_sha256);
+  const independentReviewerAvailable = Boolean(goalReviewer(longGoal, selectedTask));
   $("missionRequestReview").disabled = immutable || providerSetupChanged || hasPendingDecision
     || !selectedTask || !independentReviewerAvailable;
   $("missionRequestReview").title = !selectedTask || independentReviewerAvailable
     ? ""
+    : longGoal?.execution_mode === "facilitator" ? "Select another authorized agent to review this task."
     : "Independent review needs an authorized agent on a different provider backend; another route alias is not enough.";
 
   const pending = longGoal?.pending_interrupts || [];
@@ -16586,9 +16660,11 @@ function renderMissionControl() {
     rememberChatGoalSnapshot(result); await refreshLongGoals(true);
   });
   if (longGoal?.workspace_path) {
-    evidence.append(make("h3", "", "Retained working copy"),
-      make("p", "hint", String(longGoal.workspace_path)));
-    if (longGoal.workspace_publication?.state) evidence.append(make("p", "hint",
+    evidence.append(make("h3", "", longGoal.execution_mode === "facilitator" ? "Working folder" : "Retained working copy"),
+      make("p", "hint", String(longGoal.workspace_path)), locationOpenButton(longGoal.workspace_path, "Open working files"));
+    if (longGoal.execution_mode !== "facilitator" && longGoal.project_path && longGoal.project_path !== longGoal.workspace_path)
+      evidence.append(locationOpenButton(longGoal.project_path, "Open destination"));
+    if (longGoal.execution_mode !== "facilitator" && longGoal.workspace_publication?.state) evidence.append(make("p", "hint",
       `Result publication: ${longGoal.workspace_publication.state}`));
     if (!["complete", "cancelled", "cancelling"].includes(longGoal.status)) {
       const approval = make("button", "compact", "Review this chat's test commands");
@@ -20938,14 +21014,10 @@ function wireUpTheSwarmBoard() {
   });
   $("missionRequestReview").addEventListener("click", async () => {
     const task = longGoal?.tasks?.find((one) => one.id === selectedMissionTaskId);
-    const owner = longGoal?.agents?.find((one) => one.id === task?.assigned_agent_id);
-    const reviewer = longGoal?.agents?.find(
-      (one) => one.id !== task?.assigned_agent_id
-        && one.provider_identity_sha256
-        && owner?.provider_identity_sha256
-        && one.provider_identity_sha256 !== owner.provider_identity_sha256);
+    const reviewer = goalReviewer(longGoal, task);
     if (!task || !reviewer) return showError(
-      "Select a task with an authorized agent on a different provider backend. Route aliases for the same backend are not independent reviewers."
+      longGoal?.execution_mode === "facilitator" ? "Select a task with another authorized agent available to review it."
+        : "Select a task with an authorized agent on a different provider backend. Route aliases for the same backend are not independent reviewers."
     );
     await missionControl("request_review", {task_id: task.id, agent_id: reviewer.id});
   });
