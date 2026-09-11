@@ -15,6 +15,11 @@ def workspace(request):
     context = request.workspace_context
     root = _direct(Path(request.working_directory))
     source = _direct(Path(context.project_path))
+    if context.execution_mode == "facilitator":
+        if not request.working_directory or not Path(request.working_directory).is_absolute() \
+                or root != source or root != _direct(Path(context.execution_path)) or not root.is_dir():
+            raise HarnessError("Facilitator native execution must use the selected project folder")
+        return root
     if not request.working_directory or not Path(request.working_directory).is_absolute() \
             or root != _direct(Path(context.execution_path)) or not root.is_dir() \
             or root == source or source in root.parents or root in source.parents:
@@ -27,6 +32,15 @@ def instructions(request):
     if root is None:
         return ""
     writable = request.native_execution == "work"
+    if request.workspace_context.execution_mode == "facilitator":
+        return (
+            "NATIVE AGENT EXECUTION\nYour working directory is the selected project: " + str(root) + ". "
+            + ("Use native commands and edits under the granted access. Saved files are immediately visible. "
+               "Return changes=[] for files already edited. " if writable else
+               "Use native inspection tools. Propose permitted edits through changes and request commands through Nexus tool_calls. ")
+            + "Report command failures and test results accurately; they do not hide saved work. "
+            "Respect the user's selected roles and permissions. Return the requested structured action."
+        )
     return (
         "NATIVE AGENT EXECUTION\nYour working directory is your own project copy: " + str(root) + ". "
         "Use your native file, search, web and skill tools to investigate the task. "
