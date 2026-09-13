@@ -68,7 +68,11 @@ test('latest message attribution, empty inbox, and polling loop with local route
       return route.fulfill({contentType:'text/html',body:`<button id="mectrl_main_trigger" aria-label="person@example.test">Account</button><main role="main">${empty?'<h2>Your inbox is empty.</h2>':row}</main>`});
     });
     await page.goto('https://outlook.office.com/mail/inbox');
-    const value={page,provider:'browser_outlook'};
+    // Establish a clickable routed inbox before starting the worker's short
+    // virtualization budget; browser startup is not part of that contract.
+    await page.bringToFront();
+    await page.locator('[data-convid="thread1"]').click({trial:true,timeout:15000});
+    const value={page,provider:'browser_outlook',lastInboxRefresh:Date.now()};
     const request={command:'sync',connection:{email:'person@example.test'}};
     await assert.rejects(status(value,{email:'foreign@example.test'}),/different mailbox/);
     const first=await operate(value,request);
