@@ -11,7 +11,8 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $repository = 'KZTP47/nexus-harness'
 $allowedHosts = @('api.github.com', 'github.com', 'objects.githubusercontent.com', 'release-assets.githubusercontent.com')
-$maximumInstallerBytes = 367001600
+# 400 MiB accommodates the pinned Java/Kestra bundle while bounding downloads.
+$maximumInstallerBytes = 419430400
 $offlineBundleManifestName = 'Nexus-Harness-Offline-Bundle.json'
 $offlineBundleContract = 'nexus-harness.windows-offline-bundle'
 $offlineBundleSchemaVersion = 2

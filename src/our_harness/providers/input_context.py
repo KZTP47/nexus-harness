@@ -36,6 +36,12 @@ def workspace_instructions(context: ProviderWorkspaceContext | None) -> str:
     if any(not isinstance(value, str) or not value.strip() or len(value) > 16_384
            for value in values.values()):
         raise HarnessError("Provider workspace identity is incomplete")
+    if context.execution_mode == "facilitator":
+        return ("\n\nNEXUS WORKSPACE IDENTITY (ENGINE METADATA)\n"
+            + json.dumps({"schema_version": 1, **values, "execution_mode": "facilitator"}, ensure_ascii=False)
+            + "\nThe execution path is the selected project itself. Files are saved directly there, "
+              "and commands use the saved access grant. Tests and reviewer feedback are advisory. "
+              "Use these exact paths; other remembered projects and attachment storage are not destinations.")
     return (
         "\n\nNEXUS WORKSPACE IDENTITY (ENGINE METADATA)\n"
         + json.dumps({"schema_version": 1, **values}, ensure_ascii=False, sort_keys=True)

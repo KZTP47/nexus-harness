@@ -145,7 +145,7 @@ test("actual chat renderers keep both agent replies readable across routine goal
   }
 });
 
-test("full chat prioritizes visible replies, collapses setup, and retains keyboard resizing at desktop and narrow widths", {
+test("full chat prioritizes visible replies, separates setup, and retains keyboard resizing at desktop and narrow widths", {
   skip: !fs.existsSync(manifestPath) && !process.env.NEXUS_TEST_CHROMIUM,
   timeout: 45000,
 }, async () => {
@@ -202,7 +202,7 @@ test("full chat prioritizes visible replies, collapses setup, and retains keyboa
         return Math.max(0, Math.min(rect.bottom, list.bottom, innerHeight) - Math.max(rect.top, list.top, 0));
       });
       return {transcriptHeight: list.height, transcriptWidth: list.width, replies,
-        setupOpen: document.querySelector("#theBigChatDestination").open,
+        setupVisible: document.querySelector("#theBigChatDestination").getBoundingClientRect().height > 0,
         teamPanelOpen: document.querySelector(".chat-team-goal-disclosure").open,
         historyVisible: getComputedStyle(document.querySelector(".the-big-chat-conversations")).display !== "none",
         limitsOpen: document.querySelector("#theBigChatLimits").open,
@@ -214,7 +214,7 @@ test("full chat prioritizes visible replies, collapses setup, and retains keyboa
     assert.ok(desktop.transcriptHeight >= 300, JSON.stringify(desktop));
     assert.ok(desktop.transcriptWidth >= 1000, JSON.stringify(desktop));
     assert.ok(desktop.replies.every((height) => height >= 30), JSON.stringify(desktop));
-    assert.equal(desktop.setupOpen, false);
+    assert.equal(desktop.setupVisible, false);
     assert.equal(desktop.teamPanelOpen, false);
     assert.equal(desktop.historyVisible, false);
     assert.equal(desktop.limitsOpen, false);

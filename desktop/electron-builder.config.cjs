@@ -2,7 +2,8 @@
 
 const packageJson = require("./package.json");
 const { withSelectedRuntime } = require("./runtime-selection");
+const { withPreservedKestraJava } = require("./kestra-signing.cjs");
 
 const configured = packageJson.build;
 
-module.exports = withSelectedRuntime(configured, __dirname);
+module.exports = withPreservedKestraJava(withSelectedRuntime(configured, __dirname), __dirname);

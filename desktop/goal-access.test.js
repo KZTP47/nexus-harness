@@ -17,7 +17,8 @@ test("visible permissions support deny, once, always, mode changes and stale err
     const page = await browser.newPage({viewport: {width:1264,height:850}});
     await page.setContent('<main style="max-width:1000px;margin:20px auto;padding:12px"><h1>Nexus Harness · Team chat</h1><section id="panel" class="swarm-chat-team-goal"></section></main>');
     await page.addStyleTag({content: fs.readFileSync(path.join(ui, "styles.css"), "utf8")});
-    await page.addScriptTag({content: source.slice(source.indexOf("function appendGoalAccessControls"), source.indexOf("function fillChatGoalPanel")) + `
+    await page.addScriptTag({content: source.slice(source.indexOf("function goalCommandLocation"), source.indexOf("function goalWorkspaceWords"))
+      + source.slice(source.indexOf("function appendGoalAccessControls"), source.indexOf("function fillChatGoalPanel")) + `
       function make(tag, cls='', text='') { const n=document.createElement(tag); n.className=cls; n.textContent=text; return n; }
       const goal={goal_id:'exact-goal',revision:3,status:'paused',workspace_path:'portable-workspace',project:{id:'project'},
         tasks:[],agent_access:{mode:'ask'},command_request:{state:'pending'}};
@@ -103,5 +104,23 @@ test("visible permissions support deny, once, always, mode changes and stale err
       assert.equal(selected.draft.access_mode, mode);
       assert.equal(selected.intent.policy.agent_access_mode, mode);
     }
+    for (const execution of ['isolated', 'facilitator']) {
+      await page.locator("#longGoalExecution").selectOption(execution);
+      assert.equal(await page.evaluate(()=>JSON.parse(longGoalIntent(longGoalComposerDraft())).policy.execution_mode), execution);
+    }
+    await page.setContent('<main id="evidence"></main>');
+    await page.addScriptTag({content:
+      source.slice(source.indexOf("function appendFacilitatorRecovery"), source.indexOf("function goalReviewer")) + `
+      window.recoveries=[];
+      async function missionControl(action, payload) {recoveries.push({action,payload});}
+      window.recoveryGoal={execution_workspace:{path:'private-copy'},status:'paused',revision:27,agent_access:{mode:'ask'}};
+      window.drawRecovery=()=>{const evidence=document.getElementById('evidence');evidence.replaceChildren();appendFacilitatorRecovery(evidence,recoveryGoal);};
+      drawRecovery();`});
+    await page.getByRole('button', {name:'Recover files and resume in selected project', exact:true}).click();
+    assert.deepEqual(await page.evaluate(()=>recoveries), [{action:'resume',payload:{facilitator_mode:true,expected_revision:27}}]);
+    await page.evaluate(()=>{recoveryGoal.agent_access.mode='read_only';drawRecovery();});
+    assert.equal(await page.getByRole('button', {name:'Recover files and resume in selected project', exact:true}).isDisabled(), true);
+    await page.evaluate(()=>{delete recoveryGoal.execution_workspace;drawRecovery();});
+    assert.equal(await page.getByRole('button', {name:'Recover files and resume in selected project', exact:true}).count(), 0);
   } finally { await browser.close(); }
 });

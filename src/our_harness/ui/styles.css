@@ -1975,7 +1975,7 @@ body.has-a-tray .app-shell { padding-bottom: 68px; }
   border-radius: 12px;
   background: #0b202c;
 }
-.the-big-chat-transcript:has(#theBigChatTeamGoal[hidden]) { grid-template-rows: minmax(0, 1fr) auto; }
+.the-big-chat-transcript:has(#theBigChatTeamGoal[hidden]), #theBigChatChatPanel .the-big-chat-transcript { grid-template-rows: minmax(0, 1fr) auto; }
 .the-big-chat-said {
   list-style: none;
   margin: 0; padding: 16px;
@@ -2528,15 +2528,23 @@ button.compact { min-height: 32px; padding: 4px 8px; margin: 2px 0; }
   min-height: 22px; cursor: row-resize; touch-action: none;
   background: #123342; font-size: .72rem; z-index: 2;
 }
-.prompt-library-dialog { width: 850px; max-width: 94vw; max-height: 88vh; overflow: auto; background: #102e3c; color: #eefaff; border: 1px solid var(--cyan); border-radius: 12px; padding: 20px; }
+.prompt-library-dialog { width: 850px; height: 620px; min-width: min(360px, 94vw); min-height: min(380px, 88vh); max-width: 94vw; max-height: 88vh; box-sizing: border-box; resize: both; overflow: hidden; background: #102e3c; color: #eefaff; border: 1px solid var(--cyan); border-radius: 12px; padding: 20px; }
+.prompt-library-dialog[open] { display: flex; flex-direction: column; }
+.prompt-library-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex: none; }
+.prompt-library-header h2 { margin: 0; }
+.prompt-library-header button { flex: none; }
 .prompt-library-dialog::backdrop { background: #0008; }
-.prompt-library-grid { display: grid; grid-template-columns: minmax(150px, 1fr) minmax(0, 2fr); gap: 18px; }
-.prompt-library-list { max-height: 45vh; overflow: auto; }
+.prompt-library-grid { display: grid; grid-template-columns: minmax(150px, 1fr) minmax(0, 2fr); gap: 18px; flex: 1; min-height: 0; overflow: auto; }
+.prompt-library-grid > div:first-child { display: flex; flex-direction: column; min-height: 0; gap: 6px; }
+.prompt-library-grid > div:first-child > input, .prompt-library-grid > div:first-child > button { flex: none; }
+.prompt-library-list { min-height: 40px; overflow: auto; flex: 1; }
+.prompt-library-editor { display: grid; grid-template-rows: auto auto auto minmax(120px, 1fr) auto; min-width: 0; }
 .prompt-library-list button { display: block; width: 100%; text-align: left; margin: 5px 0; overflow-wrap: anywhere; }
 .prompt-library-editor input, .prompt-library-editor textarea, .prompt-library-search { width: 100%; box-sizing: border-box; }
-.prompt-library-editor textarea { min-height: 220px; }
+.prompt-library-editor textarea { min-height: 120px; height: 100%; resize: none; }
+.prompt-library-editor .button-row { margin-top: 12px; }
 .prompt-library-dialog label { display: block; margin: 8px 0 4px; }
-@media (max-width: 600px) { .prompt-library-grid { grid-template-columns: 1fr; } .prompt-library-list { max-height: 130px; } }
+@media (max-width: 600px) { .prompt-library-grid { grid-template-columns: 1fr; grid-template-rows: minmax(180px, auto) minmax(300px, 1fr); } .prompt-library-list { max-height: 130px; } }
 /* The fixed status below the conversation already explains why answers are
    needed. Keep the decision area's height for the actual questions. */
 .the-big-chat-transcript .chat-team-goal-body:has(.chat-goal-question-set) > p:not(.chat-force-status) { display: none; }
@@ -2582,3 +2590,41 @@ button.compact { min-height: 32px; padding: 4px 8px; margin: 2px 0; }
 .chat-collaboration-roles { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.6rem; }
 .chat-collaboration-roles[hidden] { display: none; }
 .chat-collaboration-direct { display: flex; align-items: start; gap: 0.5rem; }
+
+/* Conversation and collaboration occupy separate panes, including on small screens. */
+.the-big-chat .the-big-chat-main:has(> .chat-view-tabs) { grid-template-rows: auto minmax(0, 1fr); gap: 4px; }
+.chat-view-tabs { display: flex; flex-wrap: wrap; gap: 6px; border-bottom: 1px solid var(--line); padding-bottom: 6px; }
+.chat-view-tabs [role=tab] { border-radius: 8px 8px 0 0; padding: 4px 12px; }
+.chat-view-tabs [aria-selected=true] { background: #153e4d; border-color: var(--cyan, #52d5ea); color: #dcfaff; }
+.chat-view-tabs [role=tab]:focus-visible { outline: 2px solid var(--cyan, #52d5ea); outline-offset: 2px; }
+.chat-settings-needed { margin-left: 8px; color: var(--amber, #ffc65a); font-size: .75rem; }
+#theBigChatChatPanel { display: grid; grid-template-rows: minmax(96px, 1fr) 12px minmax(150px, var(--big-chat-composer-height)); min-width: 0; min-height: 0; margin: 0; }
+#theBigChatSettingsPanel { min-width: 0; min-height: 0; overflow: auto; padding: 12px 16px; border: 1px solid var(--line); border-radius: 10px; }
+#theBigChatChatPanel[hidden], #theBigChatSettingsPanel[hidden] { display: none !important; }
+#theBigChatSettingsPanel #theBigChatDestination { height: auto; max-height: none; overflow: visible; margin: 18px 0; }
+#theBigChatSettingsPanel #theBigChatDestination .chat-destination { height: auto; max-height: none; overflow: visible; }
+#theBigChatDestination > h3 { margin: 0 0 12px; font-size: 1rem; }
+.chat-facilitator-section { border: 2px solid var(--cyan, #52d5ea); border-radius: 12px; background: #153e4d; padding: 18px; margin: 0 0 12px; }
+.chat-facilitator-section h3 { margin: 0 0 10px; font-size: 1.25rem; color: #dcfaff; }
+.chat-facilitator-section p { margin: 10px 0; overflow-wrap: anywhere; }
+.chat-facilitator-state { font-weight: 700; color: #dcfaff; }
+.chat-facilitator-section button { white-space: normal; }
+#theBigChatSettingsPanel .chat-team-goal-body { display: block; }
+#theBigChatSettingsPanel .chat-team-goal-body > button { margin: 6px 8px 6px 0; }
+#theBigChatWorkMode h4 { margin: 0 0 6px; }
+#theBigChatWorkMode .chat-composer-permissions-body { display: grid; gap: 12px; }
+#theBigChatWorkMode label { display: grid; gap: 6px; }
+#theBigChatWorkMode select { max-width: 100%; }
+@media (max-width: 700px) {
+  #theBigChatSettingsPanel { padding: 10px; }
+  .chat-view-tabs [role=tab] { padding: 7px 10px; }
+}
+#theBigChatSettingsPanel .chat-team-goal:has(.chat-team-goal-disclosure[open]) { height: auto; max-height: none; overflow: visible; }
+#theBigChatSettingsPanel .chat-team-panel-resize { display: none; }
+#theBigChatSettingsPanel .chat-team-goal-body:has(.chat-goal-question-set) > p:not(.chat-force-status) { display: none; }
+#theBigChatSettingsPanel [hidden] { display: none !important; }
+#theBigChatWorkMode .chat-collaboration-direct { display: flex; align-items: center; gap: 8px; }
+#theBigChatWorkMode .chat-collaboration-direct input { width: auto; margin: 0; }
+@media (max-width: 520px) {
+  #theBigChatChatPanel { grid-template-rows: minmax(100px, 1fr) 180px; }
+}

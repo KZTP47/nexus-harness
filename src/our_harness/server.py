@@ -359,6 +359,8 @@ class HarnessHTTPServer(ThreadingHTTPServer):
         # see that this is a different one and start listening again from the
         # beginning, instead of waiting forever for numbers that will never come.
         self.started_id = secrets.token_urlsafe(8)
+        from .email_service import EmailService
+        self.email = EmailService(self)
         self.events = EventBus(redactor=CredentialRedactor(config))
         self._swarm_runs: swarm_runs.SwarmRunStore | None = None
         self._swarm_communication_runs: swarm_runs.SwarmRunStore | None = None
@@ -452,6 +454,7 @@ class HarnessHTTPServer(ThreadingHTTPServer):
         self.workflow_policy = resolve_workflow_policy(config, registry.workflow_nodes)
         self.check_kinds = dict(registry.check_kinds)
         self.template = migrate_graph(json.loads(files("our_harness.templates").joinpath("gauntlet.json").read_text(encoding="utf-8")))
+        self.email.restore_if_present()
 
     @property
     def swarm_known_routes(self) -> list[dict[str, Any]] | None:
@@ -2963,6 +2966,7 @@ class HarnessHTTPServer(ThreadingHTTPServer):
         return self.require_no_long_horizon_path(root)
 
     def server_close(self) -> None:
+        self.email.close()
         with self._long_horizon_lifecycle_lock:
             with self.authority_lock:
                 held = self._long_horizon
@@ -3767,6 +3771,13 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 self._static("styles.css", "text/css; charset=utf-8")
             elif parsed.path == "/app.js":
                 self._static("app.js", "text/javascript; charset=utf-8")
+            elif parsed.path == "/email.js":
+                self._static("email.js", "text/javascript; charset=utf-8")
+            elif parsed.path == "/email.css":
+                self._static("email.css", "text/css; charset=utf-8")
+            elif parsed.path == "/api/email":
+                self._require_token()
+                self._json(self.server.email.snapshot())
             elif parsed.path == "/api/bootstrap":
                 # This is the one call that hands out the session key, so it must
                 # come from the panel's own page. A browser always says where a
@@ -4554,9 +4565,19 @@ class HarnessHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         try:
+            if self.path in {"/api/email-worker/generate", "/api/email-worker/finalize"}:
+                self._validate_authority()
+                self._validate_request_site()
+                supplied = self._single_header("X-Nexus-Email-Token")
+                if not secrets.compare_digest(supplied, self.server.email.callback_token):
+                    raise HarnessError("Missing or invalid email workflow token")
+                self._json(self.server.email.worker(self.path.rsplit("/", 1)[1], self._body()))
+                return
             self._authorize()
             body = self._body()
-            if self.path == "/api/web-chats/heartbeat":
+            if self.path.startswith("/api/email/"):
+                self._json(self.server.email.dispatch(self.path.removeprefix("/api/email/"), body))
+            elif self.path == "/api/web-chats/heartbeat":
                 routes = self.server.web_chats.heartbeat(body.get("connections"))
                 self._json({"routes": routes})
             elif self.path == "/api/web-chats/complete":

@@ -144,11 +144,17 @@ function normalizedPayload(raw) {
   }
   const policy = {};
   if (Object.hasOwn(raw, "policy")) {
-    exactKeys(raw.policy, new Set(["agent_access_mode", "collaboration"]), "Direct-goal permissions");
+    exactKeys(raw.policy, new Set(["agent_access_mode", "execution_mode", "collaboration"]), "Direct-goal permissions");
     if (!["read_only", "ask", "full"].includes(raw.policy.agent_access_mode)) {
       throw fail("NEXUS_OUTBOX_INVALID", "Direct-goal permissions must name a supported access mode.");
     }
     policy.policy = {agent_access_mode: raw.policy.agent_access_mode};
+    if (Object.hasOwn(raw.policy, "execution_mode")) {
+      if (!["isolated", "facilitator"].includes(raw.policy.execution_mode)) {
+        throw fail("NEXUS_OUTBOX_INVALID", "Direct-goal permissions must name a supported execution mode.");
+      }
+      policy.policy.execution_mode = raw.policy.execution_mode;
+    }
     if (Object.hasOwn(raw.policy, "collaboration")) {
       const settings = raw.policy.collaboration;
       exactKeys(settings, new Set(["mode", "writer_id", "reviewer_id", "allow_direct_real_edits"]), "Collaboration settings");

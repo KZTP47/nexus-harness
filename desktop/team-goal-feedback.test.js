@@ -40,6 +40,9 @@ test("actual chat activity and decision controls fit wide and narrow windows and
       ${section("const chatGoalRequests =", "function chatGoalParticipants")}
       ${section("function chatGoalParticipants", "function rememberChatGoalSnapshot")}
       ${section("function fillChatGoalPanel", "function syncChatGoalControls")}
+      ${section("function goalCommandLocation", "function goalReviewer")}
+      ${section("function directLongGoalCanonicalValue", "async function prepareDirectLongGoalAdmission")}
+      ${section("function chatCollaborationPreference", "function appendGoalAccessControls")}
       ${section("function normalizedUserQuestions", "function frozenWorkRecovery")}
       ${section("function aChatActivityPanel", "async function pollSwarmChatActivity")}
       ${section("function longHorizonStateWords", "function longHorizonAssignmentsForAgent")}
@@ -66,8 +69,8 @@ test("actual chat activity and decision controls fit wide and narrow windows and
         window.submissions.push({url,body:JSON.parse(options.body)}); return {goal:longGoals[0]};
       }
       async function refreshChatGoalAfterAction() {}
-      window.setGoal = (changes) => { Object.assign(longGoals[0],changes); fillChatGoalPanel($('theBigChatTeamGoal'),'builder',chatLongGoalContext('builder')); renderSwarmChatActivity('builder'); };
-      window.renderFeedback = () => { fillChatGoalPanel($('theBigChatTeamGoal'),'builder',chatLongGoalContext('builder')); renderSwarmChatActivity('builder'); };
+      window.setGoal = (changes) => { Object.assign(longGoals[0],changes); renderFeedback(); };
+      window.renderFeedback = () => { fillChatGoalPanel($('theBigChatTeamGoal'),'builder',chatLongGoalContext('builder')); syncBigChatTabs('builder',chatLongGoalContext('builder')); renderSwarmChatActivity('builder'); };
       for (let one=$('theBigChat');one;one=one.parentElement) one.hidden=false;
       $('theBigChatTitle').textContent='Builder ↔ Reviewer — Portable project';
       $('theBigChatScopeHint').textContent='Your messages steer this team’s current goal.';
@@ -104,6 +107,7 @@ test("actual chat activity and decision controls fit wide and narrow windows and
           {label:'Continue with the current team',description:'Keep both agents and let them finish their shared work.',recommended:true},
           {label:'Review the saved work first',description:'Inspect the existing result before continuing. '+ 'portable-evidence-'.repeat(8)}]}]}]}));
       assert.equal(await page.locator("#theBigChatActivity .chat-activity-stage").textContent(), "Waiting for your answer");
+      await page.getByRole('tab',{name:'collaboration settings',exact:true}).click();
       const options = await page.locator("#theBigChatTeamGoal .agent-question-option").evaluateAll(rows=>rows.map(row=>{
         const box=row.getBoundingClientRect(),radio=row.querySelector('input').getBoundingClientRect(),words=row.querySelector('.agent-question-option-words'),text=words.getBoundingClientRect();
         return {radioWidth:radio.width,radioHeight:radio.height,font:parseFloat(getComputedStyle(words).fontSize),
@@ -137,11 +141,13 @@ test("actual chat activity and decision controls fit wide and narrow windows and
         'Use a different approach for this project.');
       geometry.push({viewport,activity,options});
       await page.evaluate(()=>setGoal({status:'running',pending_interrupts:[]}));
+      await page.getByRole('tab',{name:'CHAT',exact:true}).click();
     }
     // Selection is a native radio interaction. A repeated status poll must not
     // reset it, and submitting must retain the exact pending decision identity.
     await page.evaluate(()=>setGoal({status:'waiting_for_user',pending_interrupts:[{id:'decision-b',reason:'Choose controls',questions:[{
       id:'controls',prompt:'Keyboard or mouse?',allow_other:false,options:[{label:'Keyboard',description:'Use arrow keys.'},{label:'Mouse',description:'Use clicks.'}]}]}]}));
+    await page.getByRole('tab',{name:'collaboration settings',exact:true}).click();
     await page.locator('#theBigChatTeamGoal').getByText('Keyboard',{exact:true}).click();
     await page.evaluate(()=>renderFeedback());
     assert.equal(await page.locator('#theBigChatTeamGoal input[value="Keyboard"]').isChecked(),true);
@@ -162,6 +168,7 @@ test("actual chat activity and decision controls fit wide and narrow windows and
     await page.evaluate(note=>setGoal({status:'paused',pending_interrupts:[],note}),longPause);
     assert.equal(await page.locator('#theBigChatActivity .chat-activity-detail').textContent(),
       'The verifier needs a corrected project snapshot.');
+    await page.getByRole('tab',{name:'CHAT',exact:true}).click();
     await page.locator('#theBigChatActivity .chat-activity-explanation summary').click();
     assert.equal(await page.locator('#theBigChatActivity .chat-activity-explanation p').textContent(),longPause.trim());
     await page.evaluate(()=>renderFeedback());
@@ -172,6 +179,7 @@ test("actual chat activity and decision controls fit wide and narrow windows and
     for (const width of [1264,390]) {
       await page.setViewportSize({width,height:850});
       await page.evaluate(()=>setGoal({status:'paused',pending_interrupts:[],command_request:{state:'pending'},scheduler_live:false,agent_access:{mode:'ask'}}));
+      await page.getByRole('tab',{name:'collaboration settings',exact:true}).click();
       await page.getByRole('button',{name:'Run once',exact:true}).waitFor();
       await page.getByRole('button',{name:'Run once',exact:true}).scrollIntoViewIfNeeded();
       const visible=await page.getByRole('button',{name:'Run once',exact:true}).evaluate(button=>{

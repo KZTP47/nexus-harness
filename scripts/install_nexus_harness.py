@@ -24,7 +24,7 @@ from urllib.parse import urlparse
 
 REPOSITORY = "KZTP47/nexus-harness"
 LATEST_RELEASE_API = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
-MAX_INSTALLER_BYTES = 350 * 1024 * 1024
+MAX_INSTALLER_BYTES = 400 * 1024 * 1024
 ALLOWED_DOWNLOAD_HOSTS = {
     "api.github.com",
     "github.com",

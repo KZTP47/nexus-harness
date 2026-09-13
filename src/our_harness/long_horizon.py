@@ -35,6 +35,7 @@ from . import chat as chat_lab
 from . import user_questions
 from .changes import FileTransaction
 from .config import LoadedConfig
+from .filesystem_paths import filesystem_path
 from .models import ContextRequestError, HarnessError, ProviderOutcomeUnknown, ProviderWorkspaceContext, ResponseFormat
 from .pipeline_runs import _owner_is_alive, _process_token, inspect_project_authority, project_identity
 from .providers.base import STRICT_OUTPUT_SCHEMA_CONTRACT, _strict_output_schema
@@ -54,6 +55,7 @@ from . import goal_budget_policy
 from . import goal_workspaces
 from . import goal_closeout
 from . import workspace_collaboration as collaboration
+from . import facilitator
 from . import agent_workspaces
 from . import goal_access
 from . import goal_tools
@@ -486,13 +488,15 @@ def _project_key(path: Path) -> str:
     return hashlib.sha256(os.path.normcase(str(path.resolve())).encode("utf-8")).hexdigest()
 
 
-def _exclusive_project_contract(project_path: Path, project_authority_id: str) -> dict[str, Any]:
+def _exclusive_project_contract(project_path: Path, project_authority_id: str, *, facilitator_mode: bool = False) -> dict[str, Any]:
     basis = {
         "schema_version": EXECUTION_CONTRACT_SCHEMA_VERSION,
         "mode": "exclusive_project",
         "project_authority_id": str(project_authority_id),
         "root_fingerprint_sha256": _project_key(project_path),
     }
+    if facilitator_mode:
+        basis.update(mode="facilitator_project", facilitator_contract=facilitator.CONTRACT)
     return {
         **basis,
         "fingerprint_sha256": hashlib.sha256(
@@ -524,6 +528,7 @@ def _concurrent_project_copy(document: dict[str, Any]) -> bool:
 def _goal_execution_contract(document: dict[str, Any]) -> dict[str, Any]:
     contract = _exclusive_project_contract(
         Path(document["project"]["path"]), str(document.get("project_authority_id") or ""),
+        facilitator_mode=facilitator.enabled(document),
     )
     if _isolated_execution(document):
         contract.update({
@@ -2920,6 +2925,9 @@ class GoalStore(goal_access.AccessStoreMixin):
         access_mode = (policy or {}).get("agent_access_mode", "ask")
         if not isinstance(access_mode, str) or access_mode not in goal_access.MODES:
             raise HarnessError("Choose a supported agent access mode")
+        execution_mode = (policy or {}).get("execution_mode", "isolated")
+        if not isinstance(execution_mode, str) or execution_mode not in {"isolated", "facilitator"}:
+            raise HarnessError("Choose isolated or facilitator project work")
         _exact_request_id(request_id)
         project = next((
             one for one in board.get("projects", []) if isinstance(one, dict)
@@ -3156,7 +3164,10 @@ class GoalStore(goal_access.AccessStoreMixin):
         expected_agents: list[dict[str, Any]] | None = None,
         require_all_participants: bool | None = None,
         isolated_workspace: bool = False,
+        facilitator_mode: bool = False,
     ) -> dict[str, Any]:
+        if type(facilitator_mode) is not bool or facilitator_mode and isolated_workspace:
+            raise HarnessError("Choose one supported project execution mode")
         exact_conversation_id = _exact_conversation_id(conversation_id)
         require_all = bool(participant_ids) if require_all_participants is None \
             else bool(require_all_participants)
@@ -3335,7 +3346,7 @@ class GoalStore(goal_access.AccessStoreMixin):
             "legacy_available": True,
             "agent_access_mode": (policy or {}).get("agent_access_mode", "ask"),
         }
-        execution_contract = _exclusive_project_contract(root, target_authority_id)
+        execution_contract = _exclusive_project_contract(root, target_authority_id, facilitator_mode=facilitator_mode)
         collaboration_contract = _collaboration_contract(require_all)
         verification_contract = capture_verification_contract(self.config, project, root)
         bound_admission_digest = _short(admission_digest, 128) or hashlib.sha256(
@@ -3418,7 +3429,11 @@ class GoalStore(goal_access.AccessStoreMixin):
             "parent_goal_id": "",
             "fork_checkpoint": 0,
         }
-        if isolated_workspace:
+        if facilitator_mode:
+            document["execution_mode"] = "facilitator"
+            document["note"] = "Agents work directly in the selected project. Checks and reviews are advisory."
+            collaboration.install(document, (policy or {}).get("collaboration"))
+        elif isolated_workspace:
             document["execution_workspace"] = goal_workspaces.create(document, self.root)
             document["execution_contract"] = self._execution_contract_for(document)
             document["agent_workspace_contract"] = agent_workspaces.CONTRACT
@@ -3749,7 +3764,7 @@ class GoalStore(goal_access.AccessStoreMixin):
     def adopt_isolated_workspace(self, goal_id: str) -> dict[str, Any]:
         """Upgrade settled saved chats without replaying or moving an in-flight effect."""
         def change(document: dict[str, Any], db: sqlite3.Connection):
-            if _isolated_execution(document) or not document.get("conversation_id") \
+            if facilitator.enabled(document) or _isolated_execution(document) or not document.get("conversation_id") \
                     or document.get("status") in TERMINAL_GOALS | {"cancelling"} \
                     or self._scheduler_live(document) or any(
                         task.get("state") == "running" or task.get("pending_transaction")
@@ -4109,6 +4124,8 @@ class GoalStore(goal_access.AccessStoreMixin):
                 "recovery_action": "",
             }
             return value
+        if facilitator.enabled(document):
+            value["workspace_path"] = document["project"]["path"]
         if _isolated_execution(document):
             # Expose the deterministic folder for inspecting retained/conflicting
             # work. Loading chat status does not scan mutable source files.
@@ -4286,7 +4303,10 @@ class GoalStore(goal_access.AccessStoreMixin):
             document["execution_contract"] = self._execution_contract_for(document)
             document["workspace_publication"] = {"state": "pending"}
         if source.get("workspace_collaboration"):
+            document["execution_contract"] = self._execution_contract_for(document)
             collaboration.install(document, collaboration.state(source))
+        elif facilitator.enabled(document):
+            document["execution_contract"] = self._execution_contract_for(document)
         document["dialogue_archive"] = goal_dialogue.empty(document)
         if source.get("verification_contract") is not None:
             source_verification = verification_project(self.config, source)
@@ -4680,7 +4700,7 @@ class GoalStore(goal_access.AccessStoreMixin):
                 ),
             )
             for _position, task in ordered_tasks:
-                if task["state"] != "ready" or not self._compatible(task, chosen):
+                if task["state"] != "ready" or not self._compatible(task, chosen) or (facilitator.enabled(document) and chosen):
                     continue
                 if any(not _providers_independent(
                     agents.get(one["assigned_agent_id"]),
@@ -5649,6 +5669,8 @@ class GoalStore(goal_access.AccessStoreMixin):
                 str(action.get("action") or "") == "request_review"
                 or self._needs_review(document, current, action, None)
             )
+            if facilitator.enabled(document):
+                return False
             if not needed:
                 return False
             if current.get("kind") == "review":
@@ -5828,6 +5850,8 @@ class GoalStore(goal_access.AccessStoreMixin):
         interrupt_ids: list[str] = []
         def change(document: dict[str, Any], db: sqlite3.Connection):
             nonlocal interrupt_ids
+            if facilitator.enabled(document) and action.get("action") == "request_review":
+                action["action"] = "work"
             current = next(one for one in document["tasks"] if one["id"] == task["id"])
             if current["lease_id"] != task["lease_id"] or current["state"] not in {"running", "pending_apply"}:
                 raise HarnessError("A stale task action cannot change long-horizon state")
@@ -6204,6 +6228,8 @@ class GoalStore(goal_access.AccessStoreMixin):
 
     @staticmethod
     def _needs_review(document: dict[str, Any], task: dict[str, Any], action: dict[str, Any], artifact: object) -> bool:
+        if facilitator.enabled(document):
+            return False
         if task.get("kind") == "review":
             return False
         if task.get("provider_effect_id") and str(task.get("review_approved_effect_id") or "") \
@@ -6838,6 +6864,25 @@ class GoalStore(goal_access.AccessStoreMixin):
                 raise HarnessError("A terminal goal is immutable; fork it to continue with new work")
             if action in {"resume", "retry", "message"}:
                 self._settle_legacy_applied_actions(document, db)
+            if action == "resume" and payload.get("facilitator_mode") is True and _isolated_execution(document):
+                if self._scheduler_live(document):
+                    raise HarnessError("Wait for the current team turn to settle before recovering its working files.")
+                blockers = self._shared_project_owners(db, Path(document["project"]["path"]),
+                    document["project_authority_id"], except_goal_id=goal_id)
+                if blockers:
+                    raise HarnessError("Another active team owns this project. Pause or finish it before recovering these files.")
+                roles = collaboration.state(document)
+                if facilitator.recover(document, self.root):
+                    document["execution_contract"] = self._execution_contract_for(document)
+                    if roles:
+                        collaboration.install(document, roles)
+                    document["agent_access"]["binding"] = goal_access.binding(document)
+                    for item in document.get("interrupts", []):
+                        if item.get("purpose") == "risk_review" and item.get("state") == "pending":
+                            item["state"] = "superseded"
+                    if document["status"] == "waiting_for_user" and not any(i.get("state") == "pending" for i in document["interrupts"]):
+                        document["status"] = "paused"
+                    self._event(db, document, "workspace_recovered", payload=document["workspace_publication"])
             if action in {"resume", "retry", "reassign", "steer", "message", "criteria", "request_review"} \
                     and any(one.get("state") == "pending" for one in document.get("interrupts", [])):
                 raise HarnessError(
@@ -7406,7 +7451,7 @@ class GoalStore(goal_access.AccessStoreMixin):
                     raise HarnessError("Choose a different authorized agent as reviewer")
                 owner = next(one for one in document["agents"] if one["id"] == task["assigned_agent_id"])
                 reviewing = next(one for one in document["agents"] if one["id"] == reviewer)
-                if not _providers_independent(owner, reviewing):
+                if not facilitator.enabled(document) and not _providers_independent(owner, reviewing):
                     raise HarnessError(
                         "Independent review requires a different effective provider identity, "
                         "not another alias for the same backend"
@@ -7447,6 +7492,12 @@ class GoalStore(goal_access.AccessStoreMixin):
                 document["budget"]["tasks_created"] += 1
                 task["review_return_state"] = task["state"]
                 task["state"] = "waiting_review"
+                if facilitator.enabled(document):
+                    feedback = document["tasks"][-1]
+                    feedback["kind"] = "feedback"
+                    feedback["description"] = "Review the linked task and share your findings with the team. This feedback does not gate saved files."
+                    feedback.pop("review_of", None)
+                    task["state"] = task.pop("review_return_state")
                 document["automatic_recovery_control"] = _automatic_recovery_control(
                     False,
                 )
@@ -7497,6 +7548,21 @@ class GoalStore(goal_access.AccessStoreMixin):
             if any(_task_has_unsettled_effect(task) for task in document["tasks"]):
                 raise HarnessError("Unsettled provider or file effects cannot support goal completion")
             checked = copy.deepcopy(result)
+            if facilitator.enabled(document):
+                if any(one["state"] not in {"complete", "cancelled"} for one in document["tasks"]):
+                    raise HarnessError("Wait for the team's active contributions before recording its final checks")
+                checked = facilitator.completion_evidence(document, checked, _execution_root(document))
+                document["verification"] = _durable_evidence(checked)
+                goal_access.record_block(document, checked)
+                self._event(db, document, "test_result", payload=checked)
+                if document["status"] == "paused":
+                    return
+                document["workspace_publication"] = {"state": "files_saved",
+                    "message": "Work was saved directly in the selected project; checks did not gate files."}
+                document["status"] = "complete"
+                document["note"] = "Agent work finished. Checks: " + str(checked.get("status") or "unverified") + ". " + str(checked.get("reason") or "")
+                self._event(db, document, "goal_completed", payload={"basis": "agent_work_finished", "verification_status": checked.get("status")})
+                return
             unconfigured = result.get("status") == "not_configured"
             current_tree = ""
             current_manifest: dict[str, str] = {}
@@ -8159,6 +8225,9 @@ class LongHorizonRuntime:
                    "owner": one["assigned_agent_id"], "depends_on": one["depends_on"],
                    "summary": _short(one.get("summary"), 1_000)} for one in goal["tasks"]]
         files = swarm_work._file_snapshot(root, list(extra_files or [])) if extra_files else "No additional file contents requested yet."
+        if facilitator.enabled(goal):
+            return facilitator.context(goal, task, root, ledger, evidence_by_task, files,
+                [*swarm_work.HARNESS_TOOL_DEFINITIONS, *goal_tools.FACILITATOR_DEFINITIONS])
         contribution_packet = ""
         if goal.get("require_all_participants"):
             agents = {
@@ -8484,10 +8553,11 @@ class LongHorizonRuntime:
             answer = chat_lab.ask_once(
                 self.config, agent["who"], request_text, context=request_context,
                 workspace_context=ProviderWorkspaceContext(project_id=str(goal["project"]["id"]),
-                    project_path=str(goal["project"]["path"]), execution_path=str(root)),
+                    project_path=str(goal["project"]["path"]), execution_path=str(root),
+                    execution_mode="facilitator" if facilitator.enabled(goal) else "isolated"),
                 provider_attachments=provider_attachments,
-                **({"native_execution": "work" if goal_access.state(goal)["mode"] == "full" and collaboration.can_write(goal, task) else "inspect",
-                    "working_directory": str(root)} if agent_workspace else {}),
+                **({"native_execution": facilitator.native_profile(goal, collaboration.can_write(goal, task), self.config),
+                    "working_directory": str(root)} if agent_workspace or facilitator.enabled(goal) else {}),
                 response_format=_agent_action_format(task),
                 conversation_key=conversation_key,
                 before_provider_dispatch=account_dispatch(phase, request_text, request_context),
@@ -8511,8 +8581,9 @@ class LongHorizonRuntime:
                     self.config, agent["who"], correction_prompt,
                     context=correction_context, provider_attachments=provider_attachments,
                     workspace_context=ProviderWorkspaceContext(project_id=str(goal["project"]["id"]),
-                        project_path=str(goal["project"]["path"]), execution_path=str(root)),
-                    **({"native_execution": "inspect", "working_directory": str(root)} if agent_workspace else {}),
+                        project_path=str(goal["project"]["path"]), execution_path=str(root),
+                        execution_mode="facilitator" if facilitator.enabled(goal) else "isolated"),
+                    **({"native_execution": "inspect", "working_directory": str(root)} if agent_workspace or facilitator.enabled(goal) else {}),
                     response_format=_agent_action_format(task),
                     conversation_key=conversation_key,
                     prefer_existing_conversation=False,
@@ -8547,9 +8618,9 @@ class LongHorizonRuntime:
             for descriptor in goal.get("input_provider_attachments", []):
                 path = Path(str(descriptor.get("path") or ""))
                 name = str(descriptor.get("name") or path.name or "unnamed attachment")
-                if not path.is_file():
+                if not filesystem_path(path).is_file():
                     raise HarnessError(f"Saved attachment {name!r} is missing; restore it before this goal continues.")
-                content = path.read_bytes()
+                content = filesystem_path(path).read_bytes()
                 expected_hash = str(descriptor.get("sha256") or "")
                 if expected_hash and not hmac.compare_digest(expected_hash, hashlib.sha256(content).hexdigest()):
                     raise HarnessError(f"Saved attachment {name!r} changed after it was attached; restore the original before continuing.")
@@ -8617,7 +8688,7 @@ class LongHorizonRuntime:
                         self.config, root, ledger,
                         project_tools_authority,
                         current_goal["objective"], changed_paths, None,
-                        attachments=current_goal.get("input_provider_attachments") or [],
+                        attachments=provider_attachments,
                         git_root=Path(current_goal["project"]["path"]),
                         **({"verification_profile": "shared_goal_v1"}
                            if current_goal.get("require_all_participants") else {}),
@@ -8642,6 +8713,18 @@ class LongHorizonRuntime:
                             if not first_execution:
                                 result = {"status": "outcome_unknown", "executed_again": False,
                                           "reason": "This effectful call was reserved before interruption. Inspect the saved private copy and command effects before choosing a new call; Nexus did not replay it."}
+                            elif facilitator.enabled(current_authority):
+                                from .facilitator_commands import authorize_tool
+                                try:
+                                    permitted = collaboration.can_write(current_authority, task)
+                                    if permitted and call["name"] == "run_command":
+                                        permitted = authorize_tool(self.store, current_authority, root, call.get("arguments", {}))
+                                    if permitted is True:
+                                        result = goal_tools.execute(self.config, root, call["name"], call.get("arguments", {}), facilitator=True)
+                                    else:
+                                        result = permitted if isinstance(permitted, dict) else {"status": "unavailable", "reason": "The selected access or reviewer role permits inspection only."}
+                                except (HarnessError, OSError, ValueError) as exc:
+                                    result = {"status": "error", "reason": str(exc), "executed_again": False}
                             elif not agent_workspace or goal_access.state(current_authority)["mode"] != "full" \
                                     or not collaboration.can_write(current_authority, task):
                                 result = {"status": "unavailable", "reason": "This execution tool requires saved Full project access and the writer's private working copy. Use inspection tools within the current grant."}
@@ -8872,6 +8955,14 @@ class LongHorizonRuntime:
                     continue
                 break
             action = self.store.sanitize_action(action)
+            if facilitator.enabled(goal):
+                observed = _project_baseline_manifest(root)
+                action["_nexus_direct_changes"] = [
+                    {"path": path, "before_sha256": baseline_manifest.get(path, "").removeprefix("file:"),
+                     "after_sha256": observed.get(path, "").removeprefix("file:")}
+                    for path in sorted(baseline_manifest.keys() | observed.keys())
+                    if baseline_manifest.get(path) != observed.get(path)
+                ]
             action["_nexus_baselines"] = {
                 str(one.get("path") or "").replace("\\", "/").strip(): baseline_manifest.get(
                     str(one.get("path") or "").replace("\\", "/").strip(), "missing"
@@ -9106,6 +9197,11 @@ class LongHorizonRuntime:
                     "kind": "verified_no_change", "tree_merkle": merkle,
                     "file_count": len(manifest), "observed_at_ms": _now(),
                 }
+            if facilitator.enabled(current_goal) and action.get("_nexus_direct_changes"):
+                artifact = artifact or {"tree_merkle": swarm_work._project_tree_merkle(_execution_root(current_goal))[0]}
+                artifact["kind"] = "direct_work_observation"
+                artifact["changes"] = [*action["_nexus_direct_changes"], *artifact.get("changes", [])]
+                artifact["basis"] = "Observed selected-project file changes during the agent turn; no test verdict implied."
             interrupts.extend(self.store.apply_action(goal_id, task, action, artifact=artifact))
         goal = self.store.get(goal_id)
         if goal["status"] == "waiting_for_user" and interrupts:
@@ -9590,7 +9686,7 @@ class LongHorizonRuntime:
                     if expected_parent not in attachment_root.parents:
                         raise HarnessError("The request attachment staging path escaped its authority")
                     if attachment_root.exists():
-                        shutil.rmtree(attachment_root)
+                        shutil.rmtree(filesystem_path(attachment_root))
                     attachment_root.mkdir(parents=True)
                     attachment_config = LoadedConfig(
                         copy.deepcopy(self.config.data), attachment_root,
@@ -9616,11 +9712,12 @@ class LongHorizonRuntime:
                             admission_digest=admission_digest,
                             expected_project_authority_id=actual_authority_id,
                             expected_agents=admitted_agents,
-                            isolated_workspace=True,
+                            facilitator_mode=(policy or {}).get("execution_mode") == "facilitator",
+                            isolated_workspace=(policy or {}).get("execution_mode") != "facilitator",
                         )
                     except Exception:
                         if attachment_root.exists() and expected_parent in attachment_root.parents:
-                            shutil.rmtree(attachment_root)
+                            shutil.rmtree(filesystem_path(attachment_root))
                         raise
                 else:
                     goal = self.store.create(
@@ -9633,7 +9730,8 @@ class LongHorizonRuntime:
                         admission_digest=admission_digest,
                         expected_project_authority_id=actual_authority_id,
                         expected_agents=admitted_agents,
-                        isolated_workspace=True,
+                        facilitator_mode=(policy or {}).get("execution_mode") == "facilitator",
+                        isolated_workspace=(policy or {}).get("execution_mode") != "facilitator",
                     )
             if goal.get("request_tombstone") is True:
                 # Detailed terminal history is intentionally bounded, but a

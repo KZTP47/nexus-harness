@@ -109,6 +109,10 @@ function whereTheHarnessLives(
 // has installed it properly is sent somewhere else.
 function environmentForStarting(environment = process.env, folders = []) {
   const started = { ...environment };
+  if (process.versions.electron) {
+    started.NEXUS_EMAIL_BROWSER_NODE = process.execPath;
+    started.NEXUS_EMAIL_BROWSER_WORKER = path.join(__dirname, 'email-browser-worker.js');
+  }
   if (!folders.length) return started;
   const already = String(environment.PYTHONPATH || "").trim();
   started.PYTHONPATH = [...folders, ...(already ? [already] : [])].join(path.delimiter);

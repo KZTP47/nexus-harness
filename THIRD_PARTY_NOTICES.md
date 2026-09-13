@@ -1,5 +1,27 @@
 # Third-party notices
 
+## Kestra and Eclipse Temurin (Mail Copilot)
+
+The Windows app bundles Kestra 1.3.38, copyright Kestra Technologies,
+under Apache License 2.0. Source and license:
+https://github.com/kestra-io/kestra/tree/v1.3.38 and
+https://github.com/kestra-io/kestra/blob/v1.3.38/LICENSE.
+The distribution retains upstream metadata and license files in kestra.jar.
+
+Its private Eclipse Temurin Java 25.0.4.1+1 runtime is distributed by Eclipse
+Adoptium under the GNU General Public License version 2 with the Classpath
+Exception, plus applicable third-party notices. Complete license notices are
+included in resources/kestra-runtime/java/legal and java/NOTICE.
+Corresponding source: https://github.com/adoptium/jdk25u/tree/jdk-25.0.4.1%2B1.
+Pinned distribution URLs and SHA-256 checksums are in
+desktop/kestra-runtime.lock.json. These components are separate from the
+existing private Python runtime.
+
+Mail Copilot uses an embedded H2 database with synchronous commits for local
+desktop orchestration. Kestra documents H2 as a local testing backend;
+production Kestra deployments should use a supported PostgreSQL/MySQL backend.
+The application mail database owns drafts and learning records independently.
+
 Nexus Harness's private Windows runtime includes `langsmith` 0.11.1, used by
 LangGraph. The package metadata declares the MIT license and identifies the
 upstream repository as <https://github.com/langchain-ai/langsmith-sdk>.

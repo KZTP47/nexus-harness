@@ -105,6 +105,9 @@ def record_block(document, result, agent_id=""):
             "approval_digest": result.get("approval_digest", ""),
             "reason": result.get("reason", "Command permission is required."),
         }
+        if result.get("command_kind") == "run_command":
+            document["command_request"].update(command_kind="run_command",
+                tool_arguments=copy.deepcopy(result.get("tool_arguments", {})))
         # Existing denials are answers, not new requests for permission. Return
         # the refused tool result so the team can adapt within its access mode.
         # Final verification still cannot claim success without required checks.
@@ -119,6 +122,7 @@ class AccessStoreMixin:
     def access_project(self, document):
         from .goal_verification import verification_project
         project = verification_project(self.config, document, runtime_root=self.root)
+        project["_nexus_facilitator"] = document.get("execution_mode") == "facilitator"
         project["_nexus_command_access"] = CommandAuthority(
             lambda commands, digest, source: self.authorize_commands(document["goal_id"], commands, digest, source))
         return project
@@ -186,6 +190,9 @@ class AccessStoreMixin:
                 document["command_request"] = {"schema_version": 1, "state": "denied" if decision == "deny" else "approved",
                     "commands": preview["commands"], "approval_digest": command_digest,
                     "resume_after_decision": resume_after_decision}
+                if preview.get("command_kind") == "run_command":
+                    document["command_request"].update(command_kind="run_command",
+                        tool_arguments=copy.deepcopy(preview.get("tool_arguments", {})))
             else:
                 raise HarnessError("Choose Deny, Run once, or Always allow")
             access["revision"] = revision

@@ -1,7 +1,7 @@
 "use strict";
 const assert=require("node:assert/strict"),fs=require("node:fs"),path=require("node:path"),os=require("node:os"),test=require("node:test");
 const {chromium}=require("playwright-core");
-const ui=path.resolve(__dirname,"../src/our_harness/ui"),runtime=path.join(__dirname,"build-output/win-unpacked/resources/runtime");
+const ui=process.env.NEXUS_CHAT_UI_ROOT||path.resolve(__dirname,"../src/our_harness/ui"),runtime=path.join(__dirname,"build-output/win-unpacked/resources/runtime");
 test("prompt library saves, edits, searches, inserts exact text, protects other chats and handles save conflicts",{timeout:30000},async()=>{
   const manifest=JSON.parse(fs.readFileSync(path.join(runtime,"NEXUS_RUNTIME.json"),"utf8"));
   const browser=await chromium.launch({executablePath:process.env.NEXUS_TEST_CHROMIUM||path.join(runtime,"playwright",manifest.playwright.chromium_executable),headless:true});
@@ -24,6 +24,17 @@ test("prompt library saves, edits, searches, inserts exact text, protects other 
       window.openLibrary=()=>openPromptLibrary(document.getElementById('composer'),()=>current);
     `});
     await page.evaluate(()=>{const c=document.getElementById('composer');c.selectionStart=c.selectionEnd=c.value.length;openLibrary();});
+    const windowBefore=await page.locator('dialog').boundingBox();
+    const editorBefore=await page.getByLabel('Prompt text',{exact:true}).boundingBox();
+    await page.mouse.move(windowBefore.x+windowBefore.width-4,windowBefore.y+windowBefore.height-4);
+    await page.mouse.down();
+    await page.mouse.move(windowBefore.x+windowBefore.width+90,windowBefore.y+windowBefore.height+55,{steps:12});
+    await page.mouse.up();
+    const windowAfter=await page.locator('dialog').boundingBox();
+    const editorAfter=await page.getByLabel('Prompt text',{exact:true}).boundingBox();
+    assert.ok(windowAfter.width>windowBefore.width+30 && windowAfter.height>windowBefore.height+20,JSON.stringify({windowBefore,windowAfter}));
+    assert.ok(editorAfter.width>editorBefore.width && editorAfter.height>editorBefore.height,JSON.stringify({editorBefore,editorAfter}));
+    assert.equal(await page.getByLabel('Prompt text',{exact:true}).inputValue(),'Existing draft: ');
     await page.getByLabel('Prompt title',{exact:true}).fill('Review changes');
     const exact='Read the source.\nCheck café and 日本語.\n';
     await page.getByLabel('Prompt text',{exact:true}).fill(exact);
@@ -58,10 +69,20 @@ test("prompt library saves, edits, searches, inserts exact text, protects other 
     await page.evaluate(()=>{fail=false;});
     await page.getByRole('button',{name:'Save prompt',exact:true}).click();
     await page.getByLabel('Find a saved prompt').fill('');
-    for(const width of [1120,390]){
-      await page.setViewportSize({width,height:820});
+    for(const [width,height] of [[1120,820],[390,820],[390,420]]){
+      await page.setViewportSize({width,height});
       assert.ok(await page.locator('dialog').evaluate(n=>n.scrollWidth<=n.clientWidth+1));
-      await page.screenshot({path:path.join(output,'library-'+width+'.png')});
+      const bounds=await page.locator('dialog').boundingBox();
+      const close=await page.getByRole('button',{name:'Close library',exact:true}).boundingBox();
+      const heading=await page.getByRole('heading',{name:'Prompt library',exact:true}).boundingBox();
+      if(width<600){
+        const listPane=await page.locator('.prompt-library-grid > div:first-child').boundingBox();
+        const editPane=await page.locator('.prompt-library-editor').boundingBox();
+        assert.ok(editPane.y>=listPane.y+listPane.height,JSON.stringify({listPane,editPane}));
+      }
+      assert.ok(bounds.x>=0 && bounds.y>=0 && bounds.x+bounds.width<=width+1 && bounds.y+bounds.height<=height+1,JSON.stringify(bounds));
+      assert.ok(close.x>heading.x+heading.width && close.y<bounds.y+55 && bounds.x+bounds.width-close.x-close.width<30,JSON.stringify({bounds,heading,close}));
+      await page.screenshot({path:path.join(output,'library-'+width+'-'+height+'.png')});
     }
     page.on('dialog',dialog=>dialog.accept());
     await page.getByRole('button',{name:'Delete prompt',exact:true}).click();

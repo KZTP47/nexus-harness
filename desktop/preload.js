@@ -35,6 +35,8 @@ contextBridge.exposeInMainWorld("harnessDesktop", {
   saveJsonFile: (suggestedName, contents) => ipcRenderer.invoke(
     "harness:saveJsonFile", String(suggestedName || "nexus-export.json"),
     String(contents || "")),
+  saveEmailFile: (suggestedName, contents) => ipcRenderer.invoke(
+    "harness:saveEmailFile", String(suggestedName || "reply.eml"), String(contents || "")),
   saveLargeJsonFile: async (suggestedName, contents) => {
     const written = String(contents || "");
     const begun = await ipcRenderer.invoke(

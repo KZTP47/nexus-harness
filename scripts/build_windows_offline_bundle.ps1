@@ -7,7 +7,8 @@ param(
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-$maximumInstallerBytes = 367001600
+# Match the bootstrap ceiling for the app including pinned Java/Kestra.
+$maximumInstallerBytes = 419430400
 $contractFingerprint = 'd85e8a719bc8d49df4fbac3b617736b12aa10b7ff1418d5b6462e26e4d6f55cb'
 
 function Get-CanonicalPath([string] $Path, [string] $What) {

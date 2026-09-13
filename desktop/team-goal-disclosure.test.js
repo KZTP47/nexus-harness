@@ -118,6 +118,7 @@ test("team panel remembers collapse, expands for fresh input, preserves drafts a
       window.refreshChatGoalAfterAction=async(_agent,next)=>{window.goal=next;render();};
     });
     const resize=page.getByRole('button',{name:'Resize team panel'});
+    await page.getByRole('button',{name:'Resize team panel'}).focus();
     await resize.scrollIntoViewIfNeeded();
     const before=(await page.locator('#panel').boundingBox()).height;
     await resize.focus();await page.keyboard.press('ArrowUp');await page.keyboard.press('ArrowUp');

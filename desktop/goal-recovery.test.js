@@ -17,7 +17,8 @@ test("interrupted chat shows actionable recovery, preserves approvals and reject
     const page=await browser.newPage({viewport:{width:1264,height:850}});
     await page.setContent('<main style="max-width:1000px;margin:20px auto"><h1>Team chat</h1><section id="panel" class="swarm-chat-team-goal"></section></main>');
     await page.addStyleTag({content:fs.readFileSync(path.join(ui,"styles.css"),"utf8")});
-    await page.addScriptTag({content:source.slice(source.indexOf("function appendGoalAccessControls"),source.indexOf("function fillChatGoalPanel"))+`
+    await page.addScriptTag({content:source.slice(source.indexOf("function goalCommandLocation"),source.indexOf("function goalWorkspaceWords"))
+      +source.slice(source.indexOf("function appendGoalAccessControls"),source.indexOf("function fillChatGoalPanel"))+`
       function make(tag,cls='',text=''){const n=document.createElement(tag);n.className=cls;n.textContent=text;return n;}
       window.calls=[];window.fail=false;
       window.inspected=[];async function openChatGoalDetails(goal){inspected.push(goal.goal_id);}

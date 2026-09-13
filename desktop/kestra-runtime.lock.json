@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "kestra": {
+    "version": "1.3.38",
+    "url": "https://github.com/kestra-io/kestra/releases/download/v1.3.38/kestra-1.3.38",
+    "sha256": "2f723f733b60eba713e195600decc164e9c1f9609cf77487bc1fd49e9749038a"
+  },
+  "java": {
+    "version": "25.0.4.1+1",
+    "url": "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.4.1%2B1/OpenJDK25U-jre_x64_windows_hotspot_25.0.4.1_1.zip",
+    "sha256": "4c95451cea98556def2c54f7782933f52a26d4a36bd85e1d59f0364464828b07"
+  }
+}

@@ -74,7 +74,8 @@ test("only correlated routine Nexus goal transitions use compact status rows", (
 
 test("an admission receipt points to the shared chat without claiming that the team is still running", () => {
   const context = vm.createContext({});
-  vm.runInContext(section("function longHorizonAdmissionWords", "function finishLongHorizonAdmissionActivity"), context);
+  vm.runInContext(section("function facilitatorCompletionDetail", "function goalReviewer")
+    + section("function longHorizonAdmissionWords", "function finishLongHorizonAdmissionActivity"), context);
   for (const status of ["running", "queued", "waiting_for_user"]) {
     context.status = status;
     const words = vm.runInContext('longHorizonAdmissionWords({goal_id: "portable-goal", status})', context);
@@ -213,6 +214,7 @@ function fixture(view = "maximized") {
     isLoneAgentChat() { return state.conversation.pair.length === 1; },
     swarmChatKey() { return `${state.agent.id}:${state.conversation.id}`; },
     swarmChatRuntimeKey() { return context.swarmChatKey(); },
+    chatComposerIsPending() { return false; },
     swarmChatIsHydrating() { return false; },
     swarmChatAttachmentsAreLoading() { return Boolean(state.attachmentLoading); },
     projectWorkPauseForMessage() { return ""; },
@@ -435,6 +437,12 @@ for (const view of ["compact", "maximized"]) {
       vm.runInContext("syncChatGoalControls(state.agent.id, testCard)", f.context);
       assert.equal(stop.textContent, "Resume team");
       assert.equal(stop.disabled, false);
+      assert.equal(send.disabled, false);
+      f.context.chatComposerIsPending = () => true;
+      vm.runInContext("syncChatGoalControls(state.agent.id, testCard)", f.context);
+      assert.equal(send.disabled, true, "an existing team goal cannot enable sending a provisional new-chat draft");
+      f.context.chatComposerIsPending = () => false;
+      vm.runInContext("syncChatGoalControls(state.agent.id, testCard)", f.context);
       assert.equal(send.disabled, false);
       f.context.refreshLongGoals = async () => {};
       f.inventory = [f.goal];

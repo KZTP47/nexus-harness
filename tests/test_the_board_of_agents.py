@@ -3287,7 +3287,7 @@ removeDirectLongGoalOutbox("chat-two", "request-two", "a".repeat(64))
         self.assertIn("chatId: conversation?.id", activity)
         self.assertIn("swarmBusy.delete(activity.chatKey)", activity)
 
-    def test_chat_composers_pause_only_while_saved_chat_identity_changes(self) -> None:
+    def test_chat_editing_never_waits_for_saved_chat_identity_but_dispatch_does(self) -> None:
         compact = self.script[
             self.script.index("function setWhatCanBePressedInAChat"):
             self.script.index("function stoppedChatError")
@@ -3301,9 +3301,9 @@ removeDirectLongGoalOutbox("chat-two", "request-two", "a".repeat(64))
             self.assertIn("swarmConversationSwitching.has", controls)
             self.assertIn("swarmChatIsHydrating", controls)
             self.assertIn("const waiting = busy || identityChanging", controls)
-        self.assertIn("box.disabled = !agent || identityChanging", compact)
+        self.assertIn("box.disabled = !agent;", compact)
         self.assertIn("const chatAgent = theSwarmAgent(theBigOne)", enlarged)
-        self.assertIn('$("theBigChatBox").disabled = !chatAgent || identityChanging', enlarged)
+        self.assertIn('$("theBigChatBox").disabled = !chatAgent;', enlarged)
         self.assertIn('$("theBigChatSend").disabled = waiting || !chatAgent', enlarged)
         self.assertIn('$("theBigChatAttach").disabled = waiting || !chatAgent', enlarged)
         self.assertNotIn("box.disabled = !agent || busy", compact)
@@ -9892,7 +9892,7 @@ class WhatThePanelIsTold(BoardTestCase):
             script.index("function setWhatCanBePressedInAChat"):
             script.index("function stoppedChatError")
         ]
-        self.assertIn('box.disabled = !agent || identityChanging;', controls)
+        self.assertIn('box.disabled = !agent;', controls)
         self.assertIn("waiting || !agent || !agent.ready", controls)
         self.assertNotIn("box.disabled = !agent || !agent.ready", controls)
         self.assertNotIn("box.disabled = !agent || busy", controls)
@@ -11051,6 +11051,7 @@ function limitsForSwarmChat() { return {input_characters: 200000}; }
 function activeConversationFor() { return conversation; }
 function swarmChatKey() { return "lead|chat-portable"; }
 function swarmChatRuntimeKey() { return "lead|chat-portable"; }
+function chatComposerIsPending() { return false; }
 function swarmChatIsHydrating() { return false; }
 function isLoneAgentChat() { return false; }
 function syncChatTeamReadiness() { return []; }
@@ -11201,7 +11202,7 @@ async function request(path, options = {}) {
         }
         assertions = r'''
 assert.equal(prepareDraft, words);
-assert.deepEqual(events.find(event => event.kind === "prepare").body.policy, {agent_access_mode:"ask"});
+assert.deepEqual(events.find(event => event.kind === "prepare").body.policy, {agent_access_mode:"ask",execution_mode:"facilitator"});
 assert.equal(startDraft, "", "draft must clear only after exact prepare receipt");
 assert.equal(box.value, "");
 assert.deepEqual(events.map((event) => event.kind), [

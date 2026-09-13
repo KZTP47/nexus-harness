@@ -40,7 +40,7 @@ function fixture() {
   node("theBigChatConversationList").querySelectorAll = () => [navigation];
   node("swarmBoard").querySelectorAll = () => [compact];
   const context = vm.createContext({
-    console, AbortController, lead, held, swarmChats: [held], theBigOne: lead.id,
+    console, AbortController, crypto: require("node:crypto").webcrypto, lead, held, swarmChats: [held], theBigOne: lead.id,
     swarmBusy: new Set(["chat:red"]), swarmStopping: new Set(), swarmChatResetting: new Set(),
     swarmConversationSwitching: new Set(), swarmConversationHydrating: new Set(),
     swarmConversationTranscriptRefreshes: new Set(), swarmConversationListRevisions: new Map(),
@@ -61,6 +61,8 @@ function fixture() {
     syncChatTeamReadiness: () => [], workRecoveryFor: () => null,
     setSwarmProjectWorkControl(button, disabled) { button.disabled = disabled; },
     rememberSwarmChatComposer() {}, syncSwarmChatComposer() {},
+    rememberTheBigChatComposer() {}, syncTheBigChatComposer() {},
+    swarmChatComposerDrafts: new Map(), theBigChatComposerDrafts: new Map(),
     transcriptIdentityFor: () => held.conversation,
     activeConversationIdFor: () => held.conversation,
     bigChatShows: (_agent, id = held.conversation) => id === held.conversation,
@@ -102,7 +104,8 @@ for (const operation of ["activate", "create", "restore", "archive"]) {
       : operation === "restore" ? "restoreConversationFor(lead.id, 'blue')"
       : "archiveConversationFor(lead.id, 'red')";
     const changing = f.run(call);
-    assert.equal(f.node("theBigChatBox").disabled, true, "unknown mutation outcome must stay fenced");
+    assert.equal(f.node("theBigChatBox").disabled, false, "editing must not wait for registry writes");
+    assert.equal(f.node("theBigChatSend").disabled, true, "dispatch must stay fenced");
     assert.equal(f.navigation.disabled, true);
     delete f.chats[1].archived_at;
     f.requests[0].resolve(f.selection("blue"));
@@ -131,7 +134,8 @@ test("a late transcript cannot overwrite the next selected chat or clear its nav
   const second = f.run("activateConversationFor(lead.id, 'third')");
   f.requests[1].resolve({said: [{text: "late blue history"}]});
   await tick();
-  assert.equal(f.node("theBigChatBox").disabled, true, "older refresh cannot release newer mutation");
+  assert.equal(f.node("theBigChatBox").disabled, false);
+  assert.equal(f.node("theBigChatSend").disabled, true, "older refresh cannot release newer mutation");
   assert.equal(f.held.conversation, "third");
   assert.deepEqual(Array.from(f.held.said), []);
   f.requests[2].resolve(f.selection("third"));
@@ -161,7 +165,8 @@ test("first chat hydration enables the confirmed identity before its history arr
   f.held.conversation = "";
   f.context.swarmConversationHydrating.add(f.held.agent);
   f.run("setWhatCanBePressedInSwarm()");
-  assert.equal(f.node("theBigChatBox").disabled, true);
+  assert.equal(f.node("theBigChatBox").disabled, false);
+  assert.equal(f.node("theBigChatSend").disabled, true);
   const loading = f.run("loadConversationsFor(lead.id)");
   f.requests[0].resolve(f.selection("blue"));
   await tick();
@@ -170,6 +175,36 @@ test("first chat hydration enables the confirmed identity before its history arr
   f.requests[1].resolve({said: [{text: "saved history"}]});
   await loading;
   assert.equal(f.held.said[0].text, "saved history");
+});
+
+test("an invalid creation response preserves the provisional draft and never enables dispatch", async () => {
+  const f = fixture();
+  const changing = f.run("createConversationFor(lead.id, 'peer-blue')");
+  const key = f.held.pendingComposer.key;
+  f.context.theBigChatComposerDrafts.set(key, {value: "Keep the unsaved draft"});
+  f.requests[0].resolve({active: "missing", chats: f.chats});
+  await changing;
+  assert.equal(f.held.conversation, "red");
+  assert.equal(f.held.pendingComposer.key, key);
+  assert.equal(f.context.theBigChatComposerDrafts.get(key).value, "Keep the unsaved draft");
+  assert.equal(f.node("theBigChatBox").disabled, false);
+  assert.equal(f.node("theBigChatSend").disabled, true);
+  assert.equal(f.requests.length, 1);
+});
+
+test("a creation response cannot move a draft into a closed and reopened chat card", async () => {
+  const f = fixture();
+  const changing = f.run("createConversationFor(lead.id, 'peer-blue')");
+  const key = f.held.pendingComposer.key;
+  f.context.theBigChatComposerDrafts.set(key, {value: "Original card draft"});
+  const replacement = {...f.held, pendingComposer: undefined, conversation: "third"};
+  f.context.swarmChats = [replacement];
+  f.requests[0].resolve(f.selection("blue"));
+  await changing;
+  assert.equal(replacement.conversation, "third");
+  assert.equal(f.context.theBigChatComposerDrafts.has("shared-builder:blue"), false);
+  assert.equal(f.context.theBigChatComposerDrafts.get(key).value, "Original card draft");
+  assert.equal(f.requests.length, 1);
 });
 
 

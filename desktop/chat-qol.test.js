@@ -35,7 +35,7 @@ test('actual menu dispatch, rename dialog, cancel, and OPEN buttons work with po
     await page.addStyleTag({content:fs.readFileSync(path.join(__dirname,'../src/our_harness/ui/styles.css'),'utf8')});
     await page.addScriptTag({content:`
       function make(tag,cls='',text=''){const el=document.createElement(tag);el.className=cls;el.textContent=text;return el;}
-      window.calls=[]; window.harnessDesktop={openLocation:async location=>calls.push(['open',location])};
+      window.calls=[]; window.longGoals=[]; window.harnessDesktop={openLocation:async location=>calls.push(['open',location])};
       async function archiveConversationFor(a,c){calls.push(['archive',a,c]);}
       async function restoreConversationFor(a,c){calls.push(['restore',a,c]);}
       ${section('function requestChatName','async function manageConversationFor')}
@@ -47,7 +47,7 @@ test('actual menu dispatch, rename dialog, cancel, and OPEN buttons work with po
       button.addEventListener('contextmenu',e=>showChatContextMenu(e,'builder',conversation,button));
       appendChatDeliveryNotice(document.querySelector('#content'),{correlation:{schema_version:1,kind:'long_horizon_agent_event',delivery_contract:'selected-project-delivery/v1',delivery_state:'working_copy_report',delivery_project:${JSON.stringify(destination)}}});
     `});
-    await page.getByRole('button',{name:'OPEN',exact:true}).click();
+    await page.getByRole('button',{name:'Open destination',exact:true}).click();
     assert.deepEqual(await page.evaluate(()=>calls),[['open',destination]]);
     await page.addScriptTag({content:`
       function appendLongHorizonGoalLink(){}

@@ -312,6 +312,22 @@ def goal_command_approval(config: LoadedConfig, goal: dict[str, Any], *, runtime
     """Preview commands for either an owned chat copy or a board goal."""
     from . import swarm_work
 
+    request = goal.get("command_request") or {}
+    if goal.get("execution_mode") == "facilitator" and request.get("command_kind") == "run_command":
+        from .facilitator_commands import tool_command_digest
+        arguments = request.get("tool_arguments")
+        digest = tool_command_digest(Path(goal["project"]["path"]), arguments, config)
+        if digest != request.get("approval_digest") or request.get("commands") != [arguments["argv"]]:
+            raise HarnessError("The native command request changed; request the command again")
+        settled = goal.get("status") in {"paused", "waiting_for_user"} and not any(
+            task.get("state") == "running" for task in goal.get("tasks", []) if isinstance(task, dict))
+        return {"goal_id": goal["goal_id"], "revision": int(goal.get("revision") or 0),
+                "project_path": str(goal["project"]["path"]),
+                "commands": [list(arguments["argv"])], "cwd": arguments.get("cwd", "."),
+                "timeout_seconds": arguments.get("timeout_seconds", 30), "approval_digest": digest,
+                "source": "native_tool", "requires_approval": True, "can_approve": settled,
+                "command_kind": "run_command", "tool_arguments": copy.deepcopy(arguments)}
+
     project = verification_project(config, goal, runtime_root=runtime_root)
     proposal = swarm_work.verification_command_approval(config, project)
     from .verification_scripts import resolve_package_command
@@ -339,6 +355,65 @@ def goal_command_approval(config: LoadedConfig, goal: dict[str, Any], *, runtime
     }
 
 
+def _run_facilitator_verification(config, root, project, progress=None, *, deadline=None,
+                                  verification_session_id=""):
+    """Report executed checks under saved access, without private-copy policy."""
+    from . import swarm_work as work
+    from .facilitator_commands import run_command
+    from .goal_access import command_gate
+    from .verification import analyze_verification
+
+    results = []
+
+    def outcome(status, basis, reason, **extra):
+        return {"status": status, "basis": basis, "reason": reason, "commands": results,
+                "verification_profile": SHARED_GOAL_PROFILE, "advisory": True,
+                "verification_session_id": verification_session_id, **extra}
+
+    authority_config, authority_root = verification_authority(config, root, project)
+    commands, source = work._verification_commands(config, root, project)
+    if not commands:
+        return outcome("not_configured", "no_selected_checks",
+                       "No configured or discoverable checks were found; no tests ran.")
+    digest = work._command_approval_digest(root, commands,
+        declared_path=str(project.get("path") or ""), authority_root=authority_root)
+    access = command_gate(project, commands, digest, source)
+    if isinstance(access, dict):
+        return outcome(access["status"], access["basis"], access["reason"],
+                       proposed_commands=commands, approval_digest=access["approval_digest"])
+    if access is not True:
+        return outcome("unavailable", "discovered_command_approval_required",
+                       "Command permission is required before running project checks.",
+                       proposed_commands=commands, approval_digest=digest)
+    for command in commands:
+        work._report(progress, "Running project checks", "Nexus is running: " + " ".join(command))
+        timeout = None
+        if deadline is not None:
+            timeout = deadline.remaining_seconds("before project verification",
+                float(authority_config.get("execution.timeout_seconds")))
+        try:
+            payload = run_command(authority_config, root, command, timeout=timeout,
+                                  max_output_bytes=100000).to_dict()
+        except (HarnessError, OSError) as exc:
+            return outcome("unavailable", "verification_runtime_unavailable", str(exc))
+        results.append(payload)
+        if deadline is not None:
+            deadline.check("during project verification")
+        combined = str(payload.get("stdout") or "") + "\n" + str(payload.get("stderr") or "")
+        if payload.get("exit_code") != 0 or payload.get("timed_out") or work._EMPTY_TEST_OUTPUT.search(combined):
+            return outcome("failed", source, "A project check failed, timed out, or ran zero tests.")
+    contracts = project.get("test_evidence_contracts", [])
+    if not contracts and authority_config.project_root.resolve() == authority_root.resolve():
+        contracts = authority_config.get("project.test_evidence_contracts", [])
+    analysis = analyze_verification(commands, results,
+        evidence_contracts=contracts if isinstance(contracts, list) else [])
+    if not analysis["passed"]:
+        return outcome("failed", "positive_test_evidence",
+                       "Commands completed but did not establish that tests passed.", verification_analysis=analysis)
+    return outcome("passed", source, "The selected checks passed with execution evidence.",
+                   verification_analysis=analysis)
+
+
 def run_configured_goal_verification(
     config: LoadedConfig, root: Path, project: dict[str, Any], goal: str,
     changed: list[str], progress=None, *, deadline=None, verification_session_id: str = "",
@@ -350,6 +425,10 @@ def run_configured_goal_verification(
     website, or repository goal. The shared task ledger owns those requirements.
     This boundary reports only observed file safety and executed test evidence.
     """
+    if project.get("_nexus_facilitator") is True:
+        return _run_facilitator_verification(config, root, project, progress,
+            deadline=deadline, verification_session_id=verification_session_id)
+
     from . import cancellation, swarm_work as work
     from .models import DeadlineExpired
     from .verification import analyze_verification

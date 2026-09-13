@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import os
 import re
 from importlib.resources import files
 from pathlib import Path
@@ -19,7 +20,7 @@ ABSOLUTE_PATTERNS = [
     ),
 ]
 TEXT_SUFFIXES = {
-    ".bat", ".cmd", ".css", ".html", ".js", ".json", ".md", ".ps1",
+    ".bat", ".cmd", ".cjs", ".css", ".html", ".js", ".json", ".md", ".ps1",
     ".py", ".sh", ".toml", ".yaml", ".yml",
 }
 EXCLUDED_PARTS = {
@@ -29,7 +30,9 @@ EXCLUDED_PARTS = {
     # Generated, ignored release input. Its exact locked distributions and
     # imports are validated by prepare_windows_runtime.py; scanning vendor
     # source as if Nexus authored it creates false machine-path findings.
-    "runtime", ".runtime-published",
+    "runtime", ".runtime-published", "kestra-runtime",
+    # Local verification receipts can contain account state and are not shipped.
+    "reports",
     # What a build put there, including the copy of this very code that the
     # desktop app carries. Read as source, the audit was reading its own output
     # and telling us off for it.
@@ -81,14 +84,18 @@ def audit_distribution(root: Path) -> dict[str, Any]:
         return _result("source", 0, False, findings)
     scanned_files = 0
     syntax_ok = True
-    for path in root.rglob("*"):
-        if not path.is_file() or path.suffix.lower() not in TEXT_SUFFIXES or any(part in EXCLUDED_PARTS for part in path.parts):
-            continue
-        label = path.relative_to(root).as_posix()
-        if label in RECORDED_AUDIT_NOTES or label in NON_DISTRIBUTABLE_PROJECT_FILES:
-            continue
-        scanned_files += 1
-        syntax_ok = _inspect_text(label, path.read_text(encoding="utf-8", errors="replace"), findings) and syntax_ok
+    for directory, subdirectories, filenames in os.walk(root, followlinks=False):
+        subdirectories[:] = [name for name in subdirectories if name not in EXCLUDED_PARTS]
+        for filename in filenames:
+            path = Path(directory) / filename
+            if not path.is_file() or path.suffix.lower() not in TEXT_SUFFIXES:
+                continue
+            label = path.relative_to(root).as_posix()
+            if (label in RECORDED_AUDIT_NOTES or label in NON_DISTRIBUTABLE_PROJECT_FILES
+                    or filename.endswith((".test.js", ".test.cjs"))):
+                continue
+            scanned_files += 1
+            syntax_ok = _inspect_text(label, path.read_text(encoding="utf-8", errors="replace"), findings) and syntax_ok
     return _result("source", scanned_files, syntax_ok, findings)
 
 

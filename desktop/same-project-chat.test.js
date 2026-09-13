@@ -35,7 +35,8 @@ function fixture() {
     appendGoalAccessControls() {}, chatGoalBinding: () => ({}), swarmChatKey: () => 'fixture-chat',
   });
   vm.runInContext(
-    section("function chatGoalParticipants", "function chatGoalBinding")
+    section("function facilitatorCompletionDetail", "function goalReviewer")
+    + section("function chatGoalParticipants", "function chatGoalBinding")
     + section("function fillChatGoalPanel", "function syncChatGoalControls")
     + section("function chatGoalActivity", "function renderSwarmChatActivity")
     + section("function longHorizonAdmissionWords", "function finishLongHorizonAdmissionActivity")

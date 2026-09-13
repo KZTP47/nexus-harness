@@ -68,6 +68,8 @@ for (const input of ["pointer", "keyboard"]) {
           const pathname = new URL(route.request().url()).pathname;
           if (pathname === "/") return route.fulfill({contentType: "text/html", body: fs.readFileSync(path.join(ui, "index.html"), "utf8")});
           if (pathname === "/styles.css") return route.fulfill({contentType: "text/css", body: fs.readFileSync(path.join(ui, "styles.css"), "utf8")});
+          if (pathname === "/email.css") return route.fulfill({contentType: "text/css", body: fs.readFileSync(path.join(ui, "email.css"), "utf8")});
+          if (pathname === "/email.js") return route.fulfill({contentType: "application/javascript", body: fs.readFileSync(path.join(ui, "email.js"), "utf8")});
           if (pathname === "/app.js") {
             await scriptReady;
             return route.fulfill({contentType: "application/javascript", body: implementation});

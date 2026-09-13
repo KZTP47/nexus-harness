@@ -8980,7 +8980,7 @@ def _run_selected_project_verification(
 ) -> dict[str, Any]:
     """Run deterministic checks in the selected project, never the Harness checkout."""
 
-    if verification_profile == "shared_goal_v1":
+    if verification_profile == "shared_goal_v1" or project.get("_nexus_facilitator") is True:
         from .goal_verification import run_configured_goal_verification
         return run_configured_goal_verification(
             config, root, project, goal, changed, progress,

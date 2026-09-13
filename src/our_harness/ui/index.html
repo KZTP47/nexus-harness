@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Nexus Harness</title>
   <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/email.css">
 </head>
 <body>
   <a id="skipToWorkspace" class="skip-link" href="#startView">Skip to current workspace</a>
@@ -70,6 +71,7 @@
     <button type="button" disabled data-view="start" aria-pressed="true" title="Set up your project and ask for a change">Start here</button>
     <button type="button" disabled data-view="swarm" class="the-swarm" aria-pressed="false" title="A board of your agents, the projects they are on, and which of them may talk to each other">AI Agent Swarm orchestrator</button>
     <button type="button" disabled data-view="pipelines" class="the-automations" aria-pressed="false" title="Work that runs itself: draw the jobs as boxes, join them with arrows, press Run">visual test automation</button>
+    <button type="button" disabled data-view="email" aria-pressed="false" title="Read incoming mail, review replies, and teach your assistant">Email assistant</button>
     <button type="button" disabled data-view="settings" aria-pressed="false" title="Change any setting, without opening a file">Settings</button>
   </nav>
   <details id="moreOptionsMenu" class="more-options-menu" hidden>
@@ -764,13 +766,18 @@
         <div id="longGoalAgents" class="long-goal-agents"></div>
         <label for="longGoalLead">Lead agent</label>
         <select id="longGoalLead"></select>
+        <label for="longGoalExecution">Project work mode</label>
+        <select id="longGoalExecution">
+          <option value="facilitator" selected>Facilitator mode · direct project work</option>
+          <option value="isolated">Private copies · verified delivery</option>
+        </select>
         <label for="longGoalAccess">Agent access</label>
         <select id="longGoalAccess">
           <option value="read_only">Read only</option>
           <option value="ask" selected>Ask before commands</option>
           <option value="full">Full project access</option>
         </select>
-        <p class="field-help">Controls every agent in this goal. Read only permits inspection; Ask permits edits and asks before new commands; Full permits project edits and commands within Nexus workspace protections.</p>
+        <p class="field-help">Controls every agent in this goal. Read only permits inspection; Ask permits edits and asks before new commands; Full permits native edits and commands. Direct work saves files immediately and reports checks separately. Private copies keep verified delivery. Native tools can affect files outside the working folder.</p>
         <label for="longGoalParticipation">How they participate</label>
         <select id="longGoalParticipation">
           <option value="every">Every selected agent must make a distinct contribution</option>
@@ -1126,23 +1133,31 @@
               aria-label="Resize the agent chats list" aria-controls="theBigChatConversationList"
               title="Drag left or right. Double-click to reset this pane."><span aria-hidden="true"></span></button>
             <div class="the-big-chat-main">
-              <details id="theBigChatDestination">
-                <summary>Chat setup and saved files</summary>
+              <div class="chat-view-tabs" role="tablist" aria-label="Chat views">
+                <button id="theBigChatChatTab" type="button" role="tab" aria-selected="true"
+                  aria-controls="theBigChatChatPanel">CHAT</button>
+                <button id="theBigChatSettingsTab" type="button" role="tab" aria-selected="false" tabindex="-1"
+                  aria-label="collaboration settings" aria-controls="theBigChatSettingsPanel">collaboration settings
+                  <span id="theBigChatSettingsNeeded" class="chat-settings-needed" hidden>Input needed</span>
+                </button>
+              </div>
+              <section id="theBigChatSettingsPanel" role="tabpanel" aria-labelledby="theBigChatSettingsTab" hidden>
+              <div id="theBigChatWorkMode"></div>
+              <section id="theBigChatDestination" aria-labelledby="theBigChatDestinationTitle">
+                <h3 id="theBigChatDestinationTitle">Chat setup and saved files</h3>
                 <div class="the-big-chat-project-row">
                   <label for="theBigChatProject">Project</label>
                   <select id="theBigChatProject" aria-describedby="theBigChatProjectHelp"></select>
                   <span id="theBigChatProjectHelp" class="hint">Start Work together to let both agents build, discuss, and check the result here.</span>
                 </div>
                 <div id="theBigChatDestinationInfo"></div>
-              </details>
-              <button id="theBigChatDestinationResize" class="the-big-chat-resizer horizontal" type="button"
-                role="separator" aria-orientation="horizontal"
-                aria-label="Resize where this chat happens" aria-controls="theBigChatDestination"
-                title="Drag up or down. Double-click to reset this pane."><span aria-hidden="true"></span></button>
+              </section>
+              <section id="theBigChatTeamGoal" class="chat-team-goal" hidden
+                aria-live="polite" aria-label="Team goal and questions"></section>
+              </section>
+              <section id="theBigChatChatPanel" role="tabpanel" aria-labelledby="theBigChatChatTab">
               <div class="the-big-chat-middle">
                 <div class="the-big-chat-transcript">
-                  <section id="theBigChatTeamGoal" class="chat-team-goal" hidden
-                    aria-live="polite" aria-label="Team goal and questions"></section>
                   <ol id="theBigChatSaid" class="the-big-chat-said"
                     aria-labelledby="theBigChatTitle"></ol>
                   <section id="theBigChatActivity" class="chat-activity" hidden
@@ -1219,6 +1234,7 @@
             </details>
             <p id="theBigChatWorkStatus" class="hint" role="status" aria-live="polite" hidden></p>
               </div>
+              </section>
             </div>
           </div>
           <button id="theBigChatWindowResize" class="the-big-chat-window-resize" type="button"
@@ -1900,6 +1916,8 @@
     <button id="theChatTrayOn" class="the-chat-tray-arrow" type="button"
       aria-label="Show the chats further right">&#8594;</button>
   </div>
+  <main id="emailView" data-view-panel="email" class="data-view email-workspace" hidden tabindex="-1" aria-label="Email assistant"></main>
+  <script src="/email.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

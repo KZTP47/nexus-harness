@@ -16,6 +16,8 @@ const childProcess = require("node:child_process");
 const {_electron: electron} = require("playwright-core");
 
 const TIMEOUT = 180_000;
+const EXECUTION_MODE = process.env.NEXUS_TEAM_EXECUTION_MODE || "isolated";
+assert.ok(["isolated", "facilitator"].includes(EXECUTION_MODE));
 const AGENT_A = "portable-team-a";
 const AGENT_B = "portable-team-b";
 const PROJECT_ID = "portable-team-project";
@@ -501,11 +503,17 @@ async function captureReadableConversation(page, goalId, markers, destination) {
   // the preceding agent sits just outside the viewport. Align the first
   // requested agent row so this is deliberate conversation framing, not a
   // no-op scroll of the already visible last reply.
-  await page.locator("#theBigChatSaid .chat-prose").filter({hasText:markers[0]}).last().evaluate(paragraph=>{
-    const transcript=paragraph.closest("#theBigChatSaid");
-    const row=paragraph.closest(".the-big-chat-turn") || paragraph;
-    transcript.scrollTop+=row.getBoundingClientRect().top-transcript.getBoundingClientRect().top-12;
-  });
+  await page.evaluate(wanted=>{
+    const transcript=document.querySelector("#theBigChatSaid");
+    const paragraphs=[...transcript.querySelectorAll(".chat-prose")];
+    const replies=wanted.map(marker=>paragraphs.filter(one=>one.textContent.includes(marker)).at(-1));
+    const bounds=transcript.getBoundingClientRect();
+    const top=Math.min(...replies.map(one=>one.getBoundingClientRect().top));
+    const bottom=Math.max(...replies.map(one=>one.getBoundingClientRect().bottom));
+    // Frame the requested replies themselves; tall delivery cards between them
+    // can push the final reply outside a viewport aligned to the first row.
+    transcript.scrollTop+=(top+bottom)/2-(bounds.top+bounds.bottom)/2;
+  },markers);
   let latestLayout=null;
   let layout;
   try {
@@ -559,6 +567,20 @@ async function approveDiscoveredChecks(page, projectId) {
 }
 
 async function approveChatChecks(page, goal) {
+  if (EXECUTION_MODE === "facilitator") {
+    await page.getByRole('tab',{name:'collaboration settings',exact:true}).click();
+    const panel = page.locator("#theBigChatTeamGoal");
+    await panel.getByRole("button", {name:"Run once", exact:true}).waitFor();
+    assert.ok((await panel.innerText()).includes(goal.project_path || goal.project.path), "Command preview must identify the real project");
+    const response = page.waitForResponse(response => new URL(response.url()).pathname === "/api/long-horizon/access"
+      && response.request().method() === "POST");
+    await panel.getByRole("button", {name:"Run once", exact:true}).click();
+    const approved = await (await response).json();
+    assert.equal(approved.goal.goal_id, goal.goal_id);
+    await page.getByRole('tab',{name:'CHAT',exact:true}).click();
+    return approved.goal;
+  }
+  await page.getByRole('tab',{name:'collaboration settings',exact:true}).click();
   await page.locator("#theBigChat").getByRole("button",{name:"Advanced goal details",exact:true}).click();
   await until(async ()=>(await page.locator("#missionGoalSelect").inputValue())===goal.goal_id,
     "the selected chat's exact goal details",30_000);
@@ -600,6 +622,9 @@ async function approveChatChecks(page, goal) {
 }
 
 async function startGoal(page, words) {
+  await page.getByRole('tab',{name:'collaboration settings',exact:true}).click();
+  await page.locator("#theBigChatSettingsPanel").getByLabel("Project work mode", {exact:true}).selectOption(EXECUTION_MODE);
+  await page.getByRole('tab',{name:'CHAT',exact:true}).click();
   await page.locator("#theBigChatBox").fill(words);
   page.once("dialog", dialog=>dialog.accept());
   await page.locator("#theBigChatWork").click();
@@ -608,6 +633,7 @@ async function startGoal(page, words) {
 
 async function answerAndReconsiderFolder(page, chatId, exactAnswer, coordination) {
   const first = await goalFor(page, chatId, goal => goal.status === "waiting_for_user" && goal.pending_interrupts?.length === 1);
+  await page.getByRole('tab',{name:'collaboration settings',exact:true}).click();
   const panel = page.locator("#theBigChatTeamGoal");
   await panel.locator("textarea").fill(exactAnswer);
   await panel.getByRole("combobox", {name:"Answer audience",exact:true}).selectOption("requesting_agent");
@@ -665,11 +691,13 @@ async function answerAndReconsiderFolder(page, chatId, exactAnswer, coordination
     resolved_decision_id:original.id,superseded_interrupt_id:repeated.pending_interrupts[0].id,
     saved_answer_unchanged:true,provider_reread:true}, null, 2));
   console.log("pass  exact typed paths and URLs reach the requester without the mistaken prompt; explicit reconsider preserves that answer and resumes the same goal");
+  await page.getByRole('tab',{name:'CHAT',exact:true}).click();
 }
 
 function execute(node, arguments_, project, environment, expectedSuccess = true) {
   const result = childProcess.spawnSync(node, arguments_, {cwd:project, env:environment,
     encoding:"utf8", timeout:60_000, windowsHide:true});
+  assert.ifError(result.error);
   if (expectedSuccess) assert.equal(result.status, 0, `${arguments_.join(" ")}\n${result.stderr}\n${result.stdout}`);
   else assert.ok(result.status !== 0 && result.status !== null,
     `A deliberately broken implementation escaped its generated tests: ${result.stdout} ${result.stderr}`);
@@ -801,11 +829,11 @@ async function main() {
     assert.equal((await goalFor(page,gameChat)).status,"paused","Restart silently resumed the paused team");
     await until(async ()=>(await page.locator("#theBigChatStop").textContent()).includes("Resume"),"restored inline Resume team control");
     const teamPanel=page.locator('#theBigChatTeamGoal');
+    await page.getByRole('tab',{name:'collaboration settings',exact:true}).click();
     if(!await teamPanel.locator('details').evaluate(n=>n.open))await teamPanel.locator('summary').click();
-    await page.getByRole('button',{name:'Resize team panel',exact:true}).focus();
-    await page.keyboard.press('ArrowUp');
-    assert.ok((await teamPanel.boundingBox()).height < 350,'attention panel must leave conversation room');
-    await page.getByRole('button',{name:'Force agents to proceed',exact:true}).click();
+    assert.equal(await page.locator('#theBigChatChatPanel').isVisible(),false,'Settings must occupy their own pane');
+    await page.locator('#theBigChat').getByRole('button',{name:'Force agents to proceed',exact:true}).click();
+    await page.getByRole('tab',{name:'CHAT',exact:true}).click();
     const completed=await goalFor(page,gameChat,goal=>goal.status==="complete");
     const dialogue=await transcriptContains(page,["TEAM-A-BASE","TEAM-B-STEERED","TEAM-A-REVIEW"]);
     assert.ok(dialogue.indexOf("TEAM-A-BASE")<dialogue.indexOf("TEAM-B-STEERED"));
@@ -839,8 +867,14 @@ async function main() {
     console.log("pass  the real activity collapses before the admission response finishes and still releases Send and Resume");
     assert.equal(waitingForChecks.verification.status,"unavailable");
     assert.equal(waitingForChecks.verification.commands.length,0,"Unapproved discovered checks executed");
-    assert.equal(waitingForChecks.verification_contract.approved_test_command_digest,"");
-    assert.deepEqual(waitingForChecks.verification_contract.test_commands,[]);
+    if (EXECUTION_MODE === "isolated") {
+      assert.equal(waitingForChecks.verification_contract.approved_test_command_digest,"");
+      assert.deepEqual(waitingForChecks.verification_contract.test_commands,[]);
+    } else {
+      assert.equal(waitingForChecks.execution_mode, "facilitator");
+      assert.equal(waitingForChecks.workspace_path, testProject);
+      assert.equal(waitingForChecks.execution_workspace, undefined);
+    }
     const callsBeforeApproval=waitingForChecks.budget.provider_calls;
     const approved=await approveChatChecks(page,waitingForChecks);
     assert.equal(approved.budget.provider_calls,callsBeforeApproval,"Approval dispatched another provider turn");
@@ -850,19 +884,28 @@ async function main() {
     assert.deepEqual((await goalFor(page,gameChat)).verification_contract,completed.verification_contract,
       "Approving the selected chat changed another chat's command authority");
     await openChat(page,testChat);
+    await page.getByRole('tab',{name:'CHAT',exact:true}).click();
+    if (EXECUTION_MODE === "isolated") {
     await until(async ()=>(await page.locator("#theBigChatStop").textContent()).includes("Resume"),
       "Resume team after this chat's command approval",30_000);
     const beforeResume=await goalFor(page,testChat);
     assert.equal(beforeResume.status,"paused");
     assert.equal(beforeResume.verification.status,"not_run");
     await page.locator("#theBigChatStop").click();
+    }
     const testsComplete=await goalFor(page,testChat,goal=>goal.status==="complete");
     assert.equal(testsComplete.goal_id,waitingForChecks.goal_id,"Check approval replaced the goal");
-    assert.equal(testsComplete.budget.provider_calls,callsBeforeApproval+1,"Verification recovery must add only its independent judge");
+    assert.equal(testsComplete.budget.provider_calls,callsBeforeApproval+(EXECUTION_MODE === "isolated" ? 1 : 0),"Verification recovery must not repeat finished agent work");
     const judged=testsComplete.tasks.filter(task=>task.closeout_packet);
+    if (EXECUTION_MODE === "isolated") {
     assert.equal(judged.length,1);
     assert.equal(judged[0].closeout_outcome?.verdict,"approve");
     assert.ok(testsComplete.verification_contract.approved_test_command_digest,"Resume did not adopt the explicit command approval");
+    } else {
+      assert.equal(judged.length, 0, "Facilitator mode must not add a delivery judge");
+      assert.equal(testsComplete.verification.advisory, true);
+      assert.ok(testsComplete.agent_access.grants);
+    }
     await transcriptContains(page,["TEST-A-UNIT","TEST-B-INTEGRATION","TEST-A-REVIEW"]);
     assert.equal(testsComplete.verification.status,"passed");
     await captureReadableConversation(page,testsComplete.goal_id,["TEST-A-REVIEW","TEST-B-FINAL"],

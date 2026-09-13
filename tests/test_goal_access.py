@@ -7,11 +7,256 @@ import unittest
 import threading
 import urllib.request
 import urllib.error
+import sys
+from pathlib import Path
 from unittest import mock
 
 from our_harness import goal_access, goal_verification, goal_workspaces, long_horizon, swarm_work
 from our_harness.models import HarnessError
 from tests import test_long_horizon_verification_policy as fixtures
+from our_harness import facilitator, facilitator_commands, goal_tools, workspace_collaboration
+from our_harness.execution import CommandRunner
+
+
+class FacilitatorModeTests(unittest.TestCase):
+    def setUp(self):
+        self.fixture = fixtures.LongHorizonVerificationPolicyTests()
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+        self.runtime = self.fixture.runtime
+        self.store = self.runtime.store
+        self.project = self.fixture.project
+        self.config = self.fixture.config
+
+    def create(self, *, mode="ask", isolated=False, request="facilitator", **options):
+        return self.store.create(self.fixture.board, "tiny-game", ["Inspect and improve the requested project"], request,
+            participant_ids=["creator", "reviewer"], conversation_id=request,
+            facilitator_mode=not isolated, isolated_workspace=isolated,
+            policy={"agent_access_mode": mode}, **options)
+
+    def checks(self, fail=False):
+        (self.project / "package.json").write_text(json.dumps({"scripts": {"test": "node --test example.test.cjs"}}))
+        (self.project / "example.test.cjs").write_text(
+            "require('node:test')('a real assertion',()=>require('node:assert/strict').equal(2+2,"
+            + ("5" if fail else "4") + "));", encoding="utf-8")
+
+    def test_new_runtime_admission_is_direct_and_replays_the_same_goal(self):
+        with mock.patch.object(self.runtime, "start_background", side_effect=lambda goal_id, **kw: self.store.public(self.store.get(goal_id))):
+            first = self.runtime.start(self.fixture.board, "tiny-game", ["Improve the project"], "direct-admission",
+                participant_ids=["creator", "reviewer"], conversation_id="new-chat", policy={"execution_mode": "facilitator"})
+            again = self.runtime.start(self.fixture.board, "tiny-game", ["Improve the project"], "direct-admission",
+                participant_ids=["creator", "reviewer"], conversation_id="new-chat", policy={"execution_mode": "facilitator"})
+        self.assertEqual(first["goal_id"], again["goal_id"])
+        goal = self.store.get(first["goal_id"])
+        self.assertEqual(goal["execution_mode"], "facilitator")
+        self.assertNotIn("execution_workspace", goal)
+        self.assertEqual(goal["execution_contract"]["facilitator_contract"], facilitator.CONTRACT)
+        self.assertEqual(Path(first["workspace_path"]), self.project)
+        self.assertEqual(long_horizon.GoalStore(self.config).get(goal["goal_id"])["execution_contract"], goal["execution_contract"])
+
+    def test_final_command_permission_pauses_and_run_once_resumes_actual_checks(self):
+        goal = self.create()
+        self.checks()
+        self.fixture.finish_tasks(goal)
+        paused = self.fixture.verify(goal)
+        self.assertEqual(paused["status"], "paused")
+        self.assertEqual(paused["command_request"]["state"], "pending")
+        reopened = long_horizon.GoalStore(self.config).get(goal["goal_id"])
+        self.assertEqual(reopened["command_request"], paused["command_request"])
+        preview = goal_verification.goal_command_approval(self.config, reopened, runtime_root=self.store.root)
+        self.store.update_access(goal["goal_id"], expected_revision=preview["revision"], decision="once", command_digest=preview["approval_digest"])
+        self.store.control(goal["goal_id"], "resume")
+        finished = self.fixture.verify(goal)
+        self.assertEqual(finished["status"], "complete", finished)
+        self.assertEqual(finished["verification"]["status"], "passed")
+        self.assertEqual(finished["agent_access"]["grants"][preview["approval_digest"]]["remaining"], 0)
+
+    def test_denied_final_check_finishes_with_honest_unavailable_evidence(self):
+        goal = self.create()
+        self.checks()
+        self.fixture.finish_tasks(goal)
+        paused = self.fixture.verify(goal)
+        preview = goal_verification.goal_command_approval(self.config, paused, runtime_root=self.store.root)
+        self.store.update_access(goal["goal_id"], expected_revision=preview["revision"], decision="deny", command_digest=preview["approval_digest"])
+        self.store.control(goal["goal_id"], "resume")
+        with mock.patch.object(facilitator_commands, "run_command") as run:
+            finished = self.fixture.verify(goal)
+        run.assert_not_called()
+        self.assertEqual(finished["status"], "complete")
+        self.assertEqual(finished["verification"]["basis"], "command_access_denied")
+        self.assertEqual(finished["verification"]["commands"], [])
+
+    def test_failed_checks_keep_saved_files_and_report_unverified_criteria(self):
+        goal = self.create(mode="full")
+        self.checks(fail=True)
+        goal_tools.execute(self.config, self.project, "write_file", {"path": "saved.txt", "content": "immediately visible"}, facilitator=True)
+        self.fixture.finish_tasks(goal, evidence=False)
+        finished = self.fixture.verify(goal)
+        self.assertEqual(finished["status"], "complete")
+        self.assertEqual(finished["verification"]["status"], "failed")
+        self.assertEqual((self.project / "saved.txt").read_text(), "immediately visible")
+        self.assertTrue(finished["verification"]["advisory"])
+        original = next(item for item in finished["verification"]["criteria_results"] if item["criterion"] == "Original objective is satisfied")
+        self.assertEqual(original["status"], "unverified")
+        self.assertFalse(any(task["kind"] == "repair" for task in finished["tasks"]))
+
+    def test_direct_native_and_tool_edits_are_observed_without_duplicate_patches(self):
+        goal = self.create(mode="full")
+        task = self.store.claim_ready(goal["goal_id"], "direct-worker")[0]
+        replies = [fixtures.completion(action="work", tool_calls=[
+            {"call_id": "save", "name": "write_file", "arguments": {"path": "tool.txt", "content": "tool output"}}]),
+            fixtures.completion()]
+        def ask(*args, **kwargs):
+            self.assertEqual(kwargs["native_execution"], "work")
+            self.assertEqual(Path(kwargs["working_directory"]), self.project)
+            self.assertEqual(kwargs["workspace_context"].execution_mode, "facilitator")
+            (self.project / "native.txt").write_text("native output")
+            return {"text": json.dumps(replies.pop(0))}
+        with mock.patch.object(long_horizon.chat_lab, "ask_once", side_effect=ask):
+            held, result = self.runtime._execute_one(goal["goal_id"], task["id"])
+        self.assertEqual(result["changes"], [], result)
+        self.assertEqual({one["path"] for one in result["_nexus_direct_changes"]}, {"native.txt", "tool.txt"})
+        self.runtime._apply_node({"goal_id": goal["goal_id"], "actions": [{"task": held, "action": result}]})
+        self.assertTrue(any(one.get("kind") == "direct_work_observation" for one in self.store.get(goal["goal_id"])["artifacts"]))
+
+    def test_read_only_provider_and_tool_requests_cannot_write(self):
+        goal = self.create(mode="read_only")
+        task = self.store.claim_ready(goal["goal_id"], "read-worker")[0]
+        replies = [fixtures.completion(action="work", tool_calls=[
+            {"call_id": "save", "name": "write_file", "arguments": {"path": "forbidden.txt", "content": "no"}}]), fixtures.completion()]
+        def ask(*args, **kwargs):
+            self.assertEqual(kwargs["native_execution"], "inspect")
+            return {"text": json.dumps(replies.pop(0))}
+        with mock.patch.object(long_horizon.chat_lab, "ask_once", side_effect=ask), mock.patch.object(goal_tools, "execute") as execute:
+            self.runtime._execute_one(goal["goal_id"], task["id"])
+        execute.assert_not_called()
+        self.assertFalse((self.project / "forbidden.txt").exists())
+
+    def test_ask_mode_applies_structured_changes_without_an_automatic_review_gate(self):
+        goal = self.create()
+        task = self.store.claim_ready(goal["goal_id"], "writer")[0]
+        action = fixtures.completion(action="request_review", risk="high", changes=[
+            {"path": "structured.txt", "content": "direct structured output", "reason": "Requested work"}])
+        with mock.patch.object(long_horizon.chat_lab, "ask_once", return_value={"text": json.dumps(action)}):
+            held, received = self.runtime._execute_one(goal["goal_id"], task["id"])
+        self.runtime._apply_node({"goal_id": goal["goal_id"], "actions": [{"task": held, "action": received}]})
+        self.assertEqual((self.project / "structured.txt").read_text(), "direct structured output")
+        current = self.store.get(goal["goal_id"])
+        self.assertFalse(any(task["kind"] == "review" for task in current["tasks"]))
+        self.assertFalse(current["interrupts"])
+
+    def test_explicit_same_provider_feedback_does_not_block_writer_or_override_fixed_roles(self):
+        board = copy.deepcopy(self.fixture.board)
+        board["agents"][1]["who"] = "creator-route"
+        goal = self.store.create(board, "tiny-game", ["Improve the project"], "same-provider-feedback",
+            participant_ids=["creator", "reviewer"], facilitator_mode=True,
+            policy={"agent_access_mode": "full", "collaboration": {"mode": "fixed", "writer_id": "creator", "reviewer_id": "reviewer"}})
+        task = goal["tasks"][0]
+        reviewed = self.store.control(goal["goal_id"], "request_review", {"task_id": task["id"], "agent_id": "reviewer"})
+        current = self.store.get(goal["goal_id"])
+        feedback = next(item for item in current["tasks"] if item["kind"] == "feedback")
+        self.assertNotEqual(next(item for item in current["tasks"] if item["id"] == task["id"])["state"], "waiting_review")
+        self.assertFalse(workspace_collaboration.can_write(current, feedback))
+        self.assertEqual(facilitator.native_profile(current, workspace_collaboration.can_write(current, feedback), self.config), "inspect")
+
+    def test_missing_referenced_files_are_reported_without_a_delivery_claim(self):
+        goal = self.create(mode="full")
+        self.fixture.finish_tasks(goal, refs=["file:missing-output.txt"])
+        finished = self.fixture.verify(goal)
+        self.assertEqual(finished["status"], "complete")
+        self.assertEqual(finished["verification"]["missing_deliverable_files"], ["missing-output.txt"])
+        self.assertNotIn("delivery_receipt", finished)
+
+    def test_same_project_queues_and_adaptive_tasks_still_serialize(self):
+        goal = self.create(require_all_participants=False)
+        tasks = self.store.claim_ready(goal["goal_id"], "serial-worker")
+        self.assertEqual(len(tasks), 1)
+        other = self.create(request="other-chat")
+        self.assertEqual(other["status"], "waiting_for_project")
+        self.assertFalse(self.store.claim_ready(other["goal_id"], "other-worker"))
+
+    def test_native_request_binds_policy_cwd_timeout_and_once_survives_restart(self):
+        goal = self.create()
+        (self.project / "nested").mkdir()
+        arguments = {"argv": [sys.executable, "-c", "print('nested execution')"], "cwd": "nested", "timeout_seconds": 12}
+        block = facilitator_commands.authorize_tool(self.store, goal, self.project, arguments)
+        self.store._mutate(goal["goal_id"], lambda document, db: goal_access.record_block(document, block, "creator"))
+        paused = self.store.get(goal["goal_id"])
+        preview = goal_verification.goal_command_approval(self.config, paused, runtime_root=self.store.root)
+        self.assertEqual((preview["project_path"], preview["cwd"], preview["timeout_seconds"]), (str(self.project), "nested", 12))
+        self.store.update_access(goal["goal_id"], expected_revision=preview["revision"], decision="once", command_digest=preview["approval_digest"])
+        store = long_horizon.GoalStore(self.config)
+        self.assertIs(facilitator_commands.authorize_tool(store, store.get(goal["goal_id"]), self.project, arguments), True)
+        executed = goal_tools.execute(self.config, self.project, "run_command", arguments, facilitator=True)
+        self.assertEqual(executed["result"]["exit_code"], 0)
+        self.assertIn("nested execution", executed["result"]["stdout"])
+        self.assertIsInstance(facilitator_commands.authorize_tool(store, store.get(goal["goal_id"]), self.project, arguments), dict)
+        digest = facilitator_commands.tool_command_digest(self.project, arguments, self.config)
+        self.assertNotEqual(digest, facilitator_commands.tool_command_digest(self.project, {**arguments, "timeout_seconds": 11}, self.config))
+        changed = copy.deepcopy(self.config)
+        changed.data["execution"]["deny_executables"].append("different-command")
+        self.assertNotEqual(digest, facilitator_commands.tool_command_digest(self.project, arguments, changed))
+        with self.assertRaises(HarnessError):
+            facilitator_commands.tool_command_digest(self.project, {**arguments, "cwd": ".."}, self.config)
+
+    def test_command_policy_and_configured_backend_are_not_bypassed(self):
+        for argv in (["shutdown"], ["git", "reset", "--hard"]):
+            with self.subTest(argv=argv), self.assertRaises(HarnessError):
+                facilitator_commands.run_command(self.config, self.project, argv)
+        config = copy.deepcopy(self.config)
+        config.data["execution"]["mode"] = "docker"
+        goal = self.create(mode="full")
+        self.assertEqual(facilitator.native_profile(goal, True, config), "inspect")
+        from our_harness.models import CommandResult
+        def capture(runner, argv, **kwargs):
+            self.assertEqual(runner.config.get("execution.mode"), "docker")
+            self.assertEqual(runner.root, self.project)
+            self.assertEqual(argv, ["python", "-V"])
+            return CommandResult(argv, ".", 0, "fixture", "", 1)
+        with mock.patch.object(CommandRunner, "run", autospec=True, side_effect=capture):
+            facilitator_commands.run_command(config, self.project, ["python", "-V"])
+
+    def test_recovery_is_explicit_keeps_roles_and_retains_both_copies(self):
+        goal = self.create(isolated=True)
+        self.store.control(goal["goal_id"], "pause")
+        private = goal_workspaces.root(goal, self.store.root)
+        (private / "recovered.txt").write_text("saved private work")
+        self.store.control(goal["goal_id"], "resume")
+        self.assertNotIn("execution_mode", self.store.get(goal["goal_id"]))
+        self.assertFalse((self.project / "recovered.txt").exists())
+        self.store.control(goal["goal_id"], "pause")
+        self.store.control(goal["goal_id"], "resume", {"facilitator_mode": True})
+        current = long_horizon.GoalStore(self.config).get(goal["goal_id"])
+        self.assertEqual(current["execution_mode"], "facilitator")
+        self.assertEqual(goal_access.state(current)["mode"], "ask")
+        self.assertIsNotNone(workspace_collaboration.state(current))
+        self.assertEqual((self.project / "recovered.txt").read_text(), "saved private work")
+        self.assertTrue(private.exists())
+        self.assertEqual(current["retained_workspaces"][0]["path"], str(private))
+
+    def test_conflicting_legacy_recovery_preserves_both_versions(self):
+        goal = self.create(isolated=True)
+        self.store.control(goal["goal_id"], "pause")
+        private = goal_workspaces.root(goal, self.store.root)
+        (private / "index.html").write_text("private version")
+        (self.project / "index.html").write_text("destination version")
+        with self.assertRaisesRegex(HarnessError, "conflict"):
+            self.store.control(goal["goal_id"], "resume", {"facilitator_mode": True})
+        self.assertEqual((private / "index.html").read_text(), "private version")
+        self.assertEqual((self.project / "index.html").read_text(), "destination version")
+        self.assertNotIn("execution_mode", self.store.get(goal["goal_id"]))
+
+    def test_changed_mode_contract_and_route_cannot_reuse_write_authority(self):
+        goal = self.create(mode="full")
+        changed = copy.deepcopy(goal)
+        changed["execution_contract"]["facilitator_contract"] = "obsolete"
+        changed["execution_contract"]["fingerprint_sha256"] = "0" * 64
+        with self.assertRaisesRegex(HarnessError, "ownership metadata"):
+            self.store._validate_execution_metadata(changed)
+        self.assertEqual(goal_access.state(changed)["mode"], "read_only")
+        changed = copy.deepcopy(goal)
+        changed["agents"][0]["route_binding"]["changed"] = "another route"
+        self.assertEqual(goal_access.state(changed)["mode"], "read_only")
 
 
 class GoalAccessTests(unittest.TestCase):

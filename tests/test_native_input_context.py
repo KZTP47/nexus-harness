@@ -19,6 +19,7 @@ from our_harness.models import CommandResult, HarnessError, ProviderRequest, Pro
 from our_harness.providers import claude_input, codex_cli, subscription_cli
 from our_harness.providers.image_inputs import read_image_inputs
 from our_harness.providers.input_context import CLI_WORKSPACE_RULES, workspace_instructions
+from our_harness.providers import native_execution
 from tests.test_subscription_cli import fake_tool
 
 
@@ -63,6 +64,19 @@ class NativeInputTests(unittest.TestCase):
         self.assertEqual(workspace_instructions(None), "")
         with self.assertRaises(HarnessError):
             workspace_instructions({"project_path": str(self.selected)})
+
+    def test_facilitator_native_workspace_matches_selected_project_and_rejects_other_roots(self):
+        context = ProviderWorkspaceContext("project-exact", str(self.selected), str(self.selected), execution_mode="facilitator")
+        request = replace(self.request(), workspace_context=context, native_execution="work", working_directory=str(self.selected))
+        self.assertEqual(native_execution.workspace(request), self.selected)
+        self.assertIn("Saved files are immediately visible", native_execution.instructions(request))
+        self.assertIn("selected project itself", workspace_instructions(context))
+        self.assertIn("inspection tools", native_execution.instructions(replace(request, native_execution="inspect")))
+        for changed in (replace(request, working_directory=str(self.execution)),
+                        replace(request, workspace_context=replace(context, execution_path=str(self.execution))),
+                        replace(request, workspace_context=replace(context, execution_mode="isolated"))):
+            with self.subTest(changed=changed), self.assertRaises(HarnessError):
+                native_execution.workspace(changed)
 
     def test_claude_receives_original_native_image_bytes_without_read_permissions(self):
         calls = []

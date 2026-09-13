@@ -70,6 +70,18 @@ if "debug" in args and "models" in args and "--bundled" in args:
         ],
     }]}))
     raise SystemExit(0)
+if "debug" in args and "models" in args and mode.startswith("refreshed-"):
+    if mode == "refreshed-malformed":
+        print("invalid JSON")
+    elif mode == "refreshed-oversize":
+        print("x" * 2000000)
+    else:
+        print(json.dumps({"models": [{
+            "slug": "fixture-new", "display_name": "New Fixture",
+            "visibility": "hide" if mode == "refreshed-hidden" else "list",
+            "supported_reasoning_levels": [{"effort": "high"}],
+        }]}))
+    raise SystemExit(0)
 if "exec" not in args:
     raise SystemExit(8)
 prompt = sys.stdin.read()
@@ -507,6 +519,44 @@ class CodexCLIProviderTests(unittest.TestCase):
             with self.assertRaisesRegex(HarnessError, "does not contain configured model"):
                 provider.complete(request)
             self.assertFalse(record.exists())
+
+    def test_refreshed_only_model_is_admitted_into_isolated_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            _config, provider, record = self.make_provider(Path(temporary), "refreshed-ok")
+            request = ProviderRequest(**{**self.request().__dict__, "model": "fixture-new", "reasoning_effort": "high"})
+            response = provider.complete(request)
+            captured = json.loads(record.read_text())
+            self.assertEqual(json.loads(response.text), {"answer": "ok"})
+            self.assertEqual(captured['catalog']['models'][0]['slug'], 'fixture-new')
+            self.assertIn('--ignore-user-config', captured['argv'])
+            self.assertFalse(Path(captured['cwd']).exists())
+
+    def test_refreshed_hidden_malformed_and_oversize_fail_before_exec(self) -> None:
+        for mode, message in [('refreshed-hidden', 'does not contain configured model'),
+                              ('refreshed-malformed', 'not valid JSON'),
+                              ('refreshed-oversize', 'byte limit')]:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
+                _config, provider, record = self.make_provider(Path(temporary), mode)
+                request = ProviderRequest(**{**self.request().__dict__, 'model': 'fixture-new'})
+                with self.assertRaisesRegex(HarnessError, message):
+                    provider.complete(request)
+                self.assertFalse(record.exists())
+
+    def test_catalog_fallback_shares_deadline_and_keeps_bundled_first(self) -> None:
+        from types import SimpleNamespace
+        bundled = SimpleNamespace(stdout=json.dumps({'models': [{'slug': 'bundled'}]}),
+                                  timed_out=False, output_truncated=False, exit_code=0)
+        fresh = SimpleNamespace(stdout=json.dumps({'models': [{'slug': 'fresh', 'visibility': 'list'}]}),
+                                timed_out=False, output_truncated=False, exit_code=0)
+        with patch.object(codex_cli, '_run_bounded', side_effect=[bundled, fresh]) as run, \
+                patch.object(codex_cli.time, 'monotonic', side_effect=[10, 12]):
+            codex_cli._bundled_model_catalog(['fixture'], cwd=Path('.'), model='fresh', timeout_seconds=5, max_output_bytes=1234)
+        self.assertEqual(run.call_args_list[0].args[0], ['fixture', 'debug', 'models', '--bundled'])
+        self.assertEqual(run.call_args_list[1].kwargs['timeout_seconds'], 3)
+        self.assertEqual(run.call_args_list[1].kwargs['max_output_bytes'], 1234)
+        with patch.object(codex_cli, '_run_bounded', return_value=bundled) as run:
+            codex_cli._bundled_model_catalog(['fixture'], cwd=Path('.'), model='bundled', timeout_seconds=5, max_output_bytes=1234)
+        self.assertEqual(run.call_count, 1)
 
     def test_timeout_nonzero_oversize_and_invalid_result_fail_closed(self) -> None:
         cases = (

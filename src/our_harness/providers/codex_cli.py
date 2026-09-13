@@ -345,7 +345,12 @@ def _bundled_model_catalog(
     timeout_seconds: float,
     max_output_bytes: int,
 ) -> str:
-    """Read and validate only the catalog bundled with this Codex binary."""
+    """Prefer bundled metadata; admit a refreshed-only model explicitly.
+
+    Both sources come from the configured CLI, share one deadline and byte
+    limit, and are copied into the isolated turn's model_catalog_json file.
+    """
+    deadline_at = time.monotonic() + timeout_seconds
     result = _run_bounded(
         [*command, "debug", "models", "--bundled"],
         cwd=cwd,
@@ -375,7 +380,37 @@ def _bundled_model_catalog(
         if isinstance(item, dict) and isinstance(item.get("slug"), str) and item.get("slug")
     }
     if model and model not in slugs:
-        raise HarnessError(f"Codex CLI bundled model catalog does not contain configured model: {model}")
+        # Account catalogs can advertise a newly released model before the
+        # installed binary bundles it. Do not admit hidden/internal entries.
+        refreshed = _run_bounded(
+            [*command, "debug", "models"], cwd=cwd, stdin_text=None,
+            timeout_seconds=_remaining(deadline_at), max_output_bytes=max_output_bytes,
+        )
+        if refreshed.timed_out:
+            raise HarnessError("Codex CLI refreshed model catalog timed out")
+        if refreshed.output_truncated:
+            raise HarnessError("Codex CLI refreshed model catalog exceeded its byte limit")
+        if refreshed.exit_code != 0:
+            detail = bounded_redacted_text(
+                CredentialRedactor(), (refreshed.stderr or refreshed.stdout).strip(), 1_000
+            )
+            raise HarnessError(
+                f"Codex CLI model catalog does not contain configured model: {model}. "
+                "Refreshing the configured CLI catalog failed; update or reconnect "
+                f"this route in Nexus Settings. {detail}"
+            )
+        if refreshed.exit_code == 0:
+            try:
+                fresh_value = _load_json(refreshed.stdout)
+            except (json.JSONDecodeError, ValueError) as exc:
+                raise HarnessError("Codex CLI refreshed model catalog is not valid JSON") from exc
+            fresh_models = fresh_value.get("models") if isinstance(fresh_value, dict) else None
+            if isinstance(fresh_models, list) and any(
+                isinstance(item, dict) and item.get("slug") == model
+                and item.get("visibility") == "list" for item in fresh_models
+            ):
+                return refreshed.stdout
+        raise HarnessError(f"Codex CLI model catalog does not contain configured model: {model}")
     return result.stdout
 
 

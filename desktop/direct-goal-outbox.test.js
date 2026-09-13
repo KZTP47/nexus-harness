@@ -135,10 +135,13 @@ test("composer permissions share an exact digest with the outbox and backend aft
     app.indexOf("async function prepareDirectLongGoalAdmission")), renderer);
   const python = path.join(__dirname, "build-output/win-unpacked/resources/runtime/python.exe");
   const digests = [];
-  for (const mode of ["read_only", "ask", "full"]) {
-    const exact = record({payload: {policy: {agent_access_mode: mode}, chat_id: `chat-${mode}`},
-      chat_id: `chat-${mode}`, request_id: `request-${mode}`});
+  for (const execution of ["isolated", "facilitator"]) for (const mode of ["read_only", "ask", "full"]) {
+    const exact = record({payload: {policy: {agent_access_mode: mode, execution_mode: execution}, chat_id: `chat-${execution}-${mode}`},
+      chat_id: `chat-${execution}-${mode}`, request_id: `request-${execution}-${mode}`});
     const conversation = {id: exact.chat_id, project: exact.payload.project_id};
+    const settings = new Map();
+    renderer.localStorage = {getItem: key => settings.get(key), setItem: (key, value) => settings.set(key, value)};
+    renderer.chatExecutionPreference(conversation, execution);
     const digest = await renderer.directLongGoalIntent(conversation, exact.payload.lead_id,
       exact.payload.text, [], mode);
     exact.intent = digest;
@@ -149,12 +152,14 @@ test("composer permissions share an exact digest with the outbox and backend aft
       "import json,sys;sys.path.insert(0,'src');from our_harness.chat import long_horizon_intent_sha256;p=json.load(sys.stdin);print(long_horizon_intent_sha256(p['chat_id'],p['project_id'],p['lead_id'],p['text'],p['attachments'],p['policy']))"],
     {cwd:path.join(__dirname,".."), input:JSON.stringify(exact.payload), encoding:"utf8", windowsHide:true}).trim();
     assert.equal(backend, digest);
+    renderer.chatExecutionPreference({id:"same-chat",project:conversation.project}, execution);
     digests.push(await renderer.directLongGoalIntent({id:"same-chat",project:conversation.project},
       exact.payload.lead_id, exact.payload.text, [], mode));
     assert.throws(()=>oneStore(held).save({...exact,payload:{...exact.payload,policy:{agent_access_mode:mode === "full" ? "ask" : "full"}}}),
       /intent|digest|different/i);
   }
-  assert.equal(new Set(digests).size, 3, "Each permission mode changes the same prompt's identity");
+  assert.equal(new Set(digests).size, 6, "Each permission and execution mode changes the same prompt's identity");
+  assert.throws(()=>oneStore(held).save(record({payload:{policy:{agent_access_mode:"ask",execution_mode:"unknown"}}})), /supported execution mode/);
   assert.throws(()=>oneStore(held).save(record({payload:{policy:{agent_access_mode:"unrestricted"}}})), /supported access mode/);
   assert.throws(()=>oneStore(held).save(record({payload:{policy:{agent_access_mode:"full",other:true}}})), /unsupported field/);
 });

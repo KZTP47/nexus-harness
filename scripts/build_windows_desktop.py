@@ -13,6 +13,19 @@ DESKTOP = ROOT / "desktop"
 sys.path.insert(0, str(ROOT))
 
 from scripts import prepare_windows_runtime as runtime  # noqa: E402
+from scripts import prepare_kestra_runtime as kestra_runtime  # noqa: E402
+
+
+def verify_product_source_privacy(resources: Path) -> None:
+    """Reject build caches and local application state in shipped source."""
+    source = resources / "harness"
+    if not source.is_dir():
+        raise RuntimeError("Packaged product source is missing")
+    forbidden = {"__pycache__", ".harness", "email-studio", "config.local.json"}
+    for item in source.rglob("*"):
+        relative = item.relative_to(source)
+        if forbidden.intersection(relative.parts) or item.suffix.lower() in {".pyc", ".pyo"}:
+            raise RuntimeError(f"Private build or runtime state in package: {relative}")
 
 
 def build(arguments: list[str] | None = None) -> Path:
@@ -31,6 +44,7 @@ def build(arguments: list[str] | None = None) -> Path:
     if not node:
         raise RuntimeError("Node.js is required to build the Nexus desktop application")
     with runtime.runtime_build_lock():
+        kestra_runtime.prepare()
         selected = runtime._prepare_locked(DESKTOP / "runtime")
         expected_tree = runtime.runtime_tree_digest(selected)
         environment = {
@@ -52,6 +66,7 @@ def build(arguments: list[str] | None = None) -> Path:
         packaged = subprocess.run(command, cwd=DESKTOP, env=environment, check=False)
         if packaged.returncode:
             raise RuntimeError(f"Electron desktop packaging failed ({packaged.returncode})")
+        verify_product_source_privacy(DESKTOP / "build-output" / "win-unpacked" / "resources")
         packaged_runtime = DESKTOP / "build-output" / "win-unpacked" / "resources" / "runtime"
         if (
             not packaged_runtime.is_dir()
@@ -61,6 +76,9 @@ def build(arguments: list[str] | None = None) -> Path:
             raise RuntimeError(
                 "Packaged private runtime does not exactly match the verified selected runtime"
             )
+        packaged_kestra = DESKTOP / "build-output" / "win-unpacked" / "resources" / "kestra-runtime"
+        if not kestra_runtime.verify(packaged_kestra):
+            raise RuntimeError("Packaged Kestra distribution differs from its pinned manifest")
         return selected
 
 

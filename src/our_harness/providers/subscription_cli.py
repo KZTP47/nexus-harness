@@ -425,6 +425,16 @@ def available(kind: str, command: list[str] | None = None) -> str:
         newest, newest_version = max(kept, key=lambda one: one[1])
         if not found or newest_version > _the_version_of(found):
             return str(newest)
+    if rediscoverable and found:
+        # Older Nexus releases saved a desktop-managed path. That executable
+        # may remain on disk after an update; compare real versions rather
+        # than stranding the route merely because the old file still exists.
+        candidates = _where_else_it_might_be(recipe.also_found_at)
+        current_version = _the_version_of(found)
+        for candidate in candidates[:4]:
+            if os.path.normcase(str(candidate)) != os.path.normcase(found):
+                if _the_version_of(str(candidate)) > current_version:
+                    return str(candidate)
     if found:
         return found
     # Not on the path is not the same as not here. Codex is installed by its own
@@ -450,7 +460,7 @@ def _rediscoverable_codex_command(kind: str, parts: list[str]) -> bool:
     raw = parts[0].strip()
     if raw.casefold() in {"codex", "codex.exe", "codex.cmd"}:
         return True
-    normalized = raw.replace("\\", "/").casefold()
+    normalized = re.sub(r"/+", "/", raw.replace("\\", "/")).casefold()
     return bool(
         re.search(r"/openai/codex/bin/[^/]+/codex\.exe$", normalized)
         or (

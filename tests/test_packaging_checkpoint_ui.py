@@ -246,6 +246,24 @@ class PackagingTests(unittest.TestCase):
         self.assertEqual(result["mode"], "installed")
         self.assertGreater(result["scanned_files"], 0)
 
+    def test_source_audit_prunes_generated_runtime_and_private_receipts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package = root / "src" / "our_harness"
+            package.mkdir(parents=True)
+            (package / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
+            for folder in (root / "reports", root / "desktop" / "kestra-runtime"):
+                folder.mkdir(parents=True)
+                (folder / "private.py").write_text('PATH = "/home/synthetic/private"\n', encoding="utf-8")
+            desktop = root / "desktop"
+            (desktop / "paths.test.js").write_text('const fixture = "/home/synthetic/private";\n', encoding="utf-8")
+            self.assertTrue(audit_distribution(root)["passed"])
+            (desktop / "main.cjs").write_text('const path = "/home/synthetic/private";\n', encoding="utf-8")
+            self.assertFalse(audit_distribution(root)["passed"])
+            (desktop / "main.cjs").write_text('const path = "relative";\n', encoding="utf-8")
+            (package / "module.py").write_text('PATH = "/home/synthetic/private"\n', encoding="utf-8")
+            self.assertFalse(audit_distribution(root)["passed"])
+
 
 class CheckpointTests(unittest.TestCase):
     def test_checkpoint_captures_untracked_and_restores_through_transaction(self) -> None:

@@ -620,6 +620,33 @@ ipcMain.handle("harness:saveJsonFile", (event, suggestedName, contents) => {
   return {saved: true, filename: path.basename(chosen)};
 });
 
+ipcMain.handle("harness:saveEmailFile", (event, suggestedName, contents) => {
+  if (!fromHarnessWindow(event)) throw new Error("Only the Nexus Harness window may save an email.");
+  const written = String(contents || "");
+  if (!written || Buffer.byteLength(written, "utf8") > 2_000_000) {
+    throw new Error("An email export must contain 1 to 2000000 UTF-8 bytes.");
+  }
+  let safe = path.basename(String(suggestedName || "reply.eml")).replace(/[^A-Za-z0-9._ -]/g, "-");
+  if (!safe.toLowerCase().endsWith(".eml")) safe += ".eml";
+  const selected = dialog.showSaveDialogSync(window || undefined, {
+    title: "Save approved email reply",
+    defaultPath: path.join(app.getPath("downloads"), safe),
+    buttonLabel: "Save reply",
+    filters: [{name: "Email messages", extensions: ["eml"]}],
+    properties: ["showOverwriteConfirmation", "createDirectory"],
+  });
+  if (!selected) return {saved: false};
+  const chosen = selected.toLowerCase().endsWith(".eml") ? selected : `${selected}.eml`;
+  const beside = `${chosen}.${process.pid}-${Date.now()}.part`;
+  try {
+    fs.writeFileSync(beside, written, {encoding: "utf8", flag: "wx"});
+    fs.renameSync(beside, chosen);
+  } finally {
+    try { fs.unlinkSync(beside); } catch (error) { if (error?.code !== "ENOENT") throw error; }
+  }
+  return {saved: true, path: chosen};
+});
+
 function closeLargeJsonExport(identity, removeTemporary = true) {
   const held = pendingJsonExports.get(identity);
   if (!held) return;

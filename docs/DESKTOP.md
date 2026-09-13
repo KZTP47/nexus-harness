@@ -17,6 +17,14 @@ runner. Use the release page directly, or double-click
 release automatically without system Python. The installer creates desktop
 and Start menu shortcuts.
 
+Mail Copilot also bundles a pinned Java runtime and Kestra. The Windows
+bootstrap and offline ZIP builder allow installers up to 400 MiB; release
+metadata records the actual download size. This bounded file-size allowance
+does not change the separate fifteen-minute CI execution limit. Bundled Java
+executables retain their upstream bytes and signatures so their checksummed
+runtime manifest remains valid; Nexus executables and NSIS installers retain
+the normal release-signing path.
+
 When an Authenticode publisher is configured, both CI and the bootstrap require
 that exact valid signer. Until then, the published asset is visibly named
 `*-UNSIGNED.exe`; CI verifies it is actually unsigned, and the bootstrap

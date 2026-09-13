@@ -11,6 +11,21 @@ from scripts import build_windows_desktop as builder
 
 
 class DesktopBuildLeaseTests(unittest.TestCase):
+    def setUp(self):
+        # These tests isolate the Python publication lease. JVM acquisition and
+        # runtime checks have their own real-engine integration tests.
+        self.prepare_kestra = mock.patch.object(builder.kestra_runtime, "prepare").start()
+        self.verify_kestra = mock.patch.object(builder.kestra_runtime, "verify", return_value=True).start()
+        self.addCleanup(mock.patch.stopall)
+
+    @staticmethod
+    def _packaged_source(desktop: Path) -> None:
+        # The fake electron-builder must produce the product-source directory
+        # required by the real privacy gate as well as the runtime under test.
+        source = desktop / "build-output" / "win-unpacked" / "resources" / "harness" / "src"
+        source.mkdir(parents=True)
+        (source / "app.py").write_text("PRODUCT_NAME = 'Synthetic desktop app'\n", encoding="utf-8")
+
     def test_one_lease_spans_prepare_smoke_and_electron_builder(self) -> None:
         events: list[str] = []
         with tempfile.TemporaryDirectory() as temporary:
@@ -38,6 +53,7 @@ class DesktopBuildLeaseTests(unittest.TestCase):
                     events.append("builder")
                     packaged = desktop / "build-output" / "win-unpacked" / "resources" / "runtime"
                     shutil.copytree(selected, packaged)
+                    self._packaged_source(desktop)
                 return mock.Mock(returncode=0)
 
             with mock.patch.object(builder.runtime, "runtime_build_lock", side_effect=lease), \
@@ -88,6 +104,7 @@ class DesktopBuildLeaseTests(unittest.TestCase):
                 if "smoke_bundled_playwright.py" not in str(command):
                     packaged.mkdir(parents=True)
                     (packaged / "sentinel.txt").write_text("stale", encoding="utf-8")
+                    self._packaged_source(desktop)
                 return mock.Mock(returncode=0)
 
             with mock.patch.object(builder.runtime, "runtime_build_lock", contextlib.nullcontext), \
@@ -111,6 +128,7 @@ class DesktopBuildLeaseTests(unittest.TestCase):
                 if "smoke_bundled_playwright.py" not in str(command):
                     sentinel.write_text("same tampered bytes", encoding="utf-8")
                     shutil.copytree(selected, packaged)
+                    self._packaged_source(desktop)
                 return mock.Mock(returncode=0)
 
             with mock.patch.object(builder.runtime, "runtime_build_lock", contextlib.nullcontext), \

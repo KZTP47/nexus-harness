@@ -160,7 +160,7 @@ class MatchingTests(unittest.TestCase):
     def test_the_shapes_of_text_it_knows_are_checked(self) -> None:
         self.assertFalse(contracts.problems("2026-08-15T10:00:00Z", {"format": "date-time"}))
         self.assertTrue(contracts.problems("yesterday", {"format": "date-time"}))
-        self.assertFalse(contracts.problems("a@b.co", {"format": "email"}))
+        self.assertFalse(contracts.problems("a@example.test", {"format": "email"}))
         self.assertTrue(contracts.problems("a@b", {"format": "email"}))
         self.assertFalse(contracts.problems("10.0.0.1", {"format": "ipv4"}))
         self.assertTrue(contracts.problems("10.0.0.256", {"format": "ipv4"}))
