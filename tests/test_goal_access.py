@@ -25,7 +25,9 @@ class FacilitatorModeTests(unittest.TestCase):
         self.addCleanup(self.fixture.doCleanups)
         self.runtime = self.fixture.runtime
         self.store = self.runtime.store
-        self.project = self.fixture.project
+        # Hosted Windows runners may expose TEMP through an 8.3 alias.
+        # Production resolves project identity before binding commands.
+        self.project = self.fixture.project.resolve()
         self.config = self.fixture.config
 
     def create(self, *, mode="ask", isolated=False, request="facilitator", **options):

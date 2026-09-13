@@ -3494,12 +3494,13 @@ removeDirectLongGoalOutbox("chat-two", "request-two", "a".repeat(64))
             'id="theBigChatWindowResize"',
             'id="theBigChatSidebarResize"',
             'id="theBigChatActivityResize"',
-            'id="theBigChatDestinationResize"',
             'id="theBigChatComposerResize"',
             'id="theBigChatResetLayout"',
         ):
             self.assertIn(identity, self.markup)
-        self.assertGreaterEqual(self.markup.count('role="separator"'), 4)
+        self.assertGreaterEqual(self.markup.count('role="separator"'), 3)
+        self.assertNotIn('id="theBigChatDestinationResize"', self.markup)
+        self.assertIn('id="theBigChatDestination"', self.markup)
         self.assertIn('aria-orientation="vertical"', self.markup)
         self.assertIn('aria-orientation="horizontal"', self.markup)
 

@@ -15,13 +15,24 @@ async function fixtureSession(provider,mode='headless',state={}) {
   const profile=fs.mkdtempSync(path.join(os.tmpdir(),'nexus-browser-send-'));
   const fixture=createFixture({state:{provider,...state}});
   const context=await chromium.launchPersistentContext(profile,{executablePath:findInstalledBrowser().executable,headless:mode==='headless'});
-  await context.route('**/*',fixture.route);
-  const page=context.pages()[0];
-  await page.goto(provider==='browser_gmail'?'https://mail.google.com/mail/u/0/#inbox':'https://outlook.office.com/mail/inbox');
-  const value={context,page,profile,provider,mode};
-  const request={command:'sync',connection:connection(provider,mode)};
-  const incoming=(await worker.operate(value,request)).messages[0];
-  return {value,incoming,fixture,request,async close(){await context.close();fs.rmSync(profile,{recursive:true,force:true});}};
+  try {
+    await context.route('**/*',fixture.route);
+    const page=context.pages()[0];
+    await page.goto(provider==='browser_gmail'?'https://mail.google.com/mail/u/0/#inbox':'https://outlook.office.com/mail/inbox');
+    // Finish headed-window startup before measuring the worker's bounded clicks.
+    await page.bringToFront();
+    await page.locator(provider==='browser_gmail'?'tr[data-legacy-thread-id]':'[role="option"][data-convid]').click({trial:true,timeout:15000});
+    const value={context,page,profile,provider,mode};
+    const request={command:'sync',connection:connection(provider,mode)};
+    const incoming=(await worker.operate(value,request)).messages[0];
+    return {value,incoming,fixture,request,async close(){await context.close();fs.rmSync(profile,{recursive:true,force:true});}};
+  } catch(error) {
+    // Setup can fail before the caller receives its close method. Never leave
+    // a browser child keeping the test process alive after a reported failure.
+    await context.close();
+    fs.rmSync(profile,{recursive:true,force:true});
+    throw new Error(`${provider}/${mode} fixture setup: ${error.message}`,{cause:error});
+  }
 }
 test('reviewed Outlook and Gmail replies verify original, recipient and exact body in headed and headless Chromium',{timeout:90000},async()=>{
   for(const provider of ['browser_outlook','browser_gmail'])for(const mode of ['headed','headless']) {
