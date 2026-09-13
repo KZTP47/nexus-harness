@@ -503,6 +503,8 @@ async function openGoalComposer(page) {
 
 async function exerciseGoalComposerControls(page) {
   await openGoalComposer(page);
+  // This scenario certifies the independent closeout judge in private-copy mode.
+  await page.locator("#longGoalExecution").selectOption("isolated");
   await page.locator("#longGoalProject").selectOption({index: 0});
   await page.locator("#longGoalParticipation").selectOption("adaptive");
   await page.locator("#longGoalParticipation").selectOption("every");

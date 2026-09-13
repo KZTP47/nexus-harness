@@ -164,6 +164,33 @@ test("composer permissions share an exact digest with the outbox and backend aft
   assert.throws(()=>oneStore(held).save(record({payload:{policy:{agent_access_mode:"full",other:true}}})), /unsupported field/);
 });
 
+test("recovery verifies saved policy across preference changes and rejects tampering", async (t) => {
+  const held = fixture(t);
+  const vm = require("node:vm");
+  const app = fs.readFileSync(path.join(__dirname, "../src/our_harness/ui/app.js"), "utf8");
+  const renderer = vm.createContext({crypto: crypto.webcrypto, TextEncoder});
+  vm.runInContext(app.slice(app.indexOf("function directLongGoalCanonicalValue"),
+    app.indexOf("async function prepareDirectLongGoalAdmission")), renderer);
+  vm.runInContext(app.slice(app.indexOf("async function verifiedDirectLongGoalOutboxPayload"),
+    app.indexOf("async function removeDirectLongGoalOutbox")), renderer);
+  renderer.chatProjectPolicy = () => { throw new Error("Recovery consulted current preferences"); };
+  for (const policy of [undefined, {agent_access_mode: "ask", execution_mode: "isolated"},
+    {agent_access_mode: "full", execution_mode: "facilitator"}]) {
+    const exact = record({payload: {chat_id: `chat-${policy?.execution_mode || "legacy"}`},
+      chat_id: `chat-${policy?.execution_mode || "legacy"}`,
+      request_id: `request-${policy?.execution_mode || "legacy"}`});
+    if (policy) exact.payload.policy = policy;
+    const receipt = oneStore(held).save(exact);
+    const saved = oneStore(held).read(exact.chat_id, exact.request_id, receipt.payload_sha256);
+    const recovery = {...receipt, project_id: exact.payload.project_id, lead_id: exact.payload.lead_id};
+    renderer.loadDirectLongGoalOutboxPayload = async () => saved;
+    assert.equal(await renderer.verifiedDirectLongGoalOutboxPayload(recovery), saved);
+    renderer.loadDirectLongGoalOutboxPayload = async () => ({...saved,
+      payload: {...saved.payload, policy: {agent_access_mode: "read_only"}}});
+    await assert.rejects(renderer.verifiedDirectLongGoalOutboxPayload(recovery), /saved digest/);
+  }
+});
+
 test("same chat is idempotent only for the same request and exact payload", (t) => {
   const held = fixture(t);
   const store = oneStore(held);

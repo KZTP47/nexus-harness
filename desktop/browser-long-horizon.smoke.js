@@ -460,6 +460,15 @@ async function openCompactChat(page, chatId) {
       && !swarmChatIsHydrating(agentId),
     [AGENT_A, chatId], {timeout: 30_000},
   );
+  // This scenario verifies private-copy delivery and its independent judge.
+  await card.getByRole("button", {name: "Open full Nexus chat"}).click();
+  await page.locator("#theBigChatSettingsTab").click();
+  const mode = page.locator("#theBigChatSettingsPanel").getByLabel("Project work mode", {exact: true});
+  if (await mode.count()) {
+    await mode.selectOption("isolated");
+  }
+  await page.locator("#theBigChatChatTab").click();
+  await page.locator("#theBigChatSmall").click();
   return card;
 }
 

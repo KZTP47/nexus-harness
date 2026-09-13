@@ -1510,6 +1510,8 @@ PROJECT_RUNTIME_IGNORE_LINES: tuple[str, ...] = (
     "runtime/",
     "bundles/",
     "chats/",
+    "email-studio/",
+    "email-kestra/",
     "pages/",
     "vault/",
     "swarm-mutation-sagas/",

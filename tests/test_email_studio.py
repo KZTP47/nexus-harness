@@ -1,6 +1,7 @@
 from __future__ import annotations
 import copy
 import os
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -14,6 +15,48 @@ from our_harness.models import HarnessError
 class Secrets:
     def protect(self, value): return 'sealed:' + value[::-1]
     def unprotect(self, value): return value.removeprefix('sealed:')[::-1]
+
+
+class EmailWorkspacePrivacyTests(unittest.TestCase):
+    def test_new_and_older_projects_ignore_mail_state_across_restart_and_relocation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for name in ('fresh project', 'older project'):
+                root = Path(directory) / name
+                root.mkdir()
+                subprocess.run(['git', 'init', '--quiet', str(root)], check=True)
+                if name.startswith('older'):
+                    (root / '.harness').mkdir()
+                    (root / '.harness/.gitignore').write_text('# Preserve custom rules\n!email-studio/\n')
+                config = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), root, [], {})
+                EmailStudio(config, secret_store=Secrets())
+                ignore = root / '.harness/.gitignore'
+                first = ignore.read_bytes()
+                for path in ('email-studio/mail.sqlite3', 'email-studio/browser/Default/Cookies',
+                             'email-studio/managed-engine/settings.json', 'email-kestra/private.yml'):
+                    result = subprocess.run(['git', '-C', str(root), 'check-ignore', '--quiet', '.harness/' + path])
+                    self.assertEqual(result.returncode, 0, path)
+                shared = subprocess.run(['git', '-C', str(root), 'check-ignore', '--quiet', '.harness/config.json'])
+                self.assertEqual(shared.returncode, 1)
+                EmailStudio(config, secret_store=Secrets())
+                self.assertEqual(ignore.read_bytes(), first)
+                if name.startswith('older'):
+                    self.assertTrue(first.startswith(b'# Preserve custom rules\n!email-studio/\n'))
+                relocated = root.with_name(name + ' relocated')
+                self.assertTrue(root.resolve().is_relative_to(Path(directory).resolve()))
+                self.assertTrue(relocated.resolve().is_relative_to(Path(directory).resolve()))
+                root.rename(relocated)
+                config = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), relocated, [], {})
+                EmailStudio(config, secret_store=Secrets())
+                self.assertEqual((relocated / '.harness/.gitignore').read_bytes(), first)
+
+    def test_unwritable_ignore_boundary_blocks_mail_database_creation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / '.harness/.gitignore').mkdir(parents=True)
+            config = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), root, [], {})
+            with self.assertRaises(HarnessError):
+                EmailStudio(config, secret_store=Secrets())
+            self.assertFalse((root / '.harness/email-studio').exists())
 
 class EmailStudioTests(unittest.TestCase):
     def setUp(self):

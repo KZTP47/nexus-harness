@@ -356,6 +356,14 @@ async function openBigChat(page, chatId) {
   );
 }
 
+async function selectVerifiedDelivery(page) {
+  // These cases certify separate private workspaces and verified publication.
+  await page.locator("#theBigChatSettingsTab").click();
+  await page.locator("#theBigChatSettingsPanel").getByLabel("Project work mode", {exact: true})
+    .selectOption("isolated");
+  await page.locator("#theBigChatChatTab").click();
+}
+
 async function submitGoal(page, chatId, words) {
   await page.click(
     `#theBigChatConversationList [data-conversation-action="pick"][data-chat-id="${chatId}"]`,
@@ -366,6 +374,7 @@ async function submitGoal(page, chatId, words) {
       && !swarmChatIsHydrating(agentId),
     [chatId, AGENT_A], {timeout: 30000},
   );
+  await selectVerifiedDelivery(page);
   await page.fill("#theBigChatBox", words);
   await page.waitForFunction(
     () => !document.getElementById("theBigChatWork").disabled
@@ -421,6 +430,7 @@ async function main() {
     await page.reload({waitUntil: "domcontentloaded", timeout: 120000});
     await waitForPanelRuntime(page);
     await openBigChat(page, chats.chatR);
+    await selectVerifiedDelivery(page);
     console.log("pass  a clean packaged profile opens three real saved pair chats");
 
     // Keep the selected-project objective an exact file-state operation. The

@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from .models import HarnessError, ProviderRequest
+from .config import ensure_private_runtime_ignores
 from .providers import ProviderRegistry, create_provider
 from .redaction import CredentialRedactor
 from .email_local import LOCAL_KINDS, LocalMail
@@ -93,6 +94,9 @@ class _DPAPI:
 class EmailStudio:
     def __init__(self, config, *, secret_store=None, provider_call=None, connectors=None, local_mail=None):
         self.config = config
+        # Email can be opened before a project has saved its first config.
+        # Establish the shared privacy boundary before creating any mail state.
+        ensure_private_runtime_ignores(Path(config.project_root))
         self.root = Path(config.project_root).resolve() / '.harness' / 'email-studio'
         self.root.mkdir(parents=True, exist_ok=True)
         self.data_dir = self.root

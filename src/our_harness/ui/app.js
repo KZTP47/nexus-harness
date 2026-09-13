@@ -9237,10 +9237,7 @@ async function verifiedDirectLongGoalOutboxPayload(recovery) {
       "The exact local goal-request payload changed or returned an unsupported shape.",
     );
   }
-  const computed = await directLongGoalIntent(
-    {project: payload.project_id, id: payload.chat_id},
-    payload.lead_id, payload.text, payload.attachments,
-  );
+  const computed = await directLongGoalPayloadIntent(payload);
   if (computed !== expectedDigest) {
     throw new Error(
       "The exact local goal-request payload no longer matches its saved digest.",
@@ -15271,14 +15268,27 @@ function directLongGoalCanonicalValue(value) {
 
 async function directLongGoalIntent(conversation, agentId, text, attachments,
   accessMode = chatComposerAccessPreference(conversation)) {
-  const canonical = JSON.stringify(directLongGoalCanonicalValue({
-    schema_version: 1,
+  return directLongGoalPayloadIntent({
     project_id: String(conversation?.project || ""),
     chat_id: String(conversation?.id || ""),
     lead_id: String(agentId || ""),
     text: String(text || ""),
     attachments: attachments || [],
     policy: chatProjectPolicy(conversation, accessMode),
+  });
+}
+
+async function directLongGoalPayloadIntent(payload) {
+  // Recovery must hash the saved policy, including its absence in older records.
+  // Current composer preferences cannot redefine an already admitted request.
+  const canonical = JSON.stringify(directLongGoalCanonicalValue({
+    schema_version: 1,
+    project_id: payload.project_id,
+    chat_id: payload.chat_id,
+    lead_id: payload.lead_id,
+    text: payload.text,
+    attachments: payload.attachments,
+    ...(Object.hasOwn(payload, "policy") ? {policy: payload.policy} : {}),
   }));
   if (globalThis.crypto?.subtle && globalThis.TextEncoder) {
     const digest = await globalThis.crypto.subtle.digest(
