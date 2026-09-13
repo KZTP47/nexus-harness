@@ -290,7 +290,11 @@ test('Local EmailEngine preparation submits no credentials and progresses asynch
 test('EmailEngine hosted sign-in offers a same-origin fallback and rejects unsafe returned links', {skip: !executablePath, timeout: 45000}, async () => {
   const browser = await chromium.launch({executablePath, headless: true});
   try {
-    for (const authorizationUrl of ['https://service.example.test/accounts/new?data=signed-link', 'https://unexpected.example.test/accounts/new', 'https://operator:password@service.example.test/accounts/new', 'javascript:alert(1)']) {
+    // Synthetic URL credentials exercise rejection without resembling a saved login.
+    const credentialUrl = new URL('https://service.example.test/accounts/new');
+    credentialUrl.username = 'example-user';
+    credentialUrl.password = 'example-password';
+    for (const authorizationUrl of ['https://service.example.test/accounts/new?data=signed-link', 'https://unexpected.example.test/accounts/new', credentialUrl.href, 'javascript:alert(1)']) {
       const page = await browser.newPage();
       await page.setContent('<main id="emailView"></main>');
       await page.evaluate(url => {
