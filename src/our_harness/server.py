@@ -5372,11 +5372,15 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 action = str(body.get("action") or "")
                 held_goal = self.server.long_horizon.store.get(goal_id)
                 self.server.require_long_horizon_chat_binding(held_goal, body)
-                if action not in {"pause", "cancel"}:
+                from . import goal_status
+                status_inquiry = action == "status" or (action == "steer" and goal_status.is_inquiry(body.get("payload")))
+                if action not in {"pause", "cancel"} and not status_inquiry:
                     self.server.require_project_execution_authority(
                         Path(str(held_goal.get("project", {}).get("path") or ""))
                     )
                 payload = body.get("payload") if isinstance(body.get("payload"), dict) else {}
+                if body.get("attachments") not in (None, []) or (payload.get("attachments") not in (None, []) and action != "steer"):
+                    raise HarnessError("Attachments are supported only by team steering and team-visible answers.")
                 with self.server.project_admission_lock, self.server.swarm_lock:
                     runtime = self.server.long_horizon
                     if action == "resume":
@@ -5414,7 +5418,12 @@ class HarnessHandler(BaseHTTPRequestHandler):
                         goal = runtime.fork(goal_id, str(body.get("request_id") or uuid.uuid4().hex))
                     else:
                         goal = runtime.control(goal_id, action, payload)
-                self._json({"goal": goal})
+                directed_receipt = goal.pop("directed_message_receipt", None)
+                receipt = goal.pop("followup_receipt", None)
+                scheduling_error = goal.pop("scheduling_error", None)
+                self._json({"goal": goal, **({"directed_message_receipt": directed_receipt} if directed_receipt else {}),
+                            **({"followup_receipt": receipt} if receipt else {}),
+                            **({"scheduling_error": scheduling_error} if scheduling_error else {})})
             elif self.path == "/api/long-horizon/answer":
                 goal_id = str(body.get("goal_id") or "")
                 held_goal = self.server.long_horizon.store.get(goal_id)
@@ -5426,12 +5435,16 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 with self.server.project_admission_lock, self.server.swarm_lock:
                     goal = self.server.long_horizon.resume(goal_id, {
                         "answers": answers,
+                        **({"attachments": body["attachments"]} if "attachments" in body else {}),
                         "request_id": body.get("request_id", ""),
                         "expected_revision": body.get("expected_revision"),
                         "pending_ids": body.get("pending_ids") if isinstance(body.get("pending_ids"), list) else [],
                         **({"decision_snapshot": body["decision_snapshot"]} if "decision_snapshot" in body else {}),
                     })
-                self._json({"goal": goal})
+                receipt = goal.pop("followup_receipt", None)
+                scheduling_error = goal.pop("scheduling_error", None)
+                self._json({"goal": goal, **({"followup_receipt": receipt} if receipt else {}),
+                            **({"scheduling_error": scheduling_error} if scheduling_error else {})})
             elif self.path == "/api/long-horizon/reconsider":
                 goal_id = str(body.get("goal_id") or "")
                 held_goal = self.server.long_horizon.store.get(goal_id)
@@ -7378,7 +7391,8 @@ class HarnessHandler(BaseHTTPRequestHandler):
             else:
                 self.send_error(404)
         except HarnessError as exc:
-            self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            rejection = getattr(exc, "directed_message_rejection", None)
+            self._json({"error": str(exc), **({"directed_message_rejection": rejection} if rejection else {})}, HTTPStatus.BAD_REQUEST)
         except ConnectionError:
             # The page went to another view and closed the connection while
             # this was still answering. There is nobody left to tell, and

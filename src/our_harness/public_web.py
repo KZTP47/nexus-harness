@@ -1,6 +1,9 @@
 """Bounded public-web GETs with no credentials, cookies, or private-network access."""
 from __future__ import annotations
 
+import contextvars
+import queue
+import threading
 import http.client
 from html.parser import HTMLParser
 import ipaddress
@@ -10,6 +13,11 @@ import time
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from .models import HarnessError
+from . import cancellation
+
+# DNS and OS sockets cannot always be interrupted. Retain a slot until the
+# worker actually exits, so repeated timeouts cannot accumulate unbounded work.
+_WEB_WORKERS = threading.BoundedSemaphore(4)
 
 MAX_WEB_BYTES = 8 * 1024 * 1024
 
@@ -38,27 +46,34 @@ def _public_addresses(host: str, port: int) -> list[str]:
     return addresses
 
 
-def fetch_public(url: str, *, timeout: float = 20, max_bytes: int = MAX_WEB_BYTES) -> dict:
+def _fetch_public(url: str, *, expires: float, max_bytes: int, stopped: threading.Event) -> dict:
     """Resolve once per hop and connect to that verified IP, retaining TLS SNI."""
-    expires = time.monotonic() + max(0.1, min(timeout, 30))
+    def remaining():
+        cancellation.checkpoint()
+        value = expires - time.monotonic()
+        if stopped.is_set() or value <= 0:
+            raise HarnessError("Public web request timed out")
+        return value
     try:
         for _hop in range(6):
+            remaining()
             scheme, host, port = public_url(url)
             addresses = _public_addresses(host, port)
-            remaining = expires - time.monotonic()
-            if remaining <= 0:
-                raise HarnessError("Public web request timed out")
-            connection = http.client.HTTPConnection(host, port, timeout=remaining)
+            budget = remaining()
+            connection = http.client.HTTPConnection(host, port, timeout=budget)
             try:
-                connection.sock = socket.create_connection((addresses[0], port), timeout=remaining)
+                connection.sock = socket.create_connection((addresses[0], port), timeout=remaining())
+                connection.sock.settimeout(remaining())
                 if scheme == "https":
                     connection.sock = ssl.create_default_context().wrap_socket(connection.sock, server_hostname=host)
+                connection.sock.settimeout(remaining())
                 parsed = urlsplit(url)
                 target = urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
                 connection.request("GET", target, headers={
                     "User-Agent": "Nexus-Harness/1.0 public-research", "Accept": "*/*",
                     "Accept-Encoding": "identity",
                 })
+                connection.sock.settimeout(remaining())
                 response = connection.getresponse()
                 if response.status in {301, 302, 303, 307, 308}:
                     location = response.getheader("Location")
@@ -73,11 +88,9 @@ def fetch_public(url: str, *, timeout: float = 20, max_bytes: int = MAX_WEB_BYTE
                     raise HarnessError("Public source returned an unsupported compressed response")
                 chunks, size = [], 0
                 while True:
-                    remaining = expires - time.monotonic()
-                    if remaining <= 0:
-                        raise HarnessError("Public web request timed out")
+                    budget = remaining()
                     if connection.sock:
-                        connection.sock.settimeout(remaining)
+                        connection.sock.settimeout(budget)
                     chunk = response.read1(min(65536, max_bytes + 1 - size))
                     if not chunk:
                         break
@@ -93,6 +106,46 @@ def fetch_public(url: str, *, timeout: float = 20, max_bytes: int = MAX_WEB_BYTE
     except (OSError, http.client.HTTPException, ValueError) as exc:
         raise HarnessError(f"Public web request failed: {type(exc).__name__}") from exc
     raise HarnessError("Public source redirected too many times")
+
+
+def fetch_public(url: str, *, timeout: float = 20, max_bytes: int = MAX_WEB_BYTES) -> dict:
+    """Bound the entire GET, including DNS, headers and cancellation waits."""
+    cancellation.checkpoint()
+    expires = time.monotonic() + max(0.001, min(timeout, 30))
+    if not _WEB_WORKERS.acquire(blocking=False):
+        raise HarnessError("Public web workers are still shutting down; retry after they finish")
+    stopped = threading.Event()
+    answer = queue.Queue(maxsize=1)
+    context = contextvars.copy_context()
+    def work():
+        try:
+            answer.put((True, _fetch_public(url, expires=expires, max_bytes=max_bytes, stopped=stopped)))
+        except BaseException as exc:
+            answer.put((False, exc))
+        finally:
+            _WEB_WORKERS.release()
+    worker = threading.Thread(target=lambda: context.run(work), name="nexus-public-web", daemon=True)
+    try:
+        worker.start()
+    except BaseException:
+        _WEB_WORKERS.release()
+        raise
+    try:
+        while True:
+            cancellation.checkpoint()
+            budget = expires - time.monotonic()
+            if budget <= 0:
+                raise HarnessError("Public web request timed out at its wall-clock deadline")
+            try:
+                ok, value = answer.get(timeout=min(.025, budget))
+            except queue.Empty:
+                continue
+            cancellation.checkpoint()
+            if ok:
+                return value
+            raise value
+    finally:
+        stopped.set()
 
 
 class _ReadableHTML(HTMLParser):

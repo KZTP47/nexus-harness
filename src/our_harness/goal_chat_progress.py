@@ -26,6 +26,16 @@ def tool_outcome(name: str, result: object, error: str = "") -> tuple[str, str]:
         return "failed", error
     if value.get("status") == "error":
         return "failed", str(value.get("error") or "The tool reported an error.")
+    # Only this engine-owned envelope describes command execution. File and
+    # MCP content may contain identical-looking JSON without being a receipt.
+    if name == "run_command" and value.get("execution_contract") == "nexus-goal-effect-tools/v1" \
+            and isinstance(value.get("result"), dict):
+        command = value["result"]
+        if command.get("timed_out") is True:
+            return "failed", "The command exceeded its time limit."
+        if type(command.get("exit_code")) is int and command["exit_code"] != 0:
+            return "failed", f"The command exited with code {command['exit_code']}."
+        value = command
     # Verification is an engine-owned structured report inside a tool envelope.
     # A successful transport does not mean its project checks passed.
     if name == "run_selected_verification" and isinstance(value.get("content"), str):

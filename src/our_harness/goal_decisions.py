@@ -33,6 +33,8 @@ def pending_snapshot(document: dict[str, Any]) -> dict[str, Any]:
         "execution_contract", "collaboration_contract", "workspace_collaboration",
         "agent_access", "command_request", "verification_contract", "input_attachments",
     )}
+    from . import goal_inputs
+    context["input_contract_sha256"] = goal_inputs.fingerprint(document)
     context["pending"] = [one for one in document.get("interrupts", []) if one.get("state") == "pending"]
     context["tasks"] = [{key: task.get(key) for key in (
         "id", "assigned_agent_id", "state", "description", "evidence", "artifacts",
@@ -62,6 +64,9 @@ def submission(envelope: object) -> tuple[str, str]:
         # administrative revision after its first response was lost.
         material.pop("expected_revision")
         material["decision_snapshot"] = snapshot
+    if envelope.get("attachments") not in (None, []):
+        from . import goal_inputs
+        material["attachments"] = goal_inputs.intent(envelope["attachments"])
     return request_id, fingerprint(material)
 
 

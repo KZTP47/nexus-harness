@@ -408,3 +408,27 @@ def status(where: Path) -> dict[str, int]:
         "acknowledged": len(messages) - len(queued),
         "retrying": len([one for one in queued if int(one.get("attempts") or 0) > 0]),
     }
+
+
+def delivery_details(where: Path, *, active_message_ids: Iterable[str] = ()) -> dict[str, dict[str, Any]]:
+    """Read metadata only. Age is an observation, never an execution deadline."""
+    active = set(active_message_ids)
+    with _lock:
+        messages = _read(where)
+    result = {}
+    for one in messages:
+        identity = str(one.get('message_id', ''))
+        acknowledged = one.get('state') == 'acknowledged'
+        try:
+            age = max(0, int((datetime.now() - datetime.fromisoformat(one['created_at'])).total_seconds()))
+        except (ValueError, TypeError, KeyError):
+            age = 0
+        working = identity in active and not acknowledged
+        retrying = bool(one.get('last_error')) and not acknowledged and not working
+        stage = 'response_recorded' if acknowledged else 'dispatched' if working else 'retrying' if retrying else 'queued'
+        result[identity] = {
+            'stage': stage, 'age_seconds': age,
+            'attention': bool(not acknowledged and not working and (retrying or age >= 600)),
+            'label': 'Response recorded' if acknowledged else 'Agent working' if working else 'Delivery failed; retained for the next eligible turn' if retrying else 'Waiting for an eligible turn',
+        }
+    return result

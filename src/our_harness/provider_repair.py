@@ -589,12 +589,22 @@ def repair_plan(
             actions = [SETTINGS, CHECK]
         elif category == "timeout":
             plan_state = "provider-timeout"
-            title = "The provider request exceeded its time limit"
+            tone = "attention"
+            title = "The last request exceeded its time limit"
             steps = [
-                "Check provider availability and the route's timeout setting.",
-                "Press Check again before deliberately running another model request.",
+                "A timed-out request does not by itself mean the connection or sign-in is broken.",
+                "Check again only checks availability; it cannot clear a saved request failure.",
+                "Review the route's timeout setting if requests repeatedly need more time.",
             ]
             actions = [SETTINGS, CHECK]
+            if state in {"authenticated", "configured", "ready", "isolated-ready"} and authentication not in {
+                "signed-out", "missing-credential",
+            }:
+                steps.append(
+                    "Run one live test to verify a new answer in an empty temporary folder. "
+                    "A successful test clears this warning; it does not resume or repeat the failed task."
+                )
+                actions = [LIVE_TEST, SETTINGS, CHECK]
         elif category == "protocol":
             plan_state = "protocol-error"
             title = "The provider returned an incompatible response"

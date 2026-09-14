@@ -190,7 +190,6 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'result':
         data = copy.deepcopy(DEFAULT_CONFIG)
         data["provider"].update({"name": "codex-cli", "model": "fake-model", "command": ["fake"]})
         provider = codex_cli.CodexCLIProvider(LoadedConfig(data, self.root, [], {}))
-        provider._preflight_complete = True
         observed = []
         def run(argv, **kwargs):
             image = Path(argv[argv.index("--image") + 1])
@@ -200,6 +199,7 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'result':
             Path(argv[argv.index("--output-last-message") + 1]).write_text('{"text":"saw image"}', encoding="utf-8")
             return self.result(argv, kwargs["cwd"], json.dumps({"type": "turn.completed" if completed else "item.completed"}))
         with patch.object(provider, "_command", return_value=["fake"]), \
+             patch.object(codex_cli, "codex_cli_preflight"), \
              patch.object(codex_cli, "_bundled_model_catalog", return_value="{}"), \
              patch.object(codex_cli, "_validate_model_reasoning_effort"), \
              patch.object(codex_cli, "_run_bounded", side_effect=run):

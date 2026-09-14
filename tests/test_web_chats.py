@@ -711,7 +711,7 @@ class WebChatBrokerTests(unittest.TestCase):
         self.assertIn("fenced ```json code block", caught[0])
         self.assertIn("literal characters such as *, _, <, and >", caught[0])
         self.assertIn('"done"', caught[0])
-        self.assertLess(caught[0].index("Quoted user request:"), caught[0].index(
+        self.assertLess(caught[0].index("Quoted conversation history"), caught[0].index(
             "Authoritative role and turn instructions from Nexus:"
         ))
         self.assertLess(caught[0].index(

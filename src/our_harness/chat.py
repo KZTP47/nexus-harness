@@ -390,6 +390,90 @@ def _attachment_folder(config: LoadedConfig, route: str, filed_as: str) -> Path:
     )
 
 
+def interpret_attachment(content: bytes, name: str, mime: str, position: int = 0):
+    """Interpret verified originals identically on ingestion and historical reuse."""
+    guessed_mime = str(mimetypes.guess_type(name)[0] or "application/octet-stream")
+    if mime in {"", "application/octet-stream", "binary/octet-stream"}:
+        mime = guessed_mime
+    image_info = attachment_image_metadata(content)
+    if image_info:
+        mime = str(image_info["type"])
+    elif mime in IMAGE_EXTENSIONS or guessed_mime in IMAGE_EXTENSIONS:
+        raise ChatError(f"{name} does not contain the image format its name or type declares. Attach the original image file.")
+    unsupported_image = mime.startswith("image/") and image_info is None
+    textual = image_info is None and (
+        mime.startswith("text/")
+        or mime in {"application/json", "application/xml", "application/javascript"}
+        or Path(name).suffix.lower() in {
+            ".py", ".js", ".ts", ".tsx", ".jsx", ".css", ".html", ".md",
+            ".txt", ".json", ".yaml", ".yml", ".toml", ".ini", ".csv",
+        }
+    )
+    archive_input = image_info is None and (Path(name).suffix.lower() == ".zip" or mime in {"application/zip", "application/x-zip-compressed"})
+    if archive_input:
+        try:
+            archive = ZipInspection(content)
+            archive_count = len(archive.entries)
+            archive.close()
+        except HarnessError as exc:
+            raise ChatError(f"{name}: {exc}") from exc
+        mime = "application/zip"
+    document = image_info is None and is_docx(name, mime)
+    if document:
+        try:
+            decoded = extract_docx_text(content)
+        except HarnessError as exc:
+            raise ChatError(f"{name}: {exc}") from exc
+        mime = DOCX_MIME
+    elif textual and not archive_input:
+        try:
+            decoded = content.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise ChatError(
+                f"{name} is labelled as text but is not valid UTF-8 at byte "
+                f"{exc.start}. Nexus did not replace or discard any bytes. "
+                "Save it as UTF-8 or attach it as a binary reference."
+            ) from exc
+    else:
+        decoded = ""
+    if len(decoded) > MOST_ATTACHMENT_TEXT:
+        raise ChatError(
+            f"{name} contains more than {MOST_ATTACHMENT_TEXT:,} text characters. "
+            "Nexus did not clip it. Split it into smaller files so every character "
+            "can be supplied to the assistant."
+        )
+    public = {
+        "name": name,
+        "type": mime,
+        "size": len(content),
+        "image": image_info is not None,
+        "sha256": hashlib.sha256(content).hexdigest(),
+        **({key: image_info[key] for key in ("width", "height") if key in image_info} if image_info else {}),
+    }
+    blocks = []
+    if archive_input:
+        blocks.append(f"ATTACHED ZIP ARCHIVE {position + 1}: {name}\n"
+            f"Archive has {archive_count} entries. Use list_archive, read_archive, or extract_archive with path "
+            f"attachment://{public['sha256']} to open and inspect the original archive. Content has not yet been read.")
+    elif document:
+        blocks.append(
+            f"ATTACHED WORD DOCUMENT {position + 1}: {name}\n"
+            "Extracted document text follows (including tables and notes; images and page layout are not rendered).\n"
+            + decoded
+        )
+    elif textual:
+        blocks.append(f"ATTACHED TEXT FILE {position + 1}: {name}\n{decoded}")
+    elif image_info:
+        blocks.append("USER-SELECTED IMAGE (original bytes, no Nexus resizing)\n" + json.dumps({
+            key: public[key] for key in ("name", "type", "size", "sha256", "width", "height") if key in public
+        }, ensure_ascii=False))
+    elif unsupported_image:
+        blocks.append(f"ATTACHED FILE {json.dumps(name, ensure_ascii=False)} ({mime}) was retained as a document. "
+                           "This format was not supplied as visual input; do not claim to have inspected its image. "
+                           "PNG, JPEG, GIF and WebP are supported visual attachment formats.")
+    return public, not unsupported_image, "\n\n".join(blocks)
+
+
 def keep_attachments(
     config: LoadedConfig, route: str, supplied: object, filed_as: str = ""
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
@@ -431,55 +515,10 @@ def keep_attachments(
         total += len(content)
         if total > MOST_ATTACHMENTS_BYTES:
             raise ChatError("The attachments together are larger than 8 MB.")
-        image_info = attachment_image_metadata(content)
-        if image_info:
-            mime = str(image_info["type"])
-        elif mime in IMAGE_EXTENSIONS or guessed_mime in IMAGE_EXTENSIONS:
-            raise ChatError(f"{name} does not contain the image format its name or type declares. Attach the original image file.")
-        unsupported_image = mime.startswith("image/") and image_info is None
-        textual = image_info is None and (
-            mime.startswith("text/")
-            or mime in {"application/json", "application/xml", "application/javascript"}
-            or Path(name).suffix.lower() in {
-                ".py", ".js", ".ts", ".tsx", ".jsx", ".css", ".html", ".md",
-                ".txt", ".json", ".yaml", ".yml", ".toml", ".ini", ".csv",
-            }
-        )
-        archive_input = image_info is None and (Path(name).suffix.lower() == ".zip" or mime in {"application/zip", "application/x-zip-compressed"})
-        if archive_input:
-            try:
-                archive = ZipInspection(content)
-                archive_count = len(archive.entries)
-                archive.close()
-            except HarnessError as exc:
-                raise ChatError(f"{name}: {exc}") from exc
-            mime = "application/zip"
-        document = image_info is None and is_docx(name, mime)
-        if document:
-            try:
-                decoded = extract_docx_text(content)
-            except HarnessError as exc:
-                raise ChatError(f"{name}: {exc}") from exc
-            mime = DOCX_MIME
-        elif textual and not archive_input:
-            try:
-                decoded = content.decode("utf-8", errors="strict")
-            except UnicodeDecodeError as exc:
-                raise ChatError(
-                    f"{name} is labelled as text but is not valid UTF-8 at byte "
-                    f"{exc.start}. Nexus did not replace or discard any bytes. "
-                    "Save it as UTF-8 or attach it as a binary reference."
-                ) from exc
-        else:
-            decoded = ""
-        if len(decoded) > MOST_ATTACHMENT_TEXT:
-            raise ChatError(
-                f"{name} contains more than {MOST_ATTACHMENT_TEXT:,} text characters. "
-                "Nexus did not clip it. Split it into smaller files so every character "
-                "can be supplied to the assistant."
-            )
+        metadata, provide, attachment_text = interpret_attachment(content, name, mime, position)
+        mime = metadata["type"]
         attachment_id = uuid.uuid4().hex
-        suffix = IMAGE_EXTENSIONS[mime] if image_info else Path(name).suffix[:16]
+        suffix = IMAGE_EXTENSIONS[mime] if metadata["image"] else Path(name).suffix[:16]
         stored = folder / f"{attachment_id}{suffix}"
         beside = folder / f".{attachment_id}.part"
         descriptor = os.open(filesystem_path(beside), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -488,42 +527,16 @@ def keep_attachments(
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(filesystem_path(beside), filesystem_path(stored))
-        public = {
-            "id": attachment_id,
-            "name": name,
-            "type": mime,
-            "size": len(content),
-            "image": image_info is not None,
-            "sha256": hashlib.sha256(content).hexdigest(),
-            **({key: image_info[key] for key in ("width", "height") if key in image_info} if image_info else {}),
-        }
+        public = {**metadata, "id": attachment_id}
         kept.append(public)
-        if not unsupported_image:
+        if provide:
             provider_files.append({
                 **public,
                 "data": base64.b64encode(content).decode("ascii"),
                 "path": str(stored),
             })
-        if archive_input:
-            text_blocks.append(f"ATTACHED ZIP ARCHIVE {position + 1}: {name}\n"
-                f"Archive has {archive_count} entries. Use list_archive, read_archive, or extract_archive with path "
-                f"attachment://{public['sha256']} to open and inspect the original archive. Content has not yet been read.")
-        elif document:
-            text_blocks.append(
-                f"ATTACHED WORD DOCUMENT {position + 1}: {name}\n"
-                "Extracted document text follows (including tables and notes; images and page layout are not rendered).\n"
-                + decoded
-            )
-        elif textual:
-            text_blocks.append(f"ATTACHED TEXT FILE {position + 1}: {name}\n{decoded}")
-        elif image_info:
-            text_blocks.append("USER-SELECTED IMAGE (original bytes, no Nexus resizing)\n" + json.dumps({
-                key: public[key] for key in ("name", "type", "size", "sha256", "width", "height") if key in public
-            }, ensure_ascii=False))
-        elif unsupported_image:
-            text_blocks.append(f"ATTACHED FILE {json.dumps(name, ensure_ascii=False)} ({mime}) was retained as a document. "
-                               "This format was not supplied as visual input; do not claim to have inspected its image. "
-                               "PNG, JPEG, GIF and WebP are supported visual attachment formats.")
+        if attachment_text:
+            text_blocks.append(attachment_text)
     return kept, provider_files, "\n\n".join(text_blocks)
 
 
@@ -1342,6 +1355,7 @@ _CORRELATION_TEXT_LIMITS = {
     "progress_contract": 80,
     "outcome": 40,
     "source_dialogue_id": 160,
+    "provider_activity_id": 160,
     "task_id": 160,
     "delivery_contract": 80,
     "delivery_state": 80,
@@ -1365,6 +1379,12 @@ def _said_correlation(value: object, turn_number: int = 0) -> dict[str, Any]:
             "Nexus did not silently drop it."
         )
     kept: dict[str, Any] = {"schema_version": 1}
+    if "attachment_context" in value:
+        from .chat_attachment_context import public_notice
+        try:
+            kept["attachment_context"] = public_notice(value["attachment_context"])
+        except ValueError as exc:
+            raise ChatError(f"Saved conversation{label} has invalid attachment context metadata.") from exc
     for key, limit in _CORRELATION_TEXT_LIMITS.items():
         raw = value.get(key)
         if raw in (None, ""):
@@ -2303,58 +2323,57 @@ def say(
         )
 
 
+def _render_history_turn(one, speaker):
+    text = f"{one.speaker_name}: {one.text}" if speaker and one.who == "them" and one.speaker_name else one.text
+    if one.who == "them" and one.questions:
+        text += "\n\nQuestions this assistant asked the user:\n" + "\n".join(
+            f"- {question['prompt']}" + (" Options: " + "; ".join(option["label"] for option in question["options"]) if question["options"] else "")
+            for question in user_questions.normalize(one.questions)
+        )
+    return text
+
+
 def _project_chat_history(
     eligible: list[Any], *, speaker: Any, filed_as: str, route: str
 ) -> list[dict[str, str]]:
     """Newest complete canonical turns within the disclosed character budget."""
+    eligible = [one for one in eligible if one.phase != "reasoning_summary"]
 
     candidates = eligible[-MOST_KEPT:]
     selected: list[Any] = []
     used = 0
     for one in reversed(candidates):
-        text = (
-            f"{one.speaker_name}: {one.text}"
-            if speaker and one.who == "them" and one.speaker_name else one.text
-        )
+        text = _render_history_turn(one, speaker)
         needed = len(text)
         if needed > CHAT_HISTORY_PROMPT_CHARACTERS or used + needed > CHAT_HISTORY_PROMPT_CHARACTERS:
             continue
         selected.append((one, text))
         used += needed
     selected.reverse()
-    selected_ids = {id(one) for one, _text in selected}
-    omitted = [one for one in eligible if id(one) not in selected_ids]
-    messages: list[dict[str, str]] = []
-    if omitted:
+    def disclosure():
+        selected_ids = {id(one) for one, _text in selected}
+        omitted = [one for one in eligible if id(one) not in selected_ids]
+        if not omitted:
+            return ""
         omitted_characters = sum(len(str(one.text or "")) for one in omitted)
         canonical = f"{WHERE_THEY_LIVE}/{_filed_under(filed_as or route)}.json"
-        messages.append({
-            "role": "user",
-            "content": (
+        return (
                 "NEXUS CHAT-HISTORY PROJECTION — canonical conversation was not "
                 f"changed. {len(omitted)} complete earlier turn(s), "
                 f"{omitted_characters:,} characters, are omitted from this provider "
                 f"request only. Full Nexus history: {canonical}. No turn was sliced."
-            ),
-        })
+        )
+    notice = disclosure()
+    while selected and used + len(notice) > CHAT_HISTORY_PROMPT_CHARACTERS:
+        _one, text = selected.pop(0)
+        used -= len(text)
+        notice = disclosure()
+    messages: list[dict[str, str]] = []
+    if notice:
+        messages.append({"role": "user", "content": notice})
     messages.extend({
         "role": "user" if one.who == "you" else "assistant",
-        "content": (
-            text
-            + (
-                "\n\nQuestions this assistant asked the user:\n"
-                + "\n".join(
-                    f"- {question['prompt']}"
-                    + (
-                        " Options: "
-                        + "; ".join(option["label"] for option in question["options"])
-                        if question["options"] else ""
-                    )
-                    for question in user_questions.normalize(one.questions)
-                )
-                if one.who == "them" and one.questions else ""
-            )
-        ),
+        "content": text,
     } for one, text in selected)
     return messages
 
@@ -2384,31 +2403,21 @@ def _ask_and_keep(
         one for one in so_far
         if one.phase not in {
             "agent_reply", "lead_draft", "agent_plan", "lead_plan",
-            "agent_discussion", "agent_progress", "agent_tool",
+            "agent_discussion", "agent_progress", "agent_tool", "reasoning_summary",
             "agent_plan_review", "lead_execution", "agent_execution",
             "agent_verification", "participant_outcome", "long_horizon_checkpoint",
         }
     ]
-    messages = _project_chat_history(
-        eligible, speaker=speaker, filed_as=filed_as, route=route
+    from . import chat_attachment_context
+    messages, available_files, attachment_context = chat_attachment_context.project(
+        config, route, filed_as, eligible, list(provider_attachments or []),
+        list(kept_attachments or []), speaker, redactor,
     )
     messages.append({"role": "user", "content": redactor.text(asked)})
-    # Follow-up questions may still inspect ZIPs selected in this exact chat.
-    available_files = list(provider_attachments or [])
-    known_hashes = {one.get("sha256") for one in available_files}
-    for turn in eligible:
-        for attached in turn.attachments:
-            if (attached.get("type") == "application/zip" or str(attached.get("name", "")).lower().endswith(".zip")) and attached.get("sha256") not in known_hashes:
-                try:
-                    path, metadata = attachment_path(config, route, filed_as, attached["id"])
-                except ChatError:
-                    continue
-                available_files.append({**metadata, "path": str(path)})
-                known_hashes.add(attached.get("sha256"))
     # Built here rather than passed in, so everything that goes to an assistant
     # is built in the one place.
     request = ProviderRequest(
-        system_prefix=HOW_TO_ANSWER + ("\n\n" + ATTACHMENT_GUIDANCE if provider_attachments else ""),
+        system_prefix=HOW_TO_ANSWER + ("\n\n" + ATTACHMENT_GUIDANCE if available_files else ""),
         dynamic_context=str(dynamic_context or ""),
         messages=messages,
         model=model,
@@ -2505,6 +2514,7 @@ def _ask_and_keep(
             recipient_name="You" if speaker else "",
             phase="final_answer" if speaker else "",
             questions=user_questions.frozen(questions),
+            correlation={"schema_version": 1, "attachment_context": attachment_context} if attachment_context else {},
         ),
     ]
     # Stop and the post-provider transcript commit share one durable write
@@ -2520,6 +2530,7 @@ def _ask_and_keep(
         "route": named,
         "said": [one.to_dict() for one in turns[-MOST_KEPT:]],
         "answer": turns[-1].to_dict(),
+        **({"attachment_context": attachment_context} if attachment_context else {}),
         **({"status": "waiting_for_user", "questions": questions} if questions else {}),
     }
 
@@ -2539,6 +2550,9 @@ def ask_once(
     working_directory: str = "",
     workspace_context: ProviderWorkspaceContext | None = None,
     native_execution: str = "",
+    on_public_activity: Callable[[dict[str, Any]], None] | None = None,
+    public_activity_factory: Callable[[], Callable[[dict[str, Any]], None]] | None = None,
+    on_provider_wait: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Ask without touching a transcript, for a bounded collaboration round."""
 
@@ -2558,12 +2572,22 @@ def ask_once(
             routed = ProviderRegistry(config).provider_config(named) if named else config
             provider = create_provider(routed)
         actual_native = native_execution if not named.startswith("web:") and str(routed.get("provider.name") or "") in {"codex-cli", "claude-cli"} else ""
+        transport_work = (
+            "\n\nThis transport has no native access to the selected project. To create or edit files, "
+            "return their contents in changes; writing code in the provider page does not save a project file. "
+            "Only Nexus tool results or applied-change receipts prove that a file was saved. "
+            "A rejected or malformed action applied nothing. Use small, complete file batches and continue with work "
+            "until all requested edits have been submitted."
+            if not actual_native and response_format is not None
+            and response_format.name == "nexus_long_horizon_action_v1" else ""
+        )
         request = ProviderRequest(
             system_prefix=(HOW_TO_WORK_TOGETHER if response_format is not None
                            and response_format.name == "nexus_long_horizon_action_v1"
                            else HOW_TO_ANSWER)
                           + ("\n\n" + ATTACHMENT_GUIDANCE if provider_attachments else "")
                           + (workspace_instructions(workspace_context) if not actual_native else "")
+                          + transport_work
                           + ("\n\n" + RESEARCH_INSTRUCTIONS if response_format is not None
                              and "tool_calls" in response_format.schema.get("properties", {}) else ""),
             dynamic_context=str(context or ""),
@@ -2580,6 +2604,7 @@ def ask_once(
             working_directory=str(working_directory or ""),
             workspace_context=workspace_context,
             native_execution=actual_native,
+            on_public_activity=on_public_activity,
         )
         started = time.monotonic()
         from .swarm_runs import provider_effect
@@ -2600,6 +2625,14 @@ def ask_once(
                 config, named, one_request.conversation_key, effect_digest,
                 **effect_options,
             ):
+                if public_activity_factory is not None:
+                    one_request = replace(one_request, on_public_activity=public_activity_factory())
+                if on_provider_wait is not None:
+                    one_request = replace(one_request, on_request_started=on_provider_wait)
+                    from .providers.codex_cli import CodexCLIProvider
+                    if not isinstance(provider, CodexCLIProvider):
+                        from .provider_wait import notify
+                        notify(on_provider_wait)
                 completed = provider.complete(one_request)
             if after_provider_response is not None:
                 after_provider_response(phase)
@@ -2754,23 +2787,8 @@ def _long_horizon_public_attachments(
 
     if not isinstance(supplied, list):
         return []
-    kept: list[dict[str, Any]] = []
-    for raw in supplied[:MOST_ATTACHMENTS]:
-        if not isinstance(raw, dict):
-            continue
-        name = redactor.text(Path(str(raw.get("name") or "attachment")).name)[:180]
-        mime = str(raw.get("type") or "application/octet-stream")[:160]
-        try:
-            size = max(0, int(raw.get("size") or 0))
-        except (TypeError, ValueError):
-            size = 0
-        kept.append({
-            "name": name or "attachment",
-            "type": mime,
-            "size": size,
-            "image": mime.startswith("image/"),
-        })
-    return kept
+    from .goal_dialogue import public_attachments
+    return public_attachments(redactor.value(supplied))
 
 
 def _long_horizon_prompt_binding(
@@ -3416,6 +3434,7 @@ def keep_long_horizon_events(
                     additions.append(Said(
                         "you", words, _now(), speaker_id="user", speaker_name="You",
                         recipient_name="the team", phase="user_steering",
+                        attachments=_long_horizon_public_attachments(redactor, payload.get("attachments")),
                         correlation={**correlation, "kind": "long_horizon_user_event"},
                     ))
                 continue

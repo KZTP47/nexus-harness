@@ -1381,7 +1381,7 @@ class _BoundedCapture:
         self.truncated = False
         self._lock = threading.Lock()
 
-    def drain(self, pipe: object, destination: bytearray) -> None:
+    def drain(self, pipe: object, destination: bytearray, on_chunk=None) -> None:
         if pipe is None:
             return
         try:
@@ -1403,6 +1403,8 @@ class _BoundedCapture:
                         self.remaining -= accepted
                     if accepted < len(chunk):
                         self.truncated = True
+                if on_chunk is not None and accepted:
+                    on_chunk(chunk[:accepted])
         finally:
             pipe.close()
 

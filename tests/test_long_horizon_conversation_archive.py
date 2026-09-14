@@ -184,7 +184,7 @@ class LongHorizonConversationArchiveTests(unittest.TestCase):
         self.runtime.store.control(goal["goal_id"], "message", {
             "task_id": builder["id"], "agent_id": "builder", "text": secret,
         })
-        self.publish(goal["goal_id"], ["Public words to both participants"])
+        self.publish(goal["goal_id"], ["Public words to both participants", "Next public message"])
         goal = self.runtime.store.get(goal["goal_id"])
         self.assertIn(secret, self.runtime._agent_context(goal, goal["tasks"][0]))
         self.assertNotIn(secret, self.runtime._agent_context(goal, goal["tasks"][1]))
@@ -192,11 +192,16 @@ class LongHorizonConversationArchiveTests(unittest.TestCase):
         self.assertEqual(human["messages"][0]["summary"], secret)
         self.assertEqual(human["messages"][0]["recipient"]["agent_id"], "builder")
         hidden = self.runtime.store.dialogue_history(goal["goal_id"], limit=1, viewer_agent_id="peer")
-        self.assertEqual(hidden["messages"], [])
-        self.assertEqual(hidden["next"], 1)
+        # The page limit counts visible messages; private rows do not consume
+        # the peer's page or reveal their text through the returned metadata.
+        self.assertEqual([one["summary"] for one in hidden["messages"]], ["Public words to both participants"])
+        self.assertNotIn(secret, json.dumps(hidden))
+        self.assertEqual(hidden["next"], 2)
         self.assertTrue(hidden["has_more"])
         next_page = self.runtime.store.dialogue_history(goal["goal_id"], after=hidden["next"], limit=1, viewer_agent_id="peer")
-        self.assertEqual(next_page["messages"][0]["summary"], "Public words to both participants")
+        self.assertEqual(next_page["messages"][0]["summary"], "Next public message")
+        self.assertNotIn(secret, json.dumps(next_page))
+        self.assertEqual(next_page["next"], 3)
         self.assertFalse(next_page["has_more"])
         with self.assertRaisesRegex(HarnessError, "not addressed"):
             self.runtime.store.dialogue_history(goal["goal_id"], message_id=human["messages"][0]["id"], viewer_agent_id="peer")

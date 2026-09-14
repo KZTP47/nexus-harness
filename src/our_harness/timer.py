@@ -54,6 +54,7 @@ from .config import LoadedConfig
 from .models import HarnessError
 from .pipeline_runs import PipelineRunConflict, PipelineRunStore
 from .safety import confined_path, take_the_file_away
+from . import timer_observation
 
 WHERE_THEY_LIVE = ".harness/timers"
 # The one file that says when anything last ran, so a machine that was off
@@ -123,6 +124,8 @@ class Timer:
     on: str = "monday"
     turned_on: bool = True
     runs: list[dict[str, Any]] = field(default_factory=list)
+    watch_files: list[str] = field(default_factory=list)
+    max_lateness_minutes: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -133,6 +136,8 @@ class Timer:
             "on": self.on,
             "turned_on": self.turned_on,
             "runs": self.runs[-HOW_MANY_KEPT:],
+            "watch_files": list(self.watch_files),
+            "max_lateness_minutes": self.max_lateness_minutes,
         }
 
 
@@ -171,6 +176,9 @@ def read_it(said: Any) -> Timer:
     on = str(said.get("on") or "monday").strip().lower()
     if on not in DAYS:
         raise TimerError(f"{on!r} is not a day of the week.")
+    lateness = said.get("max_lateness_minutes", 0)
+    if type(lateness) is not int or not 0 <= lateness <= 525600:
+        raise TimerError("Late-run limit must be a whole number of minutes from 0 to 525600 (0 means no limit).")
     return Timer(
         name=check_the_name(said.get("name")),
         automation=str(said.get("automation") or "").strip(),
@@ -180,6 +188,8 @@ def read_it(said: Any) -> Timer:
         at=_check_the_time(said.get("at") or "02:00"),
         on=on,
         turned_on=bool(said.get("turned_on", True)),
+        watch_files=timer_observation.paths(said.get("watch_files", [])),
+        max_lateness_minutes=lateness,
         runs=[one for one in (said.get("runs") or []) if isinstance(one, dict)][
             -HOW_MANY_KEPT:
         ],
@@ -479,7 +489,7 @@ def looked_just_now(config: LoadedConfig, now: datetime | None = None) -> None:
 
 def write_down_a_run(
     config: LoadedConfig, timer: Timer, said: str, passed: bool, missed: int = 0,
-    when: datetime | None = None, *, by_hand: bool = False, run_id: str = "",
+    when: datetime | None = None, *, by_hand: bool = False, run_id: str = "", outcome: str = "",
 ) -> None:
     """Keep what one run did.
 
@@ -522,6 +532,8 @@ def write_down_a_run(
         "full_result_reference": full_result_reference,
         "missed": missed,
     }
+    if outcome:
+        ran["outcome"] = outcome
     path = _where_it_lives(config, timer.name)
     # Written onto whatever is on disk now, not onto the copy we started with.
     # A run may take the best part of an hour; somebody who turned the timer
@@ -777,6 +789,7 @@ def run_what_is_due(
             began = time.monotonic()
             run_id = ""
             attempt_id = ""
+            observation = None
             try:
                 automation = pipeline_lab.load(config, timer.automation)
                 frozen = pipeline_lab.freeze_definition(config, automation)
@@ -786,9 +799,35 @@ def run_what_is_due(
                     when_it_runs_next(timer, since + timedelta(seconds=1))
                     if since is not None else now
                 )
+                policy = timer.to_dict()
+                policy.pop("runs", None)
+                identity = policy
+                if not timer.watch_files and not timer.max_lateness_minutes:
+                    # Preserve pre-upgrade request IDs, including their history
+                    # field, so an accepted occurrence cannot be run twice.
+                    identity = timer.to_dict()
+                    identity.pop("watch_files", None)
+                    identity.pop("max_lateness_minutes", None)
+                # Opt-in observation policies exclude runtime history.
                 timer_digest = hashlib.sha256(
-                    json.dumps(timer.to_dict(), sort_keys=True, separators=(",", ":")).encode("utf-8")
+                    json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
                 ).hexdigest()[:16]
+                latest = occurrence
+                # Every supported cadence occurs at least weekly. Scan only
+                # eight days even after years offline, and only when enabled.
+                if timer.max_lateness_minutes:
+                    latest = when_it_runs_next(timer, now - timedelta(days=8))
+                    while when_it_runs_next(timer, latest + timedelta(seconds=1)) <= now:
+                        latest = when_it_runs_next(timer, latest + timedelta(seconds=1))
+                stale = bool(timer.max_lateness_minutes and (now - latest).total_seconds() > timer.max_lateness_minutes * 60)
+                observation = timer_observation.observe(config.project_root, timer.watch_files, {"timer": policy, "automation": frozen})
+                unchanged = observation is not None and history.get("observation") == observation
+                if stale or unchanged:
+                    reason = "stale" if stale else "unchanged"
+                    said = "Skipped: the latest scheduled occurrence is too old." if stale else "Skipped: watched inputs have not changed since the last successful run."
+                    write_down_a_run(config, timer, said, False, missed, now, outcome=reason)
+                    ran.append({"timer": timer.name, "automation": timer.automation, "run_id": "", "passed": False, "said": said, "missed": missed, "outcome": reason, "skipped": True, "told": []})
+                    continue
                 timer_name_digest = hashlib.sha256(timer.name.encode("utf-8")).hexdigest()[:16]
                 try:
                     accepted, created = run_store.accept(
@@ -873,6 +912,10 @@ def run_what_is_due(
             # down, printed in a terminal, and put on the panel.
             said = in_safe_words(config, said)
             write_down_a_run(config, timer, said, passed, missed, now, run_id=run_id)
+            if passed and observation is not None:
+                history = _what_happened(config)
+                history.setdefault(timer.name, {})["observation"] = observation
+                _keep_what_happened(config, history)
             ran.append({
                 "timer": timer.name,
                 "automation": timer.automation,
@@ -889,8 +932,11 @@ def run_what_is_due(
         keep_touching.join(timeout=5)
         take_the_file_away(held, missing_ok=True)
     deferred = sum(1 for item in ran if item.get("deferred"))
-    completed = len(ran) - deferred
+    skipped = sum(1 for item in ran if item.get("skipped"))
+    completed = len(ran) - deferred - skipped
     note = f"{completed} ran."
+    if skipped:
+        note += f" {skipped} skipped (unchanged or stale)."
     if deferred:
         note += f" {deferred} deferred without advancing its occurrence."
     return {"ran": ran, "note": note}

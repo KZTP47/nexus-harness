@@ -383,7 +383,7 @@ class GoalWorkspaces(unittest.TestCase):
                 try:
                     self.assertTrue(acquired.wait(3), failures)
                     began = time.monotonic()
-                    with self.assertRaisesRegex(HarnessError, "Another harness process holds the project transaction lock"):
+                    with self.assertRaisesRegex(HarnessError, "Another harness process holds the project transaction lock|Another write operation is using this project"):
                         with workspaces.publication(document, self.runtime, timeout_seconds=0):
                             self.fail("A contended publication lock was acquired")
                     self.assertLess(time.monotonic() - began, 0.5)

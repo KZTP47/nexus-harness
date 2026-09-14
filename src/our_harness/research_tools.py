@@ -10,6 +10,7 @@ import re
 import stat
 from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 
+from . import cancellation
 from .archive_tools import MAX_ARCHIVE_BYTES, MAX_EXPANDED_BYTES, ZipInspection
 from .bounded_file_read import READ_FILE_INPUT_SCHEMA, read_file_page, validate_read_file_arguments
 from .models import HarnessError
@@ -86,18 +87,21 @@ def attachment_bytes(record: dict) -> bytes:
 
 
 class ResearchTools:
-    def __init__(self, root: Path, *, read_project=None, attachments=None):
+    def __init__(self, root: Path, *, read_project=None, attachments=None, deadline=None):
+        self.deadline = deadline
         self.root = root
         self.read_project = read_project
         self.attachments = {one.get("sha256"): dict(one) for one in (attachments or []) if isinstance(one, dict) and one.get("sha256")}
         self.web_cache: dict[str, dict] = {}
 
     def _fetch(self, url):
+        cancellation.checkpoint()
+        timeout = self.deadline.remaining_seconds("before public research", 20) if self.deadline else 20
         if url not in self.web_cache:
             # Bound total in-memory download retention in one tool session.
             if len(self.web_cache) >= 12:
                 self.web_cache.pop(next(iter(self.web_cache)))
-            self.web_cache[url] = fetch_public(url)
+            self.web_cache[url] = fetch_public(url, **({"timeout": timeout} if self.deadline is not None else {}))
         return self.web_cache[url]
 
     def _json(self, url):

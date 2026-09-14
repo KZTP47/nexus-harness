@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 
 class HarnessError(RuntimeError):
@@ -189,6 +189,9 @@ class ProviderRequest:
     # Issued only by the goal engine for an authenticated per-agent copy.
     # Empty preserves the existing answer-only transport contract.
     native_execution: str = ""
+    # Public observational events only; never part of the provider prompt/wire.
+    on_public_activity: Callable[[dict[str, Any]], None] | None = field(default=None, repr=False, compare=False)
+    on_request_started: Callable[[dict[str, Any]], None] | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)

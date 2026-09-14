@@ -87,10 +87,12 @@ test("actual chat activity and decision controls fit wide and narrow windows and
     assert.equal(await page.locator("#theBigChatActivity .chat-activity-stage").textContent(), "Team is working");
     assert.equal(await page.locator("#compactFixture .chat-activity").evaluate(one => one.hidden), false);
     await page.evaluate(() => setGoal({tasks:[{id:'task-a',assigned_agent_id:'builder',state:'running',provider_effect_state:'dispatched'}]}));
-    assert.equal(await page.locator("#theBigChatActivity .chat-activity-stage").textContent(), "Builder is responding");
+    assert.equal(await page.locator("#theBigChatActivity .chat-activity-stage").textContent(), "Waiting for Builder");
     await page.evaluate(() => setGoal({tasks:[{id:'task-a',assigned_agent_id:'builder',state:'running',provider_effect_state:'dispatched',
+      provider_effect_id:'request-a',provider_wait:{schema_version:1,effect_id:'request-a',started_ms:Date.now()-65000,timeout_seconds:600},
       protocol_recovery:{schema_version:2,state:'dispatched',attempts:1,max_attempts:2,cumulative_attempts:3}}]}));
     assert.match(await page.locator("#theBigChatActivity").innerText(), /Correcting Builder.*response/s);
+    assert.match(await page.locator("#theBigChatActivity").innerText(), /Request limit: 600s/);
     const geometry = [];
     for (const viewport of [{width:1264,height:775},{width:760,height:760},{width:390,height:844}]) {
       await page.setViewportSize(viewport);

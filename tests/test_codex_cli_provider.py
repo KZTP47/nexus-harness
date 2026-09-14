@@ -385,7 +385,13 @@ class CodexCLIProviderTests(unittest.TestCase):
             root = Path(temporary)
             with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-fixture-secret-value"}):
                 _config, provider, record = self.make_provider(root)
-                response = provider.complete(self.request())
+                request = self.request(12)
+                from dataclasses import replace
+                timings = []
+                response = provider.complete(replace(request, on_request_started=timings.append))
+                self.assertEqual(len(timings), 1)
+                self.assertEqual(timings[0]["timeout_seconds"], 12)
+                self.assertGreater(timings[0]["started_ms"], 0)
             captured = json.loads(record.read_text(encoding="utf-8"))
         self.assertEqual(json.loads(response.text), {"answer": "ok"})
         self.assertEqual(response.input_tokens, 17)

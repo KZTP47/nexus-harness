@@ -16,7 +16,8 @@ import urllib.request
 from typing import Any
 from urllib.parse import urlsplit
 
-from . import __version__
+from . import __version__, cancellation
+from .http_deadline import GuardedHTTPHandler, GuardedHTTPSHandler, bind_dispatch_guard
 from .config import LoadedConfig
 from .models import HarnessError
 
@@ -36,6 +37,8 @@ LATEST_LEGACY_PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_LEGACY_PROTOCOL_VERSIONS = frozenset(
     {LATEST_LEGACY_PROTOCOL_VERSION, "2025-06-18", "2025-03-26", "2024-11-05", "2024-10-07"}
 )
+_HTTP_WORKERS = threading.BoundedSemaphore(8)
+
 _CLIENT_INFO = {"name": "our-harness", "version": __version__}
 
 
@@ -96,10 +99,6 @@ def _interrupt_response(response: Any) -> None:
             connection.close()
         except OSError:
             pass
-    try:
-        response.close()
-    except OSError:
-        pass
 
 
 class _SSEJSONDecoder:
@@ -150,7 +149,8 @@ class _SSEJSONDecoder:
 class MCPClient:
     """Bounded JSON-RPC client for configured MCP servers."""
 
-    def __init__(self, server: dict[str, Any], timeout: int | float = 60, max_response_bytes: int = 1_000_000):
+    def __init__(self, server: dict[str, Any], timeout: int | float = 60, max_response_bytes: int = 1_000_000, *, deadline=None):
+        self.deadline = deadline
         self.server = server
         self.timeout = max(0.001, float(timeout))
         self.max_response_bytes = max_response_bytes
@@ -173,7 +173,7 @@ class MCPClient:
         self.cache_hints: dict[str, dict[str, object]] = {}
         self.notifications: list[dict[str, Any]] = []
         self._notification_bytes = 0
-        self._http_opener = urllib.request.build_opener(_ValidatedRedirectHandler())
+        self._http_opener = urllib.request.build_opener(GuardedHTTPHandler(), GuardedHTTPSHandler(), _ValidatedRedirectHandler())
         self._windows_job: int | None = None
         # Some Windows launchers (notably Store/venv redirectors) broker the
         # real executable outside the launcher's job.  Retain creation-time
@@ -184,8 +184,13 @@ class MCPClient:
         self._windows_tree_parents: dict[int, int] = {}
         self._windows_tree_handles: dict[int, int] = {}
 
+    def _deadline_at(self) -> float:
+        cancellation.checkpoint()
+        remaining = self.deadline.remaining_seconds("before MCP operation", self.timeout) if self.deadline else self.timeout
+        return time.monotonic() + remaining
+
     def connect(self) -> dict[str, Any]:
-        deadline_at = time.monotonic() + self.timeout
+        deadline_at = self._deadline_at()
         self.cache_hints.clear()
         mode = self.server.get("protocol_mode", "legacy")
         if mode not in ("legacy", "auto", "modern"):
@@ -264,6 +269,7 @@ class MCPClient:
                 # these are paths, not secrets, and a program that cannot find
                 # the home folder cannot start at all.
                 env=launch_environment,
+                cwd=self.server.get("cwd"),
                 **options,
             )
 
@@ -349,7 +355,7 @@ class MCPClient:
         if remaining <= 0:
             raise HarnessError("MCP request timed out")
         probe_timeout = remaining if mode == "modern" else max(0.001, remaining * 0.35)
-        probe = MCPClient(self.server, timeout=probe_timeout, max_response_bytes=self.max_response_bytes)
+        probe = MCPClient(self.server, timeout=probe_timeout, max_response_bytes=self.max_response_bytes, deadline=self.deadline)
         probe.protocol_era = "modern"
         probe.protocol_version = MODERN_PROTOCOL_VERSION
         try:
@@ -1086,7 +1092,7 @@ class MCPClient:
             self._close_without_raising()
 
     def notify(self, method: str, params: dict[str, Any]) -> None:
-        self._notify(method, params, time.monotonic() + self.timeout)
+        self._notify(method, params, self._deadline_at())
 
     def _notify(self, method: str, params: dict[str, Any], deadline_at: float) -> None:
         message = {"jsonrpc": "2.0", "method": method, "params": params}
@@ -1096,7 +1102,7 @@ class MCPClient:
             self._post_http(message, allow_empty=True, deadline_at=deadline_at)
 
     def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
-        return self._request(method, params, time.monotonic() + self.timeout)
+        return self._request(method, params, self._deadline_at())
 
     def _request(self, method: str, params: dict[str, Any], deadline_at: float) -> dict[str, Any]:
         self.sequence += 1
@@ -1135,7 +1141,7 @@ class MCPClient:
         return result
 
     def list_tools(self) -> list[dict[str, Any]]:
-        deadline_at = time.monotonic() + self.timeout
+        deadline_at = self._deadline_at()
         self.cache_hints.pop("tools/list", None)
         tools: list[dict[str, Any]] = []
         cursor: str | None = None
@@ -1230,6 +1236,7 @@ class MCPClient:
         writer.start()
         try:
             while True:
+                cancellation.checkpoint()
                 remaining = deadline_at - time.monotonic()
                 if remaining <= 0:
                     diagnostic = self._stderr_diagnostic()
@@ -1322,6 +1329,7 @@ class MCPClient:
         reader.start()
         try:
             while True:
+                cancellation.checkpoint()
                 remaining = deadline_at - time.monotonic()
                 if remaining <= 0:
                     diagnostic = self._stderr_diagnostic()
@@ -1450,7 +1458,7 @@ class MCPClient:
         deadline_at: float | None = None,
     ) -> dict[str, Any]:
         url = _validated_http_url(self.server.get("url"))
-        deadline_at = deadline_at if deadline_at is not None else time.monotonic() + self.timeout
+        deadline_at = deadline_at if deadline_at is not None else self._deadline_at()
         remaining = deadline_at - time.monotonic()
         if remaining <= 0:
             raise HarnessError("MCP HTTP request timed out")
@@ -1473,8 +1481,16 @@ class MCPClient:
                 except queue.Full:
                     continue
 
+        token = cancellation.current()
+        def check_dispatch():
+            if token is not None:
+                token.checkpoint()
+            if stopped.is_set() or time.monotonic() >= deadline_at:
+                raise HarnessError("MCP HTTP request timed out before dispatch")
+
         def read_response() -> None:
             response: Any = None
+            restore_guard = bind_dispatch_guard(check_dispatch)
             try:
                 response = self._http_opener.open(request, timeout=max(0.001, remaining))
                 final_url = getattr(response, "geturl", lambda: url)()
@@ -1508,9 +1524,24 @@ class MCPClient:
                     offer("error", exc)
             except Exception as exc:
                 offer("error", exc)
+            finally:
+                try:
+                    if response is not None:
+                        response.close()
+                except Exception:
+                    pass
+                finally:
+                    restore_guard()
+                    _HTTP_WORKERS.release()
 
+        if not _HTTP_WORKERS.acquire(blocking=False):
+            raise HarnessError("MCP HTTP workers are still shutting down; retry after they finish")
         reader = threading.Thread(target=read_response, name="harness-mcp-http-reader", daemon=True)
-        reader.start()
+        try:
+            reader.start()
+        except BaseException:
+            _HTTP_WORKERS.release()
+            raise
         consumed = 0
         raw_parts: list[bytes] = []
         content_type = ""
@@ -1518,6 +1549,7 @@ class MCPClient:
         expected_id = message.get("id")
         try:
             while True:
+                cancellation.checkpoint()
                 remaining_now = deadline_at - time.monotonic()
                 if remaining_now <= 0:
                     raise HarnessError("MCP HTTP request timed out at its wall-clock deadline")

@@ -416,6 +416,7 @@ config.trust_project_local_config(
             {"provider": {"name": "openai-compatible"}},
             {"memory": {"embedding_provider": "openai", "embedding_model": "text-embedding-3-small"}},
             {"memory": {"embedding_model": "nomic-embed-text"}},
+            {"persistent_memory": {"enabled": True, "vault_path": str(Path(tempfile.gettempdir()) / "nexus-config-fixture-vault"), "hybrid_search": True, "embedding_model": "fixture"}},
         ]
         for layer in attempts:
             with self.subTest(layer=layer), tempfile.TemporaryDirectory() as temporary:

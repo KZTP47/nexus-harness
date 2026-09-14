@@ -720,5 +720,12 @@ class RefinementTests(unittest.TestCase):
                     manager.rollback("prompt", "rule", first_id, [{"name": "review", "passed": True, "evidence": "rollback review"}], "BLOCK")
 
 
+# Keep new checks in this existing CI module so adding background assistance
+# does not reshuffle the eight measured full-suite partitions.
+from tests.background_assistance_checks import (
+    ObservedTimers, HybridMemory, DeliveryObservations, UninterruptedCollaboration,
+)
+
+
 if __name__ == "__main__":
     unittest.main()

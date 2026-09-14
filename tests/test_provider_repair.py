@@ -166,6 +166,39 @@ class RepairPlanTests(unittest.TestCase):
                     )
                     self.assertIn(action["cost"], {"none", "model-request"})
 
+    def test_timeout_offers_deliberate_live_recovery_on_available_routes(self) -> None:
+        for kind, state, authentication in (
+            ("codex-cli", "authenticated", "signed-in"),
+            ("claude-cli", "authenticated", "signed-in"),
+            ("openai", "configured", "unknown"),
+            ("codex-cli", "isolated-ready", "unknown"),
+        ):
+            with self.subTest(kind=kind, state=state):
+                found = self.plan({
+                    "route": "codex", "kind": kind, "state": state,
+                    "authentication": authentication,
+                }, {"ready": True, "trouble_last_time": "Provider timed out."})
+                repair = found["repair"]
+                self.assertEqual(repair["tone"], "attention")
+                self.assertEqual([a["id"] for a in repair["actions"]],
+                                 ["live-test", "settings", "check"])
+                self.assertEqual(repair["actions"][0]["cost"], "model-request")
+                self.assertIn("cannot clear", " ".join(repair["steps"]))
+                self.assertIn("does not resume", " ".join(repair["steps"]))
+
+    def test_timeout_does_not_offer_live_test_on_unavailable_routes(self) -> None:
+        for state, authentication in (
+            ("needs-login", "signed-out"), ("unreachable", "unknown"),
+            ("not-installed", "unknown"), ("configured", "missing-credential"),
+            ("unknown", "unknown"),
+        ):
+            with self.subTest(state=state, authentication=authentication):
+                found = self.plan({
+                    "route": "codex", "kind": "codex-cli", "state": state,
+                    "authentication": authentication,
+                }, {"ready": True, "trouble_last_time": "Provider timed out."})
+                self.assertNotIn("live-test", [a["id"] for a in found["repair"]["actions"]])
+
     def test_diagnosis_fingerprint_changes_with_failure_evidence(self) -> None:
         status = {
             "route": "codex", "kind": "codex-cli", "installed": True,
@@ -401,6 +434,31 @@ class RepairEndpointTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertIn("Finish the repair step", body["error"])
         asked.assert_not_called()
+
+    def test_saved_timeout_can_be_verified_through_endpoint_and_stays_cleared_after_restart(self) -> None:
+        from our_harness import chat
+        from our_harness.models import ProviderResponse
+
+        chat._write_down_that_it_would_not(self.config, "codex", "Provider timed out.")
+        status = {
+            "route": "codex", "kind": "codex-cli", "installed": True,
+            "state": "authenticated", "authentication": "signed-in",
+        }
+        provider = mock.Mock()
+        provider.complete.return_value = ProviderResponse("READY", finish_reason="stop")
+        with mock.patch.object(provider_repair, "connection_status", return_value=status), \
+             mock.patch.object(chat, "create_provider", return_value=provider):
+            code, diagnosis = self.call("/api/team/repair-plan", {"route": "codex"})
+            self.assertEqual(code, 200)
+            self.assertEqual(diagnosis["repair"]["state"], "provider-timeout")
+            provider.complete.assert_not_called()
+            self.assertIn("codex", chat.what_would_not_answer(self.config))
+            code, result = self.call("/api/team/test-route", {"route": "codex"})
+        self.assertEqual(code, 200, result)
+        self.assertEqual(result["plan"]["repair"]["state"], "verified")
+        provider.complete.assert_called_once()
+        restarted = LoadedConfig(copy.deepcopy(self.config.data), self.config.project_root, [], {})
+        self.assertNotIn("codex", chat.what_would_not_answer(restarted))
 
     def test_stop_targets_only_the_exact_route_test(self) -> None:
         token = self.server.chat_cancellations.begin("connection-test:codex")

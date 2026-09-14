@@ -259,6 +259,11 @@ class GoalDecisionTests(unittest.TestCase):
                     self.assertIn('DIRECTED_STEERING_CANARY', context)
                     self.assertNotIn('UNKNOWN_LEGACY_RECIPIENT_CANARY', context)
                     builder = self.runtime.store.claim_ready(goal['goal_id'], 'handoff-owner')[0]
+                    # A private message must cross the recipient's actual dispatch
+                    # and reply boundary before that recipient may hand off work.
+                    self.runtime.store.record_dispatch(goal['goal_id'], builder, 'handoff-context',
+                        message_sequence=long_horizon.goal_messages.highwater(held, owner))
+                    self.runtime.store.record_provider_reply(goal['goal_id'], builder, phase='initial')
                     self.runtime.store.apply_action(goal['goal_id'], builder,
                         fixtures.reply('handoff', 'Peer, continue the implementation.', handoff_agent_id='peer'))
                     restarted = long_horizon.LongHorizonRuntime(self.config)

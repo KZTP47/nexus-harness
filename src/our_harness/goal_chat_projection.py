@@ -239,6 +239,11 @@ def keep_page(
                 raise chat.ChatError("An archived message has invalid durable identity metadata")
             seen_sequences.add(sequence)
             if sequence <= prior:
+                previous = next((one for one in saved
+                    if one.correlation.get("goal_id") == goal_id
+                    and one.correlation.get("source_dialogue_id") == message_id), None)
+                if previous is not None and not message.get("agent_id") and previous.attachments != chat._long_horizon_public_attachments(redactor, message.get("attachments")):
+                    raise chat.ChatError("An archived message identity has conflicting saved attachments")
                 continue
             words = str(message.get("summary") or "")
             if offset or len(words) != total or message.get("has_more_characters"):
@@ -279,7 +284,8 @@ def keep_page(
                     "source_goal_event_type": str(message.get("source_goal_event_type")
                                                   or ("provider_acknowledged" if agent_id else "goal_steered")),
                 })
-            if agent_id:
+            provider_activity = message.get("provider_activity") if message.get("phase") == "provider_activity" else None
+            if agent_id and not provider_activity:
                 correlation.update(report_metadata(goal))
             timestamp = _timestamp(message.get("at_ms"))
             row = chat.Said(
@@ -288,9 +294,45 @@ def keep_page(
                 speaker_id=agent_id or "user", speaker_name=str(agent.get("name") or agent_id) if agent_id else "You",
                 speaker_route=str(agent.get("who") or ""), recipient_id=target_id,
                 recipient_name=target_name,
+                attachments=chat._long_horizon_public_attachments(redactor, message.get("attachments")) if not agent_id else [],
                 phase=("agent_progress" if agent_id and str(message.get("phase") or "") != "action"
                        else "agent_discussion" if agent_id else "user_steering"), correlation=correlation,
             )
+            if provider_activity:
+                from .provider_activity import FINGERPRINT
+                if provider_activity.get("contract_fingerprint") != FINGERPRINT or not message.get("activity_id"):
+                    raise chat.ChatError("Unsupported archived provider activity")
+                row.correlation["kind"] = "long_horizon_provider_activity"
+                row.correlation["provider_activity_id"] = message["activity_id"]
+                if provider_activity.get("kind") == "reasoning_summary":
+                    from .provider_activity import SUMMARY_CONTRACT
+                    if provider_activity.get("summary_contract") != SUMMARY_CONTRACT:
+                        raise chat.ChatError("Unsupported public reasoning summary")
+                    row.phase = "reasoning_summary"
+                if provider_activity.get("kind") == "notice":
+                    row.speaker_id, row.speaker_name, row.phase = "nexus", "Nexus", "nexus_gap"
+                if provider_activity.get("kind") in {"message", "reasoning_summary"} and provider_activity.get("truncated"):
+                    row.text += "\n[Provider message truncated at the display limit.]"
+                if provider_activity.get("kind") == "tool":
+                    evidence = {"schema_version": 1, "kind": "nexus_tool_activity",
+                                "origin": "provider", "name": provider_activity.get("name", "provider_tool"),
+                                "status": provider_activity.get("status", "requested"),
+                                "arguments": provider_activity.get("arguments", {}),
+                                "result": provider_activity.get("result", provider_activity.get("details", ""))}
+                    if provider_activity.get("truncated"):
+                        evidence["summary"] = "This provider event exceeded the display limit; details were truncated."
+                    row.text = json.dumps(redactor.value(evidence), ensure_ascii=False)
+                    row.phase = "agent_tool"
+                    row.speaker_name = str(agent.get("name") or "Team") + " · provider tool"
+                    row.correlation.update({"kind": "long_horizon_tool_activity",
+                                            "event_id": chat._long_horizon_event_id("provider-tool", goal_id, message["activity_id"])})
+                    prior_activity = next((one for one in saved if one.correlation.get("goal_id") == goal_id
+                                           and one.correlation.get("provider_activity_id") == message["activity_id"]), None)
+                    if prior_activity is not None:
+                        if int(prior_activity.correlation.get("goal_dialogue_cursor") or 0) >= sequence:
+                            accepted = max(accepted, sequence)
+                            continue
+                        saved.remove(prior_activity)
             if not source_id:
                 proven = legacy_by_ordinal.get(int(message.get("legacy_dialogue_sequence") or 0))
                 if proven is not None and proven.text == row.text \
@@ -321,6 +363,8 @@ def keep_page(
                 if previous.correlation.get("source_dialogue_id") == message_id \
                         and previous.text != row.text:
                     raise chat.ChatError("An archived message identity has conflicting saved text")
+                if previous.correlation.get("source_dialogue_id") == message_id and previous.attachments != row.attachments:
+                    raise chat.ChatError("An archived message identity has conflicting saved attachments")
                 if "goal_event_cursor" in previous.correlation:
                     row.correlation["goal_event_cursor"] = previous.correlation["goal_event_cursor"]
                 saved[matching] = row

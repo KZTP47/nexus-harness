@@ -11417,7 +11417,10 @@ for (const ackLossMode of ["lost-ack-before", "lost-ack-after"]) {
             mission_controls,
         )
         self.assertIn(
-            '$("missionFork").disabled = immutable', mission_controls,
+            '$("missionFork").disabled = !longGoal\n'
+            '    || !["paused", "failed", "complete", "cancelled"].includes(longGoal.status)\n'
+            '    || Boolean(longGoal.scheduler_live) || providerSetupChanged || hasPendingDecision',
+            mission_controls,
         )
         self.assertIn(
             '$("missionProviderSetupPrepare").disabled = !longGoal '

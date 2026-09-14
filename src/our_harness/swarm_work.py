@@ -1739,7 +1739,8 @@ def _decode(
         value = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise StructuredCollaborationError(
-            f"{label} did not return the structured collaboration result Nexus requested"
+            f"{label} did not return the structured collaboration result Nexus requested: "
+            f"{exc.msg} at line {exc.lineno}, column {exc.colno}"
         ) from exc
     if not isinstance(value, dict):
         raise StructuredCollaborationError(

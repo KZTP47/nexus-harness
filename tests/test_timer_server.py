@@ -102,6 +102,15 @@ class TimerPanelTestCase(unittest.TestCase):
 
 
 class TheSwitchOnlySendsTheSwitch(TimerPanelTestCase):
+    def test_observation_settings_survive_panel_save_and_toggle(self):
+        self.a_timer(watch_files=['inputs/data.txt'], max_lateness_minutes=20)
+        status, _ = self.ask('/api/timers/turn', {'name': 'Every night', 'turned_on': False})
+        self.assertEqual(status, 200)
+        held = timer.load(self.config, 'Every night')
+        self.assertEqual(held.watch_files, ['inputs/data.txt'])
+        self.assertEqual(held.max_lateness_minutes, 20)
+        self.assertFalse(held.turned_on)
+
     def test_turning_one_off_does_not_put_back_an_old_time(self) -> None:
         self.a_timer()
         # Somebody else moves it to half five. The panel still holds the old one.

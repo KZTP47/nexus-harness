@@ -48,7 +48,7 @@ class GoalRecoveryTests(unittest.TestCase):
         peer = copy.deepcopy(current['tasks'][1])
         resumed = store.control(goal['goal_id'], 'resume', {'expected_revision': current['revision']})
         self.assertEqual(resumed['budget'], budget)
-        self.assertEqual(resumed['tasks'][1], peer)
+        self.assertEqual(store.get(goal['goal_id'])['tasks'][1], peer)
         self.assertEqual(resumed['agent_access']['mode'], 'full')
         with self.assertRaises(HarnessError):
             store.record_provider_reply(goal['goal_id'], old_task, phase='initial')
@@ -143,7 +143,7 @@ class GoalRecoveryTests(unittest.TestCase):
         self.assertEqual(store.get(goal['goal_id']), before)
         self.assertFalse(any(e['type'] == 'interrupted_turn_superseded' for e in store.events(goal['goal_id'])['events']))
         resumed = store.control(goal['goal_id'], 'resume')
-        self.assertEqual(resumed['tasks'][1], before['tasks'][1])
+        self.assertEqual(store.get(goal['goal_id'])['tasks'][1], before['tasks'][1])
         self.assertEqual(resumed['agent_access'], store.public(before)['agent_access'])
 
     def test_http_recovery_checks_chat_identity_then_runs_to_completion(self):

@@ -98,6 +98,8 @@ test("visible permissions support deny, once, always, mode changes and stale err
       'const $=id=>document.getElementById(id);' +
       source.slice(source.indexOf("function selectedLongGoalAgentIds"), source.indexOf("function saveLongGoalComposerDraft"))});
     await page.evaluate(()=>document.getElementById('longGoalDialog').showModal());
+    assert.equal(await page.locator('#longGoalAccess').inputValue(), 'full', 'new project goal default');
+    assert.equal(await page.evaluate(()=>JSON.parse(longGoalIntent(longGoalComposerDraft())).policy.agent_access_mode), 'full');
     for (const mode of ['read_only', 'full', 'ask']) {
       await page.locator("#longGoalAccess").selectOption(mode);
       const selected = await page.evaluate(()=>({draft:longGoalComposerDraft(),intent:JSON.parse(longGoalIntent(longGoalComposerDraft()))}));

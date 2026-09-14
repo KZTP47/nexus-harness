@@ -142,6 +142,9 @@ async function request(path, options = {}) {
     const error = new Error(value.error || `HTTP ${response.status}`);
     error.status = response.status;
     error.responseReceived = true;
+    if (path === "/api/long-horizon/control" && value.directed_message_rejection) {
+      error.directedMessageRejection = value.directed_message_rejection;
+    }
     throw error;
   }
   return value;
@@ -6321,8 +6324,9 @@ function renderTimers() {
       const missed = last.missed
         ? ` (${last.missed >= 1000 ? "more than 1000" : last.missed} missed while the machine was off)`
         : "";
-      row.append(make("p", `timer-last ${last.passed ? "passed" : "failed"}`,
-        `Last ran ${last.at}: ${last.passed ? "passed" : "did not pass"}${missed}. ${last.said}`));
+      const skipped = ["unchanged", "stale"].includes(last.outcome);
+      row.append(make("p", `timer-last ${skipped ? "" : last.passed ? "passed" : "failed"}`,
+        `Last checked ${last.at}: ${skipped ? "skipped" : last.passed ? "passed" : "did not pass"}${missed}. ${last.said}`));
     }
     const buttons = make("div", "button-row");
     const turn = make("button", "", one.turned_on ? "Turn it off" : "Turn it on");
@@ -6368,6 +6372,8 @@ async function addATimer() {
     how_often: $("timerHowOften").value,
     at: $("timerAt").value || "02:00",
     on: $("timerOnDay").value || "monday",
+    watch_files: $("timerWatchFiles").value.split(/\r?\n/).map(one => one.trim()).filter(Boolean),
+    max_lateness_minutes: Number($("timerMaxLateness").value || 0),
     turned_on: true,
   }, `${name} is on a timer.`);
   $("timerName").value = "";
@@ -7288,6 +7294,33 @@ function isLoneAgentChat(agentId) {
 // happens to be selected in the advanced board panel.
 const chatGoalRequests = new Set();
 const chatGoalAnswerSubmissionIds = new Map();
+// Keep the entire uncertain attachment request: an accepted answer may no
+// longer be a pending question when its HTTP response is lost.
+const chatGoalAttachmentSubmissions = new Map();
+
+function verifyChatFollowupReceipt(result, submission) {
+  const receipt = result?.followup_receipt;
+  const binding = submission.binding;
+  const participants = receipt?.participant_ids;
+  if (receipt?.schema_version !== 1 || receipt.accepted !== true
+      || receipt.request_id !== submission.requestId
+      || receipt.goal_id !== submission.body.goal_id
+      || receipt.chat_id !== binding.chat_id || receipt.project_id !== binding.project_id
+      || !Array.isArray(participants) || new Set(participants).size !== participants.length
+      || JSON.stringify([...participants].sort()) !== JSON.stringify([...binding.participant_ids].sort())
+      || receipt.attachment_count !== submission.attachments.length
+      || !/^[a-f0-9]{64}$/.test(String(receipt.submission_sha256 || ""))
+      || result.goal?.goal_id !== submission.body.goal_id) {
+    throw new Error("Nexus could not verify that this exact message and its files were saved. Your draft and files are kept; retry to check the same request.");
+  }
+}
+
+function clearSubmittedChatAttachments(agentId, chatKey, submitted) {
+  const remaining = (swarmChatAttachments.get(chatKey) || []).filter(one => !submitted.includes(one));
+  if (remaining.length) swarmChatAttachments.set(chatKey, remaining);
+  else swarmChatAttachments.delete(chatKey);
+  if (swarmChatKey(agentId) === chatKey) renderChatAttachments(agentId);
+}
 
 function goalAnswerRequestId(goalId, pending, answers) {
   // A network retry or a poll that remounts the form must retain the same
@@ -7509,7 +7542,7 @@ async function refreshChatGoalAfterAction(agentId, goal, chatKey) {
 
 async function sendToActiveChatGoal(agentId, box) {
   const conversation = activeConversationFor(agentId);
-  if (!conversation?.id || isLoneAgentChat(agentId)) return {handled: false};
+  if (!conversation?.id) return {handled: false};
   const chatKey = swarmChatKey(agentId);
   const runtimeKey = swarmChatRuntimeKey(agentId);
   if (chatGoalRequests.has(chatKey)) return {handled: true};
@@ -7518,6 +7551,12 @@ async function sendToActiveChatGoal(agentId, box) {
     && (!inBigChat || theBigOne === agentId);
   const typed = box.value;
   const text = typed.trim();
+  const submittedAttachments = [...(swarmChatAttachments.get(chatKey) || [])];
+  const uncertain = chatGoalAttachmentSubmissions.get(chatKey);
+  const retry = uncertain && uncertain.typed === typed
+    && uncertain.attachments.length === submittedAttachments.length
+    && uncertain.attachments.every((one, index) => one === submittedAttachments[index])
+    ? uncertain : null;
   const priorGoal = chatLongGoalContext(agentId).goal;
   chatGoalRequests.add(chatKey);
   setWhatCanBePressedInSwarm();
@@ -7534,44 +7573,60 @@ async function sendToActiveChatGoal(agentId, box) {
     }
     if (!Array.isArray(inventory.goals)) throw new Error("Nexus could not read the team's saved goals. Your message is still in the composer; try again.");
     const accepted = rememberGoalSnapshotInventory(inventory.goals, readTicket);
-    const context = chatLongGoalContext(agentId, accepted);
+    const context = retry ? {goal: retry.goal, problem: ""} : chatLongGoalContext(agentId, accepted);
     if (context.problem) throw new Error(context.problem);
     const goal = context.goal;
     if (!goal && priorGoal) throw new Error("The team's goal just finished or stopped. Your draft is kept; review the result before sending a new request.");
     if (!goal) return {handled: false};
     if (goal.status === "cancelling") throw new Error("The team is stopping. Your draft is kept until this goal has stopped.");
-    if (!text) throw new Error("Type a message to the team first.");
+    if (!text && !submittedAttachments.length) throw new Error("Type a message to the team first.");
     if (text.length > TEAM_FOLLOW_UP_CHARACTERS) throw new Error("Team follow-up messages can contain up to 20,000 characters. Your complete draft is kept; split the message before sending.");
-    if ((swarmChatAttachments.get(chatKey) || []).length) {
-      throw new Error("This goal's follow-up messages accept text. Remove the attached files before sending; your files and draft have been kept.");
-    }
     const binding = chatGoalBinding(agentId, goal);
     const pending = goal.pending_interrupts || [];
-    let result;
-    if (pending.length) {
+    let submission = retry;
+    let url, body;
+    if (retry) {
+      url = retry.url; body = retry.body;
+    } else if (pending.length) {
       if (pending.length !== 1 || pending[0].questions?.length !== 1
           || pending[0].purpose === "risk_review") {
         throw new Error("Answer the team's decision cards so each answer reaches its exact question. In expanded chat, open collaboration settings. Your draft is kept.");
       }
+      if (!text) throw new Error("Type your answer to the team's question before sending these files. Your files are kept.");
       const question = pending[0].questions[0];
       const answers = {[pending[0].id]: {schema_version: 1, audience: "team", questions: [{
         question_id: question.id, selected_options: [], text: typed,
       }]}};
-      result = await request("/api/long-horizon/answer", {
-        method: "POST", body: JSON.stringify({
+      url = "/api/long-horizon/answer";
+      body = {
           goal_id: goal.goal_id, ...binding,
           expected_revision: goal.revision,
           pending_ids: [pending[0].id], answers,
           decision_snapshot: goal.decision_snapshot,
           request_id: goalAnswerRequestId(goal.goal_id, pending, answers),
-        }),
-      });
+      };
     } else {
-      result = await request("/api/long-horizon/control", {
-        method: "POST", body: JSON.stringify({
-          goal_id: goal.goal_id, action: "steer", payload: {...binding, text},
-        }),
+      url = "/api/long-horizon/control";
+      body = {goal_id: goal.goal_id, action: "steer", payload: {
+        ...binding, text: text || "Please review the attached files.",
+      }};
+    }
+    if (!submission && submittedAttachments.length) {
+      const requestId = globalThis.crypto?.randomUUID?.()
+        || `followup-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      Object.assign(body.action === "steer" ? body.payload : body, {
+        request_id: requestId, attachments: submittedAttachments,
       });
+      // Freeze wire bytes against subsequent local edits, including lost answers.
+      submission = {url, body: JSON.parse(JSON.stringify(body)), requestId,
+        typed, attachments: submittedAttachments, binding, goal: JSON.parse(JSON.stringify(goal))};
+      chatGoalAttachmentSubmissions.set(chatKey, submission);
+    }
+    const result = await request(url, {method: "POST", body: JSON.stringify(submission?.body || body)});
+    if (submission) {
+      verifyChatFollowupReceipt(result, submission);
+      clearSubmittedChatAttachments(agentId, chatKey, submission.attachments);
+      if (chatGoalAttachmentSubmissions.get(chatKey) === submission) chatGoalAttachmentSubmissions.delete(chatKey);
     }
     // Only clear the submitted bytes. Typing a new draft or switching chats
     // while the server accepts the message must preserve that independent edit.
@@ -7587,8 +7642,11 @@ async function sendToActiveChatGoal(agentId, box) {
       if (inBigChat) rememberTheBigChatComposer();
       else rememberSwarmChatComposer(agentId);
     }
-    sayInRuntimeChat(runtimeKey, "Your message is saved. Both agents will use it as they continue.");
-    await refreshChatGoalAfterAction(agentId, result.goal, chatKey);
+    sayInRuntimeChat(runtimeKey, result.goal?.status_response || (result.scheduling_error
+      ? `Your message and files are saved. The team could not continue: ${result.scheduling_error}`
+      : "Your message is saved. It will be available as work on this goal continues."));
+    try { await refreshChatGoalAfterAction(agentId, result.goal, chatKey); }
+    catch (error) { sayInRuntimeChat(runtimeKey, `Your message is saved. Refreshing the chat failed: ${error.message || error}`); }
     return {handled: true, result};
   } catch (error) {
     sayInRuntimeChat(runtimeKey, String(error.message || error));
@@ -7597,6 +7655,18 @@ async function sendToActiveChatGoal(agentId, box) {
     chatGoalRequests.delete(chatKey);
     setWhatCanBePressedInSwarm();
   }
+}
+
+async function checkChatGoalStatus(agentId) {
+  const {goal, problem} = chatLongGoalContext(agentId);
+  if (!goal || problem) return;
+  const runtimeKey = swarmChatRuntimeKey(agentId);
+  try {
+    const result = await request("/api/long-horizon/control", {method: "POST", body: JSON.stringify({
+      goal_id: goal.goal_id, action: "status", payload: chatGoalBinding(agentId, goal),
+    })});
+    sayInRuntimeChat(runtimeKey, result.goal.status_response);
+  } catch (error) { sayInRuntimeChat(runtimeKey, String(error.message || error)); }
 }
 
 async function controlChatGoal(agentId) {
@@ -8269,7 +8339,7 @@ function fillChatGoalPanel(container, agentId, context) {
 
 function chatComposerAccessPreference(conversation, mode = null) {
   const allowed = ["read_only", "ask", "full"];
-  if (!conversation?.id) return "ask";
+  if (!conversation?.id) return "full";
   const key = `nexus.chat-composer-access.v1:${conversation.id}`;
   const binding = JSON.stringify(directLongGoalCanonicalValue({
     contract: "chat-composer-access/v1", project: conversation.project,
@@ -8283,7 +8353,7 @@ function chatComposerAccessPreference(conversation, mode = null) {
     const saved = JSON.parse(localStorage.getItem(key) || "null");
     if (saved?.schema_version === 1 && saved.binding === binding && allowed.includes(saved.mode)) return saved.mode;
   } catch {}
-  return "ask";
+  return "full";
 }
 
 function fillChatComposerPermissions(host, agentId, context, inline = false) {
@@ -8491,8 +8561,21 @@ function syncChatGoalControls(agentId, card = null) {
   const scope = find(".swarm-chat-scope", "theBigChatScopeHint");
   if (active && scope) scope.textContent = "Your messages steer this team's current goal. Pause or resume whenever you need to.";
   const attach = find(".swarm-chat-attach", "theBigChatAttach");
-  if (active && attach) { attach.disabled = true; attach.title = "Team follow-ups accept text. Attachments can be included when starting a goal."; }
+  if (attach) {
+    attach.title = problem || "Attach files or paste screenshots to share with this chat";
+    if (active) attach.disabled = attach.disabled || held || Boolean(problem) || goal?.status === "cancelling";
+  }
   const stop = find(".swarm-chat-stop", "theBigChatStop");
+  let checkStatus = find(".swarm-chat-status", "theBigChatStatus");
+  if (goal && !checkStatus && stop) {
+    checkStatus = make("button", "compact swarm-chat-status", "Check status");
+    checkStatus.type = "button";
+    if (inBig) checkStatus.id = "theBigChatStatus";
+    checkStatus.title = "Read the current status without changing or restarting work";
+    checkStatus.addEventListener("click", () => void checkChatGoalStatus(inBig ? theBigOne : agentId));
+    stop.after(checkStatus);
+  }
+  if (checkStatus) { checkStatus.hidden = !goal; checkStatus.disabled = Boolean(problem); }
   if (goal && stop && !swarmChatIsBusy(agentId)) {
     const resume = ["paused", "failed"].includes(goal.status);
     const needsRecovery = resume && goal.resume_recovery?.items?.length && !goal.resume_recovery.resume_safe;
@@ -10819,8 +10902,8 @@ function chatGoalActivity({goal, problem}) {
   }
   if (goal.status === "cancelling") return status("waiting", "Stopping the team",
     "Nexus is waiting for the current work to stop safely.");
-  if (goal.status === "waiting_for_project") return status("waiting", "Waiting for project access",
-    "Another saved goal is using this project. This team will continue when access is available.");
+  if (goal.status === "waiting_for_project") return status("waiting", "Waiting for legacy project work",
+    "An older exclusive run is using this project. This is a scheduling wait, not a permissions request.");
   if (direct && goal.status === "complete") return status(
     goal.verification?.status === "failed" ? "attention" : "waiting", "Agent work finished",
     facilitatorCompletionDetail(goal));
@@ -10837,14 +10920,32 @@ function chatGoalActivity({goal, problem}) {
   const correcting = tasks.find((one) => ["running", "ready"].includes(one.state)
     && [1, 2].includes(one.protocol_recovery?.schema_version)
     && ["pending", "dispatched"].includes(one.protocol_recovery.state));
-  if (correcting) return status(correcting.state === "running" ? "working" : "waiting",
+  if (correcting && correcting.provider_effect_state !== "dispatched") return status(correcting.state === "running" ? "working" : "waiting",
     `Correcting ${agentName(correcting)}’s response`,
     `Nexus is retrying the response format (${correcting.protocol_recovery.attempts || 0} of ${correcting.protocol_recovery.max_attempts || 2} attempts). The team’s saved work is kept.`);
   const running = tasks.filter((one) => one.state === "running");
   const responding = running.filter((one) => one.provider_effect_state === "dispatched");
-  if (responding.length) return status("working", responding.length === 1
-    ? `${agentName(responding[0])} is responding` : "The agents are responding",
-    "A reply has been requested. Their next message will appear in this chat when it arrives.");
+  if (responding.length) {
+    const waits = responding.map(task => {
+      const wait = task.provider_wait;
+      if (wait?.schema_version !== 1 || !task.provider_effect_id || wait.effect_id !== task.provider_effect_id
+          || !Number.isFinite(wait.started_ms) || wait.started_ms <= 0) {
+        return `${agentName(task)}: request timing unavailable for this saved turn.`;
+      }
+      const seconds = Math.max(0, Math.floor((Date.now() - wait.started_ms) / 1000));
+      const elapsed = `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+      const limit = Number.isFinite(wait.timeout_seconds) && wait.timeout_seconds > 0 ? wait.timeout_seconds : null;
+      return `${agentName(task)}: waiting ${elapsed}. ` + (limit === null
+        ? "This provider has not reported a wall-clock deadline."
+        : `Request limit: ${Math.ceil(limit)}s. ` + (seconds >= limit
+          ? "The deadline has elapsed; waiting for the provider to stop and Nexus to record the outcome."
+          : `Up to ${Math.ceil(limit - seconds)}s remain before the request deadline.`));
+    });
+    return status("waiting", correcting ? `Correcting ${agentName(correcting)}’s response` : responding.length === 1
+      ? `Waiting for ${agentName(responding[0])}` : "Waiting for the agents",
+      (correcting ? `Nexus is retrying the response format (${correcting.protocol_recovery.attempts || 0} of ${correcting.protocol_recovery.max_attempts || 2} attempts). ` : "")
+      + waits.join(" ") + " No final reply has arrived. This status does not establish provider progress. Use Pause team to request a stop.");
+  }
   if (running.some((one) => ["reply_received", "acknowledged", "context_step_acknowledged"].includes(one.provider_effect_state))) {
     return status("working", "Processing the team’s reply",
       "Nexus is checking the response and saving the team’s next step.");
@@ -12641,18 +12742,17 @@ function setWhatCanBePressedInSwarm() {
       ? `Repair ${unavailablePeers.map((one) => one.name || one.id).join(", ")} before asking the team.`
       : `${recipientWords.team}. Expected initial replies: ${recipientWords.expected}.`);
     if ($("theBigChatWork")) {
+      $("theBigChatWork").textContent = lone ? "Work on project files" : "Work together on project files";
       const recoveryAuthorityWords = !directLongGoalRecoveryInventoryReady
         ? (directLongGoalRecoveryError
           || "Checking the saved goal-request journals before enabling project work")
         : "";
-      const workTitle = bindingWords || recoveryAuthorityWords || (lone
-        ? loneAgentActionMessage("work")
-        : recovery
+      const workTitle = bindingWords || recoveryAuthorityWords || (recovery
         ? "Resume the saved project-work run before starting another"
         : conversation && !conversation.project
         ? "Choose this chat's active project first"
         : "Start durable project work with a required contribution from every ready agent in this chat");
-      setSwarmProjectWorkControl($("theBigChatWork"), waiting || lone || Boolean(recovery)
+      setSwarmProjectWorkControl($("theBigChatWork"), waiting || !chatAgent || !chatAgent.ready || Boolean(recovery)
         || !directLongGoalRecoveryInventoryReady
         || Boolean(bindingProblem)
         || (Boolean(conversation) && !conversation.project), workTitle, theBigOne);
@@ -13915,8 +14015,7 @@ function readChatAttachment(file) {
   });
 }
 
-async function addChatAttachments(agentId, files) {
-  const key = swarmChatKey(agentId);
+async function addChatAttachments(agentId, files, key = swarmChatKey(agentId)) {
   const selected = [...files];
   if (!selected.length) return;
   if (selected.length > 6) {
@@ -14095,9 +14194,11 @@ function oneSwarmChatCard(held) {
   files.multiple = true;
   files.className = "sr-only swarm-chat-files";
   files.setAttribute("aria-label", `Attach files or screenshots to ${agent.name}'s chat`);
-  files.accept = "image/*,.txt,.md,.json,.yaml,.yml,.toml,.ini,.csv,.py,.js,.ts,.tsx,.jsx,.css,.html,.xml";
+  files.accept = "image/*,.txt,.md,.json,.yaml,.yml,.toml,.ini,.csv,.py,.js,.ts,.tsx,.jsx,.css,.html,.xml,.zip,.docx";
   files.addEventListener("change", async () => {
-    await addChatAttachments(held.agent, files.files || []);
+    const origin = files.attachmentOrigin;
+    if (origin) await addChatAttachments(origin.agentId, files.files || [], origin.chatKey);
+    files.attachmentOrigin = null;
     files.value = "";
   });
   form.append(files);
@@ -14126,7 +14227,10 @@ function oneSwarmChatCard(held) {
   row.append(stop);
   const attach = make("button", "swarm-chat-attach", "Attach");
   attach.type = "button";
-  attach.addEventListener("click", () => files.click());
+  attach.addEventListener("click", () => {
+    files.attachmentOrigin = {agentId: held.agent, chatKey: swarmChatKey(held.agent)};
+    files.click();
+  });
   row.append(attach);
   const collaborate = make("button", "swarm-chat-collaborate", recipientWords.team);
   collaborate.type = "button";
@@ -14302,14 +14406,12 @@ function setWhatCanBePressedInAChat(card) {
     ? (directLongGoalRecoveryError
       || "Checking the saved goal-request journals before enabling project work")
     : "";
-  const workDisabled = waiting || lone || !agent || !agent.ready
+  const workDisabled = waiting || !agent || !agent.ready
     || !directLongGoalRecoveryInventoryReady
     || Boolean(bindingProblem)
     || Boolean(workRecoveryFor(card.dataset.agent))
     || (Boolean(conversation) && !conversation.project);
-  const workTitle = bindingWords || recoveryAuthorityWords || (lone
-    ? loneAgentActionMessage("work")
-    : workRecoveryFor(card.dataset.agent)
+  const workTitle = bindingWords || recoveryAuthorityWords || (workRecoveryFor(card.dataset.agent)
     ? "Resume the saved project-work run before starting another"
     : "Start durable project work with a required contribution from every ready agent in this chat");
   setSwarmProjectWorkControl(
@@ -14442,8 +14544,18 @@ async function copyChatCode(button, code) {
   window.setTimeout(() => { button.textContent = before; }, 1800);
 }
 
-function appendChatText(container, text) {
+function appendChatText(container, text, correlation = null) {
   const value = String(text || "");
+  if (["long_horizon_agent_event", "long_horizon_recovered_dialogue"].includes(correlation?.kind)
+      && /^\s*(?:```json\s*|JSON\s*)?\{[\s\S]*"(?:action|changes|tool_calls)"\s*:/i.test(value)) {
+    container.append(make("p", "chat-prose",
+      "This saved reply contains an action payload, not a delivery receipt. Its claims do not establish that files were saved."));
+    const details = make("details", "chat-turn-details");
+    details.append(make("summary", "", "Original provider payload"));
+    details.append(make("pre", "chat-code", value));
+    container.append(details);
+    return;
+  }
   const fences = /```([^\r\n`]*)\r?\n([\s\S]*?)```/g;
   let after = 0;
   let found;
@@ -14550,7 +14662,22 @@ function readHistoricalWorkingFolder(evidence) {
   return historicalWorkingFolderReads.get(goalId);
 }
 
+function attachmentContextNotice(context) {
+  if (context?.schema_version !== 1
+      || context.contract_fingerprint !== "c0677eb7cd50f2cb1b1805643e96fd54990c4be8bcc47f439ea1d2f2b91605d4"
+      || !Number.isInteger(context.omitted_files) || context.omitted_files <= 0
+      || typeof context.notice !== "string") return "";
+  return context.notice.slice(0, 2000);
+}
+
+function withAttachmentContextNotice(words, result) {
+  const notice = attachmentContextNotice(result?.attachment_context);
+  return notice ? `${words} ${notice}` : words;
+}
+
 function appendChatDeliveryNotice(container, one) {
+  const attachmentNotice = attachmentContextNotice(one?.correlation?.attachment_context);
+  if (attachmentNotice) container.append(make("p", "hint chat-attachment-context-notice", attachmentNotice));
   const notice = chatDeliveryNotice(one);
   if (!notice) return;
   const row = make("div", "chat-delivery-notice");
@@ -14730,6 +14857,32 @@ function aChatProgressRow(progress, className) {
   return row;
 }
 
+function normalizedReasoningSummary(one) {
+  if (one?.phase !== "reasoning_summary" || one?.correlation?.schema_version !== 1
+      || one.correlation.kind !== "long_horizon_provider_activity"
+      || !one.correlation.provider_activity_id || !one.correlation.event_id) return null;
+  return {eventId: one.correlation.event_id, text: String(one.text || "")};
+}
+
+function aReasoningSummaryRow(speaker, summary, className) {
+  const row = make("li", `${className} chat-tool-activity-row chat-reasoning-summary-row`);
+  const details = make("details", "chat-tool-activity");
+  details.open = expandedChatToolActivity.has(summary.eventId);
+  const heading = make("summary", "chat-tool-heading");
+  heading.append(make("span", "chat-tool-speaker", speaker), make("strong", "chat-tool-name", "Reasoning summary"));
+  const body = make("div", "chat-tool-body");
+  body.append(make("p", "hint", "Public provider summary · visible only to you · not a complete record of internal reasoning."));
+  body.append(make("pre", "chat-tool-output", summary.text));
+  details.append(heading, body);
+  details.addEventListener("toggle", () => {
+    if (!details.isConnected) return;
+    if (details.open) expandedChatToolActivity.add(summary.eventId);
+    else expandedChatToolActivity.delete(summary.eventId);
+  });
+  row.append(details);
+  return row;
+}
+
 function normalizedChatToolActivity(one) {
   const correlation = one?.correlation;
   if (one?.phase !== "agent_tool" || Number(correlation?.schema_version) !== 1
@@ -14763,7 +14916,7 @@ function aChatToolActivityRow(speaker, activity, at, className) {
     call_mcp_tool: "Call configured MCP tool",
     run_selected_verification: "Run verification", read_proposed_change: "Read proposed changes",
     read_shared_conversation: "Read earlier conversation"})[activity.name] || activity.name.replaceAll("_", " ");
-  const target = activity.arguments?.path || activity.arguments?.query || "";
+  const target = activity.arguments?.path || activity.arguments?.query || activity.arguments?.command || "";
   heading.append(make("span", "chat-tool-speaker", speaker));
   heading.append(make("strong", "chat-tool-name", name));
   if (target) heading.append(make("span", "chat-tool-target", String(target)));
@@ -14774,7 +14927,9 @@ function aChatToolActivityRow(speaker, activity, at, className) {
   if (activity.summary) details.append(make("p", "chat-tool-summary", String(activity.summary)));
   const body = make("div", "chat-tool-body");
   const attribution = make("p", "hint chat-tool-attribution",
-    "Recorded tool activity. Progress updates in the chat are the explanations shared by the provider.");
+    activity.origin === "provider"
+      ? "Tool activity reported by the provider. This is not a Nexus verification result."
+      : "Recorded tool activity. Progress updates in the chat are the explanations shared by the provider.");
   if (at) {
     const time = make("time", "chat-tool-time", new Date(at).toLocaleTimeString());
     time.dateTime = at;
@@ -15047,6 +15202,11 @@ function putTheChatTurnsIn(list, agent, said, scroll = true) {
       continue;
     }
     const activity = normalizedChatToolActivity(one);
+    const reasoningSummary = normalizedReasoningSummary(one);
+    if (reasoningSummary) {
+      list.append(aReasoningSummaryRow(chatTurnSpeaker(one, agent), reasoningSummary, "talk-turn"));
+      continue;
+    }
     if (activity) {
       list.append(aChatToolActivityRow(chatTurnSpeaker(one, agent), activity, one.at, "talk-turn"));
       continue;
@@ -15081,7 +15241,7 @@ function putTheChatTurnsIn(list, agent, said, scroll = true) {
     if (participantOutcome) {
       appendParticipantOutcome(text, participantOutcome, agent, latestUserPrompt, row);
     } else {
-      appendChatText(text, one.text);
+      appendChatText(text, one.text, one.correlation);
     }
     row.append(text);
     appendLongHorizonGoalLink(row, normalizedLongHorizonCorrelation(one));
@@ -15828,14 +15988,14 @@ async function sendWhatIsTypedTo(agentId) {
   if (!card || !agent) return;
   const box = card.querySelector(".swarm-chat-box");
   const typed = box.value;
-  const words = typed.trim();
+  let words = typed.trim();
   const executionPause = projectWorkPauseForMessage(mode, words, agentId);
   if (executionPause) {
     sayInTheChatFor(agentId, executionPause);
     box.focus();
     return;
   }
-  if (!words) { sayInTheChatFor(agentId, "Type something first."); return; }
+  if (!words && !(swarmChatAttachments.get(swarmChatKey(agentId)) || []).length) { sayInTheChatFor(agentId, "Type something first."); return; }
   if (words.length > Number(limitsForSwarmChat(agentId).input_characters || 200000)) {
     sayInTheChatFor(agentId,
       "This message is over the displayed limit. Nexus kept the complete draft; split it or attach a file.");
@@ -15880,8 +16040,12 @@ async function sendWhatIsTypedTo(agentId) {
   if (!goalQueueItem) {
     const teamMessage = await sendToActiveChatGoal(agentId, box);
     if (teamMessage.handled) return teamMessage.result;
+    if (!words && mode === "chat" && (swarmChatAttachments.get(requestChatKey) || []).length) {
+      words = "Please review the attached files.";
+    }
+    if (!words) { sayInTheChatFor(agentId, "Type something first."); return; }
   }
-  if (["collaborate", "work"].includes(mode) && isLoneAgentChat(agentId)) {
+  if (mode === "collaborate" && isLoneAgentChat(agentId)) {
     sayInTheChatFor(agentId, loneAgentActionMessage(mode));
     box.focus();
     return;
@@ -16057,7 +16221,7 @@ async function sendWhatIsTypedTo(agentId) {
           ? `${agent.name} answered after hearing ${said.collaborated_with.length} connected agent(s).`
           : `${agent.name} answered.`);
     sayInRuntimeChat(
-      runtimeKey, workResponseWords(said, agent.name, ordinaryWords),
+      runtimeKey, withAttachmentContextNotice(workResponseWords(said, agent.name, ordinaryWords), said),
     );
     // The list down the side carries the last thing said under each name, and
     // something was just said.
@@ -16069,7 +16233,7 @@ async function sendWhatIsTypedTo(agentId) {
     // secondary transcript read waits; the activity feed also reconciles a
     // terminal server run when the original HTTP response is lost.
     if (!swarmActivityCanSettle(activity)) return null;
-    restoreSwarmChatDraft(requestChatKey, words);
+    restoreSwarmChatDraft(requestChatKey, typed);
     if (swarmChatKey(agentId) === requestChatKey) await refreshTheChatFor(agentId);
     if (durableDirectAdmission) await refreshDirectLongGoalRecoveries();
     if (!stoppedChatError(error)) showError(error.message);
@@ -16236,7 +16400,11 @@ function renderWhatTheySaidToEachOther(said) {
       `${one.said_by_name} to ${one.shown_to_name}`));
     const under = [one.where];
     if (one.at) under.push(one.at);
-    if (one.status === "queued") {
+    const observation = delivery.observations?.[one.message_id];
+    if (observation) {
+      under.push(observation.label);
+      if (observation.attention) under.push('Waiting needs attention; no automatic interruption or resend');
+    } else if (one.status === "queued") {
       under.push(one.attempts ? "delivery failed; kept for retry" : "queued for delivery");
     } else if (one.message_id) {
       under.push("received and acknowledged");
@@ -16700,7 +16868,9 @@ function renderMissionControl() {
   // Keep cancellation available so failure/provider drift cannot strand it.
   $("missionCancel").disabled = !longGoal
     || ["complete", "cancelled"].includes(longGoal.status);
-  $("missionFork").disabled = immutable || providerSetupChanged || hasPendingDecision;
+  $("missionFork").disabled = !longGoal
+    || !["paused", "failed", "complete", "cancelled"].includes(longGoal.status)
+    || Boolean(longGoal.scheduler_live) || providerSetupChanged || hasPendingDecision;
   $("missionCriteria").disabled = immutable || hasPendingDecision;
   $("missionCriteriaSave").disabled = immutable || hasPendingDecision;
   $("missionSteer").disabled = immutable || providerSetupChanged || hasPendingDecision;
@@ -16722,6 +16892,7 @@ function renderMissionControl() {
       card.setAttribute("aria-pressed", String(selectedMissionTaskId === task.id));
       card.append(make("strong", "", task.title));
       card.append(make("span", "", `Owner: ${task.assigned_agent_id || "unassigned"} · attempt ${task.attempts || 0}`));
+      if (task.delivery_observation?.label) card.append(make("span", "hint", task.delivery_observation.label));
       if ((task.depends_on || []).length) card.append(make("span", "", `Needs: ${task.depends_on.join(", ")}`));
       if (task.summary) card.append(make(
         "span", "mission-task-summary",
@@ -17080,7 +17251,7 @@ function longGoalComposerDraft() {
       .split(/\r?\n/).map((one) => one.trim()).filter(Boolean),
     agent_ids: selectedLongGoalAgentIds(),
     lead_id: String($("longGoalLead").value || ""),
-    access_mode: $("longGoalAccess")?.value || "ask",
+    access_mode: $("longGoalAccess")?.value || "full",
     execution_mode: $("longGoalExecution")?.value || "facilitator",
     collaboration_mode: $("longGoalParticipation").value === "adaptive"
       ? "adaptive" : "every",
@@ -17096,7 +17267,7 @@ function longGoalIntent(draft) {
     agent_ids: [...draft.agent_ids].sort(),
     lead_id: draft.lead_id,
     collaboration_mode: draft.collaboration_mode,
-    policy: {agent_access_mode: draft.access_mode || "ask", execution_mode: draft.execution_mode || "facilitator"},
+    policy: {agent_access_mode: draft.access_mode || "full", execution_mode: draft.execution_mode || "facilitator"},
   });
 }
 
@@ -17237,7 +17408,7 @@ function openLongGoalComposer() {
   const dialog = $("longGoalDialog");
   longGoalDialogInvoker = document.activeElement;
   const saved = savedLongGoalComposer()?.draft || {};
-  if ($("longGoalAccess")) $("longGoalAccess").value = saved.access_mode || "ask";
+  if ($("longGoalAccess")) $("longGoalAccess").value = saved.access_mode || "full";
   if ($("longGoalExecution")) $("longGoalExecution").value = saved.execution_mode || "facilitator";
   const projects = availableLongGoalProjects();
   const projectSelect = $("longGoalProject");
@@ -17331,7 +17502,7 @@ async function startLongGoalFromComposer(event) {
       lead_id: draft.lead_id,
       collaboration_mode: draft.collaboration_mode,
       participant_ids: draft.agent_ids,
-      policy: {agent_access_mode: draft.access_mode || "ask", execution_mode: draft.execution_mode || "facilitator"},
+      policy: {agent_access_mode: draft.access_mode || "full", execution_mode: draft.execution_mode || "facilitator"},
     };
     const said = await request("/api/long-horizon/start-board", {
       method: "POST", body: JSON.stringify({request_id: requestId, goal: goalSpec}),
@@ -17360,8 +17531,81 @@ function workOnEveryBoardGoal() {
   openLongGoalComposer();
 }
 
-async function missionControl(action, payload = {}) {
-  if (!longGoal) return;
+// An uncertain directed message must never inherit a newly selected recipient.
+const missionMessageSubmissions = new Map();
+const missionMessageRequests = new Set();
+
+async function missionMessageIntent(goalId, payload) {
+  // Public canonical envelope, independently verified against the acceptance
+  // receipt. Backend authority/integrity binding remains a separate check.
+  const canonical = JSON.stringify({agent_id: payload.agent_id, goal_id: goalId,
+    task_id: payload.task_id, text: payload.text});
+  if (!globalThis.crypto?.subtle || !globalThis.TextEncoder) {
+    throw new Error("This renderer cannot verify the exact message receipt. Restart or update Nexus; your draft is kept.");
+  }
+  const digest = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonical));
+  return [...new Uint8Array(digest)].map(one => one.toString(16).padStart(2, '0')).join('');
+}
+
+function verifyMissionMessageReceipt(result, submission) {
+  const receipt = result?.directed_message_receipt, payload = submission.payload;
+  if (receipt?.schema_version !== 1 || receipt.accepted !== true
+      || receipt.request_id !== payload.request_id || receipt.goal_id !== submission.goalId
+      || receipt.task_id !== payload.task_id || receipt.agent_id !== payload.agent_id
+      || receipt.submission_sha256 !== submission.digest) {
+    throw new Error("Nexus could not verify that this exact message was saved. Your draft is kept; retry the same request.");
+  }
+}
+
+function missionMessageWasRejected(error, goalId, payload, digest) {
+  const receipt = error?.directedMessageRejection;
+  return receipt?.schema_version === 1 && receipt.accepted === false
+    && receipt.request_id === payload.request_id && receipt.goal_id === goalId
+    && receipt.task_id === payload.task_id && receipt.agent_id === payload.agent_id
+    && Boolean(digest) && receipt.submission_sha256 === digest;
+}
+
+async function sendMissionComposer(action) {
+  const goalId = longGoal?.goal_id;
+  const taskId = selectedMissionTaskId;
+  const box = $("missionSteer"), typed = box.value, text = typed.trim();
+  if (!goalId || !text) return showError("Write the steering instruction first.");
+  let submission;
+  if (action === "message") {
+    const lease = JSON.stringify([goalId, taskId]);
+    const key = JSON.stringify([goalId, taskId, typed]);
+    if (missionMessageRequests.has(lease)) return;
+    const held = missionMessageSubmissions.get(key);
+    if (held?.typed === typed) submission = held;
+    else {
+      const task = longGoal.tasks?.find(one => one.id === taskId);
+      if (!task?.assigned_agent_id) return showError("Select a task and write a message first.");
+      submission = {goalId, typed, action, payload: {text, task_id: taskId,
+        agent_id: task.assigned_agent_id,
+        request_id: globalThis.crypto?.randomUUID?.() || `message-${Date.now()}-${Math.random().toString(36).slice(2)}`}};
+      missionMessageSubmissions.set(key, submission);
+    }
+    missionMessageRequests.add(lease);
+    try {
+      const accepted = await missionControl(submission.action, submission.payload, submission.goalId);
+      if (!accepted?.accepted) {
+        if (accepted?.definitivelyRejected && missionMessageSubmissions.get(key) === submission) {
+          missionMessageSubmissions.delete(key);
+        }
+        return;
+      }
+      if (missionMessageSubmissions.get(key) === submission) missionMessageSubmissions.delete(key);
+      if (longGoal?.goal_id === goalId && selectedMissionTaskId === taskId && box.value === typed) box.value = "";
+    } finally { missionMessageRequests.delete(lease); }
+  } else {
+    const accepted = await missionControl(action, {text, task_id: taskId}, goalId);
+    if (accepted?.accepted && longGoal?.goal_id === goalId && selectedMissionTaskId === taskId
+        && box.value === typed) box.value = "";
+  }
+}
+
+async function missionControl(action, payload = {}, goalId = longGoal?.goal_id) {
+  if (!goalId || !longGoal || longGoal.goal_id !== goalId) return {accepted: false};
   const dispatchingActions = new Set([
     "resume", "retry", "reassign", "steer", "message", "request_review", "fork",
   ]);
@@ -17371,9 +17615,11 @@ async function missionControl(action, payload = {}) {
     showError(message);
     $("missionProviderSetupChanged").scrollIntoView({behavior: "smooth", block: "center"});
     $("missionProviderSetupReview").focus({preventScroll: true});
-    return;
+    return {accepted: false};
   }
+  let messageDigest = "";
   try {
+    messageDigest = action === "message" ? await missionMessageIntent(goalId, payload) : "";
     let forkRequestId = "";
     if (action === "fork") {
       try {
@@ -17389,14 +17635,22 @@ async function missionControl(action, payload = {}) {
       }));
     }
     const said = await request("/api/long-horizon/control", {method: "POST", body: JSON.stringify({
-      goal_id: longGoal.goal_id, action, payload,
+      goal_id: goalId, action, payload,
       ...(action === "fork" ? {request_id: forkRequestId} : {}),
     })});
+    if (!said?.goal?.goal_id || (action !== "fork" && said.goal.goal_id !== goalId)) {
+      throw new Error("Nexus could not verify acceptance for the exact selected goal. Your draft is kept.");
+    }
+    if (action === "message") verifyMissionMessageReceipt(said, {goalId, payload, digest: messageDigest});
     if (action === "fork") {
       localStorage.removeItem(LONG_GOAL_FORK_REQUEST_KEY);
       localStorage.setItem(LONG_GOAL_SELECTED_KEY, said.goal.goal_id);
     }
-    await refreshLongGoals(true);
+    // Persistence and refreshing the selected view are separate outcomes.
+    try { await refreshLongGoals(true); }
+    catch (error) { showError(`The action was saved, but refreshing failed: ${error.message || error}`); }
+    if (said.scheduling_error) showError(`The message was saved, but work could not continue: ${said.scheduling_error}`);
+    return {accepted: true, goalId, result: said};
   } catch (error) {
     // A fail-closed control (especially cancellation reconciliation) may have
     // committed a safer paused state while rejecting the requested action.
@@ -17404,6 +17658,8 @@ async function missionControl(action, payload = {}) {
     // is visible without making the user reload the app.
     try { await refreshLongGoals(true); } catch (_) { /* Preserve the original control error. */ }
     showError(error.message);
+    return {accepted: false, definitivelyRejected: action === "message"
+      && missionMessageWasRejected(error, goalId, payload, messageDigest)};
   }
 }
 
@@ -19092,11 +19348,12 @@ function renderTheBigChat() {
       compactGoalStatus: isRoutineGoalStatusTurn(one),
       completion: chatGoalCompletion(one),
       toolActivity: normalizedChatToolActivity(one),
+      reasoningSummary: normalizedReasoningSummary(one),
       progress: normalizedChatProgress(one),
       structuredStateUnavailable: Boolean(one.structured_state_unavailable),
       participantOutcome: normalizedParticipantOutcome(one),
       longHorizonCorrelation: normalizedLongHorizonCorrelation(one),
-      deliveryNotice: chatDeliveryNotice(one),
+      deliveryNotice: chatDeliveryNotice(one) || attachmentContextNotice(one.correlation?.attachment_context),
       deliveryCorrelation: one.correlation,
       originalPrompt: latestUserPrompt,
     });
@@ -19145,6 +19402,10 @@ function renderTheBigChat() {
         list.append(aChatGoalCompletionRow(one.text, one.at, one.completion, "the-big-chat-turn"));
         continue;
       }
+      if (one.reasoningSummary) {
+        list.append(aReasoningSummaryRow(one.who, one.reasoningSummary, "the-big-chat-turn"));
+        continue;
+      }
       if (one.toolActivity) {
         list.append(aChatToolActivityRow(one.who, one.toolActivity, one.at, "the-big-chat-turn"));
         continue;
@@ -19172,7 +19433,7 @@ function renderTheBigChat() {
       if (one.participantOutcome) {
         appendParticipantOutcome(what, one.participantOutcome, agent, one.originalPrompt, row);
       } else {
-        appendChatText(what, one.text);
+        appendChatText(what, one.text, one.deliveryCorrelation);
       }
       appendLongHorizonGoalLink(what, one.longHorizonCorrelation);
       if (one.structuredStateUnavailable) {
@@ -19820,7 +20081,7 @@ async function stopAgentRouteTest(agentId, route) {
 async function sendFromTheBigChat(mode = "chat") {
   const box = $("theBigChatBox");
   const typed = box.value;
-  const said = typed.trim();
+  let said = typed.trim();
   if (!theBigOne) return;
   const agentId = theBigOne;
   const agent = theSwarmAgent(agentId);
@@ -19830,7 +20091,7 @@ async function sendFromTheBigChat(mode = "chat") {
     box.focus();
     return;
   }
-  if (!said) {
+  if (!said && !(swarmChatAttachments.get(swarmChatKey(agentId)) || []).length) {
     $("theBigChatSaidBack").textContent = mode === "work"
       ? "Describe the project-file change first."
       : mode === "collaborate"
@@ -19885,7 +20146,11 @@ async function sendFromTheBigChat(mode = "chat") {
   }
   const teamMessage = await sendToActiveChatGoal(agentId, box);
   if (teamMessage.handled) return teamMessage.result;
-  if (["collaborate", "work"].includes(mode) && isLoneAgentChat(agentId)) {
+  if (!said && mode === "chat" && (swarmChatAttachments.get(recoveryKey) || []).length) {
+    said = "Please review the attached files.";
+  }
+  if (!said) { $("theBigChatSaidBack").textContent = "Type a message first."; return; }
+  if (mode === "collaborate" && isLoneAgentChat(agentId)) {
     $("theBigChatSaidBack").textContent = loneAgentActionMessage(mode);
     box.focus();
     return;
@@ -20043,7 +20308,7 @@ async function sendFromTheBigChat(mode = "chat") {
       runtimeKey, answered.said || [], conversation?.id || "",
     );
     renderWorkRecovery(agentId);
-    sayInRuntimeChat(runtimeKey, workResponseWords(answered, agent.name));
+    sayInRuntimeChat(runtimeKey, withAttachmentContextNotice(workResponseWords(answered, agent.name), answered));
     refreshSwarm(true);
   } catch (trouble) {
     if (!swarmActivityCanSettle(activity)) return;
@@ -20099,15 +20364,22 @@ function wireUpTheTray() {
   window.addEventListener("resize", applyTheBigChatLayout);
   $("theBigChatSend").addEventListener("click", () => sendFromTheBigChat("chat"));
   $("theBigChatStop").addEventListener("click", () => stopChatFor(theBigOne));
-  $("theBigChatAttach").addEventListener("click", () => $("theBigChatFiles").click());
+  $("theBigChatAttach").addEventListener("click", () => {
+    const files = $("theBigChatFiles");
+    files.attachmentOrigin = {agentId: theBigOne, chatKey: swarmChatKey(theBigOne)};
+    files.click();
+  });
   $("theBigChatPromptLibrary").addEventListener("click", () => {
     const chatKey = swarmChatKey(theBigOne);
     void openPromptLibrary($("theBigChatBox"), () => swarmChatKey(theBigOne) === chatKey);
   });
   $("theBigChatBox").addEventListener("paste", event => pasteChatAttachments(theBigOne, event));
   $("theBigChatFiles").addEventListener("change", async () => {
-    await addChatAttachments(theBigOne, $("theBigChatFiles").files || []);
-    $("theBigChatFiles").value = "";
+    const files = $("theBigChatFiles");
+    const origin = files.attachmentOrigin;
+    if (origin) await addChatAttachments(origin.agentId, files.files || [], origin.chatKey);
+    files.attachmentOrigin = null;
+    files.value = "";
   });
   $("theBigChatProject").addEventListener("change", () => (
     selectConversationProject(theBigOne, $("theBigChatProject").value)
@@ -21221,19 +21493,8 @@ function wireUpTheSwarmBoard() {
   $("missionCancel").addEventListener("click", cancelLongGoal);
   $("missionFork").addEventListener("click", () => missionControl("fork"));
   $("missionEventFilter").addEventListener("change", renderMissionEvents);
-  $("missionSteerSend").addEventListener("click", async () => {
-    const text = $("missionSteer").value.trim();
-    if (!text) return showError("Write the steering instruction first.");
-    await missionControl("steer", {text, task_id: selectedMissionTaskId});
-    $("missionSteer").value = "";
-  });
-  $("missionMessageAgent").addEventListener("click", async () => {
-    const task = longGoal?.tasks?.find((one) => one.id === selectedMissionTaskId);
-    const text = $("missionSteer").value.trim();
-    if (!task || !text) return showError("Select a task and write a message first.");
-    await missionControl("message", {text, task_id: task.id, agent_id: task.assigned_agent_id});
-    $("missionSteer").value = "";
-  });
+  $("missionSteerSend").addEventListener("click", () => sendMissionComposer("steer"));
+  $("missionMessageAgent").addEventListener("click", () => sendMissionComposer("message"));
   $("missionRequestReview").addEventListener("click", async () => {
     const task = longGoal?.tasks?.find((one) => one.id === selectedMissionTaskId);
     const reviewer = goalReviewer(longGoal, task);

@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from .. import cancellation
+from ..http_deadline import GuardedHTTPHandler, GuardedHTTPSHandler, bind_dispatch_guard
 from ..config import LoadedConfig, validate_embedding_provider_route
 from ..execution import CommandRunner
 from ..models import (
@@ -45,6 +46,8 @@ _EFFECTIVE_CONFIG_FIELDS = (
     "microsoft_organisation", "time_zone", "reasoning_effort",
     "max_output_tokens", "temperature", "prompt_cache_retention",
 )
+# Bound abandoned DNS/header workers across provider instances as well as routes.
+_HTTP_POST_SLOTS = threading.BoundedSemaphore(8)
 _dispatch_version_lock = threading.Lock()
 _dispatch_version_cache: dict[tuple[object, ...], dict[str, Any]] = {}
 
@@ -212,7 +215,9 @@ class _LazyHttpOpener:
                     # HTTPSHandler loads the operating system certificate stores.
                     # Provider identity/fingerprint checks never send a request and
                     # must not pay for, or block on, that transport-only operation.
-                    opener = urllib.request.build_opener(_RejectRedirectHandler())
+                    opener = urllib.request.build_opener(
+                        _RejectRedirectHandler(), GuardedHTTPHandler(), GuardedHTTPSHandler(),
+                    )
                     self._opener = opener
         return opener.open(*args, **kwargs)
 
@@ -454,57 +459,125 @@ class Provider(ABC):
             headers={"Content-Type": "application/json", **(headers or {})},
             method="POST",
         )
+        timeout = self._timeout(timeout_seconds)
+        deadline_at = time.monotonic() + timeout
+        stopped = threading.Event()
+        response_lock = threading.Lock()
         response_holder: dict[str, Any] = {}
-        unregister_cancel = cancellation.register(
-            lambda: _interrupt_http_response(response_holder.get("response"))
-            if response_holder.get("response") is not None else None
-        )
-        try:
-            cancellation.checkpoint()
-            with self._http_opener.open(request, timeout=self._timeout(timeout_seconds)) as response:
-                response_holder["response"] = response
-                cancellation.checkpoint()
-                response_limit = max(
+        received: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
+
+        def interrupt() -> None:
+            stopped.set()
+            # Do not close a buffered response from this thread: close can wait
+            # for its reader lock. Shutdown the socket, then let its owning
+            # worker close the response. DNS/open may not expose a socket yet;
+            # its worker retains an admission slot until it actually exits.
+            with response_lock:
+                response = response_holder.get("response")
+            stream = getattr(response, "fp", None)
+            connection = getattr(getattr(stream, "raw", None), "_sock", None)
+            if connection is not None:
+                try:
+                    connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+        def read_response() -> None:
+            response = None
+            def check_dispatch() -> None:
+                if stopped.is_set() or time.monotonic() >= deadline_at:
+                    raise TimeoutError("Provider HTTP dispatch deadline ended before send")
+            restore_dispatch_guard = bind_dispatch_guard(check_dispatch)
+            try:
+                if stopped.is_set():
+                    return
+                remaining = deadline_at - time.monotonic()
+                if remaining <= 0:
+                    return
+                error_code = None
+                try:
+                    response = self._http_opener.open(request, timeout=remaining)
+                except urllib.error.HTTPError as exc:
+                    response = exc
+                    error_code = exc.code
+                with response_lock:
+                    response_holder["response"] = response
+                if stopped.is_set():
+                    return
+                response_limit = (MAX_PROVIDER_RESPONSE_BYTES if error_code is not None else max(
                     MAX_PROVIDER_RESPONSE_BYTES,
                     int(self.config.get("execution.max_output_bytes")),
-                )
+                ))
                 raw = response.read(response_limit + 1)
+                if not stopped.is_set():
+                    received.put_nowait(("result", (raw, error_code, response_limit)))
+            except Exception as exc:
+                if not stopped.is_set():
+                    received.put_nowait(("error", exc))
+            finally:
+                try:
+                    if response is not None:
+                        response.close()
+                finally:
+                    restore_dispatch_guard()
+                    _HTTP_POST_SLOTS.release()
+
+        unregister_cancel = cancellation.register(interrupt)
+        admitted = False
+        worker_started = False
+        try:
+            while not admitted:
+                cancellation.checkpoint()
+                remaining = deadline_at - time.monotonic()
+                if remaining <= 0:
+                    raise HarnessError("Provider request timed out waiting for HTTP transport capacity")
+                admitted = _HTTP_POST_SLOTS.acquire(timeout=min(0.05, remaining))
+            cancellation.checkpoint()
+            worker = threading.Thread(target=read_response, name="harness-http-post-reader", daemon=True)
+            worker.start()
+            worker_started = True
+            while True:
+                cancellation.checkpoint()
+                remaining = deadline_at - time.monotonic()
+                if remaining <= 0:
+                    raise HarnessError(
+                        f"Provider request timed out at its {timeout:.3f}s wall-clock deadline"
+                    )
+                try:
+                    kind, value = received.get(timeout=min(0.05, remaining))
+                except queue.Empty:
+                    continue
+                if kind == "error":
+                    raise value
+                raw, error_code, response_limit = value
+                if error_code is not None:
+                    body = raw.decode("utf-8", errors="replace")
+                    if len(raw) > response_limit:
+                        body += (
+                            f" [Provider error body exceeded the disclosed "
+                            f"{response_limit:,}-byte transport limit; "
+                            "Nexus did not treat the captured prefix as complete.]"
+                        )
+                    raise HarnessError(
+                        f"Provider HTTP {error_code}: "
+                        + bounded_redacted_text(self._redactor, body, 65_536)
+                    )
                 if len(raw) > response_limit:
                     raise HarnessError(
                         f"Provider response exceeded its {response_limit:,}-byte transport limit"
                     )
-        except urllib.error.HTTPError as exc:
-            try:
-                error_raw = exc.read(MAX_PROVIDER_RESPONSE_BYTES + 1)
-                body = error_raw.decode("utf-8", errors="replace")
-                if len(error_raw) > MAX_PROVIDER_RESPONSE_BYTES:
-                    body += (
-                        f" [Provider error body exceeded the disclosed "
-                        f"{MAX_PROVIDER_RESPONSE_BYTES:,}-byte transport limit; "
-                        "Nexus did not treat the captured prefix as complete.]"
-                    )
-            finally:
-                exc.close()
+                break
+        except (urllib.error.URLError, TimeoutError, OSError,
+                ValueError, http.client.HTTPException) as exc:
             cancellation.checkpoint()
-            raise HarnessError(
-                f"Provider HTTP {exc.code}: "
-                + bounded_redacted_text(self._redactor, body, 65_536)
-            ) from exc
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            cancellation.checkpoint()
-            raise HarnessError(
-                f"Provider request failed: {self._redactor.text(str(exc))}"
-            ) from exc
-        except (ValueError, http.client.HTTPException) as exc:
-            # An address the machine cannot even take apart - a name and
-            # password written into it, a port that is not a number. Left to
-            # itself this is not the kind of failure anything above catches, so
-            # it went all the way out with whatever was in the address.
             raise HarnessError(
                 f"Provider request failed: {self._redactor.text(str(exc))}"
             ) from exc
         finally:
             unregister_cancel()
+            interrupt()
+            if admitted and not worker_started:
+                _HTTP_POST_SLOTS.release()
         cancellation.checkpoint()
         try:
             value = json.loads(raw)
@@ -532,66 +605,119 @@ class Provider(ABC):
         consumed = 0
         timeout = self._timeout(timeout_seconds)
         deadline_at = time.monotonic() + timeout
+        token = cancellation.current()
         stopped = threading.Event()
         received: queue.Queue[tuple[str, object]] = queue.Queue(maxsize=8)
         response_lock = threading.Lock()
         response_holder: dict[str, Any] = {}
+        slots = _HTTP_POST_SLOTS
+
+        def check_active() -> None:
+            if token is not None:
+                token.checkpoint()
+            if stopped.is_set() or time.monotonic() >= deadline_at:
+                raise HarnessError(
+                    f"Provider stream timed out at its {timeout:.3f}s wall-clock deadline"
+                )
 
         def cancel_stream() -> None:
             stopped.set()
             with response_lock:
                 response = response_holder.get("response")
-            if response is not None:
-                _interrupt_http_response(response)
+            # Buffered close can wait on a reader lock. Only interrupt the
+            # socket here; the admitted worker owns closing and slot release.
+            stream = getattr(response, "fp", None)
+            connection = getattr(getattr(stream, "raw", None), "_sock", None)
+            if connection is not None:
+                try:
+                    connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
 
         unregister_cancel = cancellation.register(cancel_stream)
 
         def offer(kind: str, value: object) -> None:
-            while not stopped.is_set():
+            while not stopped.is_set() and time.monotonic() < deadline_at:
+                if token is not None and token.cancelled:
+                    return
                 try:
-                    received.put((kind, value), timeout=0.05)
+                    received.put((kind, value), timeout=min(0.05, max(.001, deadline_at - time.monotonic())))
                     return
                 except queue.Full:
                     continue
 
         def read_response() -> None:
             response: Any = None
+            restore = bind_dispatch_guard(check_active)
             try:
-                response = self._http_opener.open(request, timeout=timeout)
+                check_active()
+                try:
+                    response = self._http_opener.open(request, timeout=max(.001, deadline_at - time.monotonic()))
+                except urllib.error.HTTPError as exc:
+                    response = exc
+                    with response_lock:
+                        response_holder["response"] = response
+                    check_active()
+                    raw = response.read(MAX_PROVIDER_RESPONSE_BYTES + 1)
+                    check_active()
+                    offer("http_error", (exc.code, raw))
+                    return
                 with response_lock:
                     response_holder["response"] = response
-                if stopped.is_set():
-                    _interrupt_http_response(response)
-                    return
                 read_chunk = getattr(response, "read1", response.read)
-                while not stopped.is_set():
+                while True:
+                    check_active()
                     chunk = read_chunk(65_536)
+                    check_active()
                     if not chunk:
                         offer("eof", None)
                         return
                     offer("chunk", chunk)
             except Exception as exc:
                 offer("error", exc)
+            finally:
+                try:
+                    if response is not None:
+                        response.close()
+                finally:
+                    restore()
+                    slots.release()
 
+        admitted = False
+        worker_started = False
         try:
+            while not admitted:
+                check_active()
+                admitted = slots.acquire(timeout=min(.05, max(.001, deadline_at - time.monotonic())))
+            check_active()
             reader = threading.Thread(target=read_response, name="harness-http-stream-reader", daemon=True)
             reader.start()
+            worker_started = True
             while True:
-                cancellation.checkpoint()
+                check_active()
                 remaining = deadline_at - time.monotonic()
-                if remaining <= 0:
-                    raise HarnessError(
-                        f"Provider stream timed out at its {timeout:.3f}s wall-clock deadline"
-                    )
                 try:
-                    kind, value = received.get(timeout=min(0.05, remaining))
+                    kind, value = received.get(timeout=min(0.05, max(.001, remaining)))
                 except queue.Empty:
                     continue
+                check_active()
+                if kind == "http_error":
+                    code, raw = value
+                    body = raw.decode("utf-8", errors="replace")
+                    if len(raw) > MAX_PROVIDER_RESPONSE_BYTES:
+                        body += (
+                            f" [Provider error body exceeded the disclosed "
+                            f"{MAX_PROVIDER_RESPONSE_BYTES:,}-byte transport limit; "
+                            "Nexus did not treat the captured prefix as complete.]"
+                        )
+                    raise HarnessError(
+                        f"Provider HTTP {code}: "
+                        + bounded_redacted_text(self._redactor, body, 65_536)
+                    )
                 if kind == "chunk":
-                    chunk = value
-                    if not isinstance(chunk, bytes):
+                    if not isinstance(value, bytes):
                         raise HarnessError("Provider stream reader returned a non-byte chunk")
-                    consumed += len(chunk)
+                    consumed += len(value)
                     response_limit = max(
                         MAX_PROVIDER_RESPONSE_BYTES,
                         int(self.config.get("execution.max_output_bytes")),
@@ -600,7 +726,9 @@ class Provider(ABC):
                         raise HarnessError(
                             f"Provider stream exceeded its {response_limit:,}-byte transport limit"
                         )
-                    yield from decoder.feed(chunk)
+                    for line in decoder.feed(value):
+                        check_active()
+                        yield line
                     continue
                 if kind == "error":
                     if isinstance(value, Exception):
@@ -608,36 +736,20 @@ class Provider(ABC):
                     raise HarnessError("Provider stream reader failed")
                 if kind != "eof":
                     raise HarnessError("Provider stream reader returned an unknown event")
-                yield from decoder.feed(b"", final=True)
+                for line in decoder.feed(b"", final=True):
+                    check_active()
+                    yield line
                 break
-        except urllib.error.HTTPError as exc:
-            try:
-                error_raw = exc.read(MAX_PROVIDER_RESPONSE_BYTES + 1)
-                body = error_raw.decode("utf-8", errors="replace")
-                if len(error_raw) > MAX_PROVIDER_RESPONSE_BYTES:
-                    body += (
-                        f" [Provider error body exceeded the disclosed "
-                        f"{MAX_PROVIDER_RESPONSE_BYTES:,}-byte transport limit; "
-                        "Nexus did not treat the captured prefix as complete.]"
-                    )
-            finally:
-                _interrupt_http_response(exc)
-            cancellation.checkpoint()
-            raise HarnessError(
-                f"Provider HTTP {exc.code}: "
-                + bounded_redacted_text(self._redactor, body, 65_536)
-            ) from exc
         except (urllib.error.URLError, TimeoutError, OSError, UnicodeDecodeError) as exc:
-            cancellation.checkpoint()
-            raise HarnessError(f"Provider stream failed: {exc}") from exc
+            if token is not None:
+                token.checkpoint()
+            raise HarnessError(f"Provider stream failed: {self._redactor.text(str(exc))}") from exc
         finally:
             unregister_cancel()
-            stopped.set()
-            with response_lock:
-                response = response_holder.get("response")
-            if response is not None:
-                _interrupt_http_response(response)
-            reader.join(timeout=0.25)
+            cancel_stream()
+            if admitted and not worker_started:
+                slots.release()
+
 
 
 def message_list(request: ProviderRequest) -> list[dict[str, Any]]:

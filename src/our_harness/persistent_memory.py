@@ -515,7 +515,14 @@ class PersistentMemoryHooks:
         self.vault_root = configured_path.resolve()
         self._verify_binding()
         _ensure_vault_scaffold(self.vault_root)
-        self.memory_index = VaultMemoryIndex(self.vault_root)
+        semantic = None
+        if config.get('persistent_memory.hybrid_search', False):
+            from .semantic_memory import settings as semantic_settings
+            semantic = semantic_settings({
+                'embedding_url': config.get('persistent_memory.embedding_url', 'http://127.0.0.1:11434'),
+                'embedding_model': config.get('persistent_memory.embedding_model', ''),
+            })
+        self.memory_index = VaultMemoryIndex(self.vault_root, semantic=semantic)
         try:
             from langgraph.graph import END, START, StateGraph
         except ImportError as exc:
@@ -724,6 +731,7 @@ class PersistentMemoryHooks:
             records.append(
                 {
                     "kind": "fts-match",
+                    "retrieval_sources": match.get("retrieval_sources", ["fts"]),
                     "path": str(match["path"]),
                     "line": int(match.get("line", 1)),
                     "heading": str(match.get("heading", ""))[:160],
@@ -755,7 +763,9 @@ class PersistentMemoryHooks:
             if record["kind"] == "fts-match":
                 heading = str(record.get("heading", ""))
                 suffix = f"; heading={heading}" if heading else ""
-                return f"[fts-match:{path}#L{record['line']}{suffix}]\n"
+                sources = record.get("retrieval_sources", ["fts"])
+                kind = "semantic-match" if sources == ["semantic"] else "hybrid-match" if "semantic" in sources else "fts-match"
+                return f"[{kind}:{path}#L{record['line']}{suffix}]\n"
             return f"[latest-session:{path}]\n"
 
         def retrieval_metadata() -> dict[str, Any]:
@@ -779,6 +789,7 @@ class PersistentMemoryHooks:
                 omitted.append(latest_path)
             return {
                 "budget_chars": self.max_context_chars,
+                "retrieval": dict(self.memory_index.retrieval_trace),
                 "mandatory": {
                     "total": len(START_NOTES),
                     "included": len(START_NOTES),

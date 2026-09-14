@@ -25,6 +25,7 @@ CONTRACT = {
     "freshness": "project-objective-route-and-other-participant-messages/v1",
     "conversation_reads": "other-participant-content-without-own-request-echo/v1",
     "max_identical_repeats": MAX_IDENTICAL_REPEATS,
+    "recoverable_failures": "wrong-skill-reader-and-unusable-search/v1",
 }
 PAUSE_REASON = (
     "The same context-tool request returned the same result repeatedly. "
@@ -100,6 +101,9 @@ def observe(
         raise HarnessError("Context progress requires one durable result for every distinct tool call")
     by_call = {result["call_id"]: result for result in results}
     observations = []
+    failures = []
+    corrected = set()
+    categories = {"read_local_skill": "wrong-skill-reader", "web_search": "search-no-usable-results"}
     for call in calls:
         name = str(call.get("name") or "")
         result = by_call[call["call_id"]]
@@ -110,6 +114,24 @@ def observe(
             "result": _observation(name, result.get("result"), speaker_id, normalize),
             "error": result.get("error") or "",
         })
+        category = categories.get(name)
+        envelope = result.get("result") or {}
+        alternatives = {"read_file": "wrong-skill-reader", "list_tree": "wrong-skill-reader",
+                        "fetch_url": "search-no-usable-results", "call_mcp_tool": "search-no-usable-results"}
+        if name in alternatives and isinstance(envelope, dict) and not result.get("error") \
+                and envelope.get("status") != "error":
+            corrected.add(alternatives[name])
+        if category and isinstance(envelope, dict):
+            raw = envelope.get("content", "")
+            try:
+                body = json.loads(raw) if isinstance(raw, str) else raw
+            except ValueError:
+                body = {}
+            error = result.get("error") or (body.get("error", "") if isinstance(body, dict) else "")
+            if str(error).startswith(f"[{category}]") and (result.get("error") or envelope.get("status") == "error"):
+                failures.append(category)
+            elif not result.get("error") and envelope.get("status") != "error":
+                corrected.add(category)
     observation_digest = _digest(observations)
     binding_digest = _digest({
         "context": binding, "speaker_id": speaker_id,
@@ -120,6 +142,11 @@ def observe(
     compatible = held.get("schema_version") == SCHEMA_VERSION \
         and held.get("contract_fingerprint_sha256") == fingerprint
     if compatible:
+        if not isinstance(held.get("recoverable_failures", {}), dict) or any(
+            k not in categories.values() or type(v) is not int or not 0 <= v <= MAX_IDENTICAL_REPEATS + 1
+            for k, v in held.get("recoverable_failures", {}).items()
+        ):
+            raise HarnessError("The saved context failure counts are malformed")
         if type(held.get("identical_repeats")) is not int \
                 or not 0 <= held["identical_repeats"] <= MAX_IDENTICAL_REPEATS \
                 or not str(held.get("last_step_id") or "") \
@@ -136,11 +163,21 @@ def observe(
         and held.get("observation_sha256") == observation_digest
     repeats = min(MAX_IDENTICAL_REPEATS, int(held.get("identical_repeats") or 0) + 1) if same else 0
     paused = repeats >= MAX_IDENTICAL_REPEATS
+    counts = dict(held.get("recoverable_failures", {})) if compatible and held.get("binding_sha256") == binding_digest else {}
+    for category in corrected:
+        counts.pop(category, None)
+    for category in set(failures):
+        counts[category] = min(MAX_IDENTICAL_REPEATS + 1, counts.get(category, 0) + 1)
+    failed_loop = bool(failures) and len(failures) == len(calls) and any(
+        counts[k] > MAX_IDENTICAL_REPEATS for k in failures)
+    paused = paused or failed_loop
     return {
         "schema_version": SCHEMA_VERSION, "contract_fingerprint_sha256": fingerprint,
         "binding_sha256": binding_digest, "observation_sha256": observation_digest,
         "last_step_id": step_id, "identical_repeats": repeats,
         "state": "paused" if paused else "tracking",
-        "reason": PAUSE_REASON if paused else "",
+        "reason": ("Repeated recoverable tool errors without a corrected result. Use read_file for ordinary files "
+                   "or fetch_url for known sources, then resume with the corrected action.") if failed_loop else PAUSE_REASON if paused else "",
+        "recoverable_failures": counts,
         "tool_names": [str(call.get("name") or "") for call in calls],
     }

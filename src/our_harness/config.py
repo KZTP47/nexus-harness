@@ -125,6 +125,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "vault_path": "",
         "max_context_chars": 20_000,
         "enforce_desktop_deployment": False,
+        "hybrid_search": False,
+        "embedding_url": "http://127.0.0.1:11434",
+        "embedding_model": "",
     },
     "context": {
         "max_chars": 120_000,
@@ -795,6 +798,9 @@ def _validate_capability_provenance(
             "persistent_memory.enabled",
             "persistent_memory.vault_path",
             "persistent_memory.enforce_desktop_deployment",
+            "persistent_memory.hybrid_search",
+            "persistent_memory.embedding_url",
+            "persistent_memory.embedding_model",
         )
     ) and (
         data["persistent_memory"]["enabled"]
@@ -1284,6 +1290,16 @@ def validate_config(data: dict[str, Any]) -> None:
         raise HarnessError("memory.allow_remote_embeddings must be a boolean")
 
     persistent_memory = data["persistent_memory"]
+    if not isinstance(persistent_memory['hybrid_search'], bool):
+        raise HarnessError('persistent_memory.hybrid_search must be a boolean')
+    _require_string(persistent_memory['embedding_url'], 'persistent_memory.embedding_url')
+    _require_string(persistent_memory['embedding_model'], 'persistent_memory.embedding_model')
+    if persistent_memory['hybrid_search']:
+        from .semantic_memory import settings as semantic_settings
+        try:
+            semantic_settings(persistent_memory)
+        except ValueError as exc:
+            raise HarnessError(str(exc)) from exc
     if not isinstance(persistent_memory["enabled"], bool):
         raise HarnessError("persistent_memory.enabled must be a boolean")
     _require_string(persistent_memory["vault_path"], "persistent_memory.vault_path")

@@ -865,19 +865,22 @@ class LongHorizonTests(unittest.TestCase):
         ) as verify:
             stopped = runtime.run(goal["goal_id"])
 
-        self.assertEqual(routes[:3], ["codex", "codex", "claude"])
-        self.assertGreater(len(peer_context), 1)
-        self.assertLessEqual(len(routes), 15)
+        # One repair attempt is enough to preserve useful prose for the peer.
+        # A later invalid lead reply must stop that repair episode, not restart
+        # the loop or erase the peer's already completed contribution.
+        self.assertEqual(routes, ["codex", "codex", "claude", "codex"])
+        self.assertEqual(len(peer_context), 1)
         self.assertEqual(stopped["budget"]["provider_calls"], len(routes))
         by_participant = {
             one["required_contributor_id"]: one for one in stopped["tasks"]
         }
         self.assertEqual(by_participant["lead"]["state"], "blocked")
-        self.assertGreater(by_participant["lead"]["attempts"], 1)
-        self.assertEqual(by_participant["reviewer"]["state"], "ready")
-        self.assertGreater(by_participant["reviewer"]["attempts"], 1)
+        self.assertEqual(by_participant["lead"]["attempts"], 2)
+        self.assertEqual(by_participant["reviewer"]["state"], "complete")
+        self.assertEqual(by_participant["reviewer"]["attempts"], 1)
         self.assertEqual(stopped["status"], "paused")
-        self.assertIn("no new evidence", stopped["note"])
+        self.assertIn("format repair failed", stopped["note"])
+        self.assertIn("retained completed work", stopped["note"])
         self.assertIn("not a structured Nexus action", peer_context[0])
         verify.assert_not_called()
 

@@ -114,7 +114,7 @@ class FacilitatorModeTests(unittest.TestCase):
             self.assertEqual(kwargs["workspace_context"].execution_mode, "facilitator")
             (self.project / "native.txt").write_text("native output")
             return {"text": json.dumps(replies.pop(0))}
-        with mock.patch.object(long_horizon.chat_lab, "ask_once", side_effect=ask):
+        with mock.patch("our_harness.project_operations.native_capable", return_value=True), mock.patch.object(long_horizon.chat_lab, "ask_once", side_effect=ask):
             held, result = self.runtime._execute_one(goal["goal_id"], task["id"])
         self.assertEqual(result["changes"], [], result)
         self.assertEqual({one["path"] for one in result["_nexus_direct_changes"]}, {"native.txt", "tool.txt"})
@@ -169,13 +169,13 @@ class FacilitatorModeTests(unittest.TestCase):
         self.assertEqual(finished["verification"]["missing_deliverable_files"], ["missing-output.txt"])
         self.assertNotIn("delivery_receipt", finished)
 
-    def test_same_project_queues_and_adaptive_tasks_still_serialize(self):
+    def test_same_project_conversations_start_while_each_team_schedules_its_tasks(self):
         goal = self.create(require_all_participants=False)
         tasks = self.store.claim_ready(goal["goal_id"], "serial-worker")
         self.assertEqual(len(tasks), 1)
         other = self.create(request="other-chat")
-        self.assertEqual(other["status"], "waiting_for_project")
-        self.assertFalse(self.store.claim_ready(other["goal_id"], "other-worker"))
+        self.assertEqual(other["status"], "queued")
+        self.assertTrue(self.store.claim_ready(other["goal_id"], "other-worker"))
 
     def test_native_request_binds_policy_cwd_timeout_and_once_survives_restart(self):
         goal = self.create()

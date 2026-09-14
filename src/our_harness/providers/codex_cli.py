@@ -27,6 +27,7 @@ from ..execution import (
 )
 from ..models import CommandResult, HarnessError, ProviderRequest, ProviderResponse
 from ..redaction import CredentialRedactor, bounded_redacted_text
+from ..provider_activity import PublicStream
 from .base import Provider, _strict_output_schema
 from . import native_execution
 
@@ -144,6 +145,11 @@ def _minimal_codex_environment(also: dict[str, str] | None = None) -> dict[str, 
         "PATH", "PATHEXT", "SYSTEMDRIVE", "SYSTEMROOT", "WINDIR", "COMSPEC",
         "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME",
         "CODEX_HOME", "TMP", "TEMP", "TMPDIR", "LANG", "LC_ALL",
+        # These configure the machine's network, not a provider account.
+        # Dropping them breaks otherwise valid sign-ins behind a proxy or
+        # an enterprise TLS trust chain. Never forward API-key variables.
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+        "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",
     }
     environment = {name: value for name, value in os.environ.items() if name.upper() in allowed}
     environment["PYTHONIOENCODING"] = "utf-8"
@@ -161,6 +167,7 @@ def _run_bounded(
     timeout_seconds: float,
     max_output_bytes: int,
     also_in_the_environment: dict[str, str] | None = None,
+    public_stream: PublicStream | None = None,
 ) -> CommandResult:
     if timeout_seconds <= 0:
         raise HarnessError("Codex CLI timed out because its wall-clock deadline expired")
@@ -207,8 +214,11 @@ def _run_bounded(
             raise
     unregister_cancel = cancellation.register(tree.kill)
     capture = _BoundedCapture(max(1, max_output_bytes))
+    if public_stream is not None:
+        public_stream.detach_sink()
     readers = [
-        threading.Thread(target=capture.drain, args=(process.stdout, capture.stdout), daemon=True),
+        threading.Thread(target=capture.drain, args=(process.stdout, capture.stdout,
+                         *((public_stream.feed,) if public_stream else ())), daemon=True),
         threading.Thread(target=capture.drain, args=(process.stderr, capture.stderr), daemon=True),
     ]
     for reader in readers:
@@ -234,6 +244,17 @@ def _run_bounded(
     if not settled and process.poll() is None:
         threading.Thread(target=_reap_process, args=(process,), daemon=True).start()
     stdout, stderr, truncated = capture.snapshot()
+    if public_stream is not None:
+        if timed_out or truncated:
+            # A partial final JSONL line is not an additional public event.
+            public_stream.buffer.clear()
+        try:
+            public_stream.finish()
+        except Exception:
+            # Public observations are not the response protocol. A malformed
+            # optional event must not mask timeout, exit or final-schema errors.
+            public_stream.observation_failures += 1
+        public_stream.settle_observations()
     return CommandResult(
         argv=argv,
         cwd=str(cwd),
@@ -650,6 +671,7 @@ class CodexCLIProvider(Provider):
     def __init__(self, config):  # type: ignore[no-untyped-def]
         super().__init__(config)
         self._preflight_complete = False
+        self._preflight_binding = None
 
     structured_retry_is_safe = True
 
@@ -710,6 +732,8 @@ class CodexCLIProvider(Provider):
         native_root = native_execution.workspace(request)
         timeout = self._timeout(request.timeout_seconds)
         deadline_at = time.monotonic() + timeout
+        from ..provider_wait import notify
+        notify(request.on_request_started, timeout_seconds=timeout)
         command = self._command()
         auth_mode = str(self.settings.get("auth_mode") or "")
         fallback = request.response_format is None
@@ -722,7 +746,20 @@ class CodexCLIProvider(Provider):
         output_limit = _provider_capture_limit(
             int(self.config.get("execution.max_output_bytes")), contract_schema
         )
-        if not self._preflight_complete:
+        # An updated executable, model, auth home or network setup invalidates
+        # a prior successful connection check on this provider instance.
+        try:
+            executable = Path(command[0]).stat()
+            executable_revision = (executable.st_size, executable.st_mtime_ns)
+        except OSError:
+            executable_revision = None
+        preflight_binding = hashlib.sha256(json.dumps({
+            "command": command, "model": request.model, "auth_mode": auth_mode,
+            "executable_revision": executable_revision,
+            "effort": request.reasoning_effort,
+            "environment": _minimal_codex_environment(),
+        }, sort_keys=True).encode()).hexdigest()
+        if not self._preflight_complete or self._preflight_binding != preflight_binding:
             codex_cli_preflight(
                 command,
                 auth_mode=auth_mode,
@@ -732,6 +769,7 @@ class CodexCLIProvider(Provider):
                 max_output_bytes=min(32_000, output_limit),
             )
             self._preflight_complete = True
+            self._preflight_binding = preflight_binding
         schema = _codex_output_schema(contract_schema)
         with _private_workspace("our-harness-codex-") as cwd:
             # Copy the exact admitted bytes into this turn's private transport
@@ -802,9 +840,31 @@ class CodexCLIProvider(Provider):
                 stdin_text=self._redactor.text(_prompt(request, fallback)),
                 timeout_seconds=_remaining(deadline_at),
                 max_output_bytes=output_limit,
+                **({"public_stream": PublicStream("codex", request.on_public_activity,
+                    self._redactor, contract_schema, output_limit)} if request.on_public_activity else {}),
             )
             if result.timed_out:
-                raise HarnessError("Codex CLI provider timed out at its wall-clock deadline")
+                # Keep bounded, redacted diagnostics: the old generic timeout
+                # discarded the only evidence of startup/network/tool failures.
+                detail = bounded_redacted_text(self._redactor, result.stderr.strip(), 2_000)
+                events = []
+                for line in result.stdout.splitlines():
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(event, dict):
+                        kind = str(event.get("type") or "")
+                        if kind in {"thread.started", "turn.started", "turn.completed", "turn.failed", "error", "item.started", "item.completed"}:
+                            item = event.get("item") or {}
+                            item_type = item.get("type") if isinstance(item, dict) else ""
+                            allowed_items = {"agent_message", "reasoning", "command_execution", "file_change", "mcp_tool_call", "web_search", "todo_list", "error"}
+                            events.append(kind + (":" + item_type if isinstance(item_type, str) and item_type in allowed_items else ""))
+                observed = ", ".join(events[-6:]) or "no recognized stdout events"
+                raise HarnessError("Codex CLI provider timed out at its wall-clock deadline. "
+                    + "Last transport events: " + observed + (". Diagnostic: " + detail if detail else ". No stderr diagnostic was captured.")
+                    + " The CLI started, but no completed answer was received. This does not establish a sign-in failure. "
+                    "Saved project work is retained; inspect it before resuming this unfinished contribution.")
             if result.output_truncated:
                 raise HarnessError(f"Codex CLI output exceeded its {output_limit}-byte limit")
             if result.exit_code != 0:

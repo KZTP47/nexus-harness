@@ -320,3 +320,14 @@ test("external provider submission uses real keyboard input and pointer activati
   assert.deepEqual(clicks, [[500, 400]]);
   assert.equal(activated.sendActivated, true);
 });
+
+test('context destruction never replays an evaluation that may already have sent', async () => {
+  const contents = Object.create(ExternalPageContents.prototype);
+  let sends = 0;
+  contents.pageForOperation = async () => ({evaluate: async () => {
+    sends += 1;
+    throw new Error('Execution context was destroyed');
+  }});
+  await assert.rejects(contents.executeJavaScript('send()'), /context was destroyed/);
+  assert.equal(sends, 1);
+});

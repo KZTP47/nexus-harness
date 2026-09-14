@@ -27,6 +27,58 @@ class LongHorizonToolRecoveryTests(unittest.TestCase):
     provider = fixtures.LongHorizonDialogueTests.provider
     run_replies = fixtures.LongHorizonDialogueTests.run_replies
 
+    def test_both_agent_contexts_explain_core_file_and_research_tools(self):
+        goal = self.create("complete-tool-catalog")
+        for direct in (False, True):
+            held = copy.deepcopy(goal)
+            if direct:
+                held["execution_mode"] = "facilitator"
+            context = self.runtime._agent_context(held, held["tasks"][0])
+            for name in ("read_file", "list_tree", "fetch_url"):
+                self.assertRegex(context, r'"name":\s*"' + name + '"')
+
+    def test_wait_observation_is_effect_bound_and_survives_store_restart(self):
+        goal = self.create("wait-observation")
+        store = self.runtime.store
+        task = store.claim_ready(goal["goal_id"], "portable-worker")[0]
+        store.record_dispatch(goal["goal_id"], task, "request-a")
+        effect = store.get(goal["goal_id"])["tasks"][0]["provider_effect_id"]
+        store.record_provider_wait(goal["goal_id"], task, {"started_ms": 1000, "timeout_seconds": 60}, effect)
+        self.assertEqual(store.public(store.get(goal["goal_id"]))["tasks"][0]["provider_wait"]["timeout_seconds"], 60)
+        self.runtime.close()
+        self.runtime = long_horizon.LongHorizonRuntime(self.config)
+        self.addCleanup(self.runtime.close)
+        store = self.runtime.store
+        self.assertEqual(store.get(goal["goal_id"])["tasks"][0]["provider_wait"]["effect_id"], effect)
+        store.record_provider_reply(goal["goal_id"], task, phase="initial")
+        self.assertNotIn("provider_wait", store.public(store.get(goal["goal_id"]))["tasks"][0])
+        store.record_dispatch(goal["goal_id"], task, "request-b", phase="context")
+        store.record_provider_wait(goal["goal_id"], task, {"started_ms": 2000, "timeout_seconds": 60}, effect)
+        self.assertNotIn("provider_wait", store.get(goal["goal_id"])["tasks"][0])
+        new_effect = store.get(goal["goal_id"])["tasks"][0]["provider_effect_id"]
+        store.record_provider_wait(goal["goal_id"], task, {"started_ms": 2000, "timeout_seconds": 60}, new_effect)
+        store.release_scheduler(goal["goal_id"], "portable-worker")
+        self.runtime.close()
+        self.runtime = long_horizon.LongHorizonRuntime(self.config)
+        self.addCleanup(self.runtime.close)
+        with mock.patch("our_harness.chat.ask_once") as dispatch:
+            recovered = self.runtime.store.recover_dead(goal["goal_id"])
+        dispatch.assert_not_called()
+        self.assertEqual(recovered["status"], "paused")
+        self.assertTrue(recovered["tasks"][0]["outcome_unknown"])
+        self.assertNotIn("provider_wait", self.runtime.store.public(recovered)["tasks"][0])
+
+    def test_wrong_skill_variants_stop_without_exhausting_provider_calls(self):
+        goal = self.create("wrong-skill-loop")
+        responses = [reply("work", "Inspecting the project", tool_calls=[{
+            "call_id": f"call-{n}", "name": "read_local_skill", "arguments": {"path": f"missing-{n}"}
+        }]) for n in range(5)]
+        result, seen = self.run_replies(goal, responses)
+        self.assertEqual(result["status"], "paused", result.get("note"))
+        self.assertEqual(len(seen), 5)
+        self.assertIn("Repeated recoverable tool errors", result["note"])
+        self.assertIn('"name":"read_file"', seen[0][1])
+
     def pending(self, request="pending-tools", calls=None):
         goal = self.create(request)
         store = self.runtime.store
@@ -47,6 +99,16 @@ class LongHorizonToolRecoveryTests(unittest.TestCase):
         current = self.runtime.store.recover_dead(goal["goal_id"])
         self.assertEqual(current["tasks"][0]["state"], "ready")
         self.runtime.store.control(goal["goal_id"], "resume")
+
+    def test_changed_read_tool_contract_supersedes_prior_observations(self):
+        from our_harness import harness_tools
+        with mock.patch.object(harness_tools, "CONTRACT", "older-toolbox"):
+            goal, task, step = self.pending("toolbox-upgrade")
+        fresh = long_horizon._context_binding(goal)
+        self.assertNotEqual(step["context_binding"], fresh)
+        self.runtime.store.supersede_stale_context_steps(goal["goal_id"], task, fresh)
+        saved = self.runtime.store.get(goal["goal_id"])["tasks"][0]["context_steps"][0]
+        self.assertEqual(saved["state"], "superseded")
 
     def test_real_read_error_and_reused_ids_continue_to_both_contributions(self):
         (self.project / "source.js").write_text("export const active = true;\n")
@@ -375,7 +437,11 @@ class LongHorizonToolRecoveryTests(unittest.TestCase):
         self.assertEqual(complete["status"], "complete", complete["note"])
         self.assertEqual([route for route, _context in seen], ["builder-route", "builder-route"])
         self.assertIn("settledPeerWork", seen[1][1])
-        self.assertEqual(next(one for one in complete["tasks"] if one["assigned_agent_id"] == "peer"), peer)
+        # Public delivery observation legitimately advances when the whole goal
+        # completes. The peer's durable work must remain identical.
+        final_peer = next(one for one in complete["tasks"] if one["assigned_agent_id"] == "peer")
+        self.assertEqual({k: v for k, v in final_peer.items() if k != "delivery_observation"},
+                         {k: v for k, v in peer.items() if k != "delivery_observation"})
         self.assertEqual(complete["artifacts"][:len(paused["artifacts"])], paused["artifacts"])
         self.assertEqual(sum(one.get("kind") == "file_transaction" for one in complete["artifacts"]), 1)
         self.assertEqual((self.project / "result.js").read_text(), "export const settledPeerWork = true;\n")

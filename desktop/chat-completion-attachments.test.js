@@ -139,6 +139,7 @@ test("real compact/full renderers show one Nexus completion bubble and share pic
       async function openChatGoalDetails(value) { window.openedGoal = value.goal_id; }
       ${source.split('\n').find(line => line.includes('box.addEventListener("paste", event => pasteChatAttachments'))}
       ${source.split('\n').find(line => line.includes('$("theBigChatBox").addEventListener("paste"'))}
+      ${section('  $("theBigChatAttach").addEventListener("click"', '  $("theBigChatPromptLibrary").addEventListener')}
       ${section('  $("theBigChatFiles").addEventListener("change"', '  $("theBigChatProject").addEventListener')}
       function renderFixtureFull(raw) {
         const list = $('theBigChatSaid'); const chatTurnsWhileWorking = () => raw, keptTranscriptFor = () => raw;
@@ -170,6 +171,7 @@ test("real compact/full renderers show one Nexus completion bubble and share pic
     await page.locator('#theBigChatSaid .chat-goal-completion-record').first().locator('summary').click();
     assert.match(await page.locator('#theBigChatSaid').innerText(), /Latest saved completion record/);
     await page.locator('#theBigChatSaid .chat-goal-completion-record').first().locator('summary').click();
+    await page.locator('#theBigChatAttach').click();
     await page.locator('#theBigChatFiles').setInputFiles({name:'picked.txt',mimeType:'text/plain',buffer:Buffer.from('picked file')});
     await page.waitForFunction(() => swarmChatAttachmentLoads.size === 0);
     await page.evaluate(() => {
@@ -228,6 +230,110 @@ test("real compact/full renderers show one Nexus completion bubble and share pic
       return {blue,red,redSent:!swarmChatAttachments.has('shared:red'),blueStillPresent:swarmChatAttachments.has('shared:blue')};
     });
     assert.deepEqual(ownership,{blue:['blue.txt'],red:['clipboard.png'],redSent:true,blueStillPresent:true});
+    // Exercise the actual shared goal send helper against real clipboard files,
+    // DOM chips and a durable receipt in both views.
+    await page.addScriptTag({content: `
+      const TEAM_FOLLOW_UP_CHARACTERS = 20000;
+      const swarmChatComposerDrafts = new Map(), theBigChatComposerDrafts = new Map();
+      const conversation = {id:'blue', project:'project', pair:['shared','peer']};
+      const goal = {goal_id:'goal',conversation_id:'blue',project:{id:'project'},status:'paused',pending_interrupts:[]};
+      const activeConversationFor = () => conversation, isLoneAgentChat = () => false;
+      const chatLongGoalContext = () => ({goal,problem:''});
+      const chatGoalBinding = () => ({chat_id:'blue',project_id:'project',participant_ids:['peer','shared']});
+      const beginGoalSnapshotRead = () => 1, rememberGoalSnapshotInventory = values => values;
+      const swarmChatAttachmentsAreLoading = () => swarmChatAttachmentLoads.size > 0;
+      const rememberTheBigChatComposer = () => {}, rememberSwarmChatComposer = () => {};
+      const sayInRuntimeChat = (key,text) => {window.notice=text;};
+      const refreshChatGoalAfterAction = async () => {};
+      const swarmChatIsBusy = () => false, swarmChatIsResetting = () => false;
+      const swarmChatIsHydrating = () => false, chatComposerIsPending = () => false;
+      const swarmConversationSwitching = new Set();
+      const fillChatGoalPanel = node => { if(node) node.textContent = 'Team paused · saved goal'; };
+      const fillChatComposerPermissions = () => {}, syncBigChatTabs = () => {};
+      const countWhatIsTypedInBigChat = () => {};
+      const renderSwarmChatActivity = () => {};
+      window.posts = [];
+      async function request(url, options) {
+        if (!options) return {goals:[goal]};
+        const body = JSON.parse(options.body), payload = body.payload;
+        window.posts.push(body);
+        return {goal,followup_receipt:{schema_version:1,accepted:true,
+          request_id:payload.request_id,goal_id:'goal',chat_id:'blue',project_id:'project',
+          participant_ids:['peer','shared'],submission_sha256:'a'.repeat(64),attachment_count:payload.attachments.length}};
+      }
+      ${section('const chatGoalRequests =', 'function goalAnswerAudience')}
+      ${section('async function sendToActiveChatGoal', 'async function controlChatGoal')}
+      ${section('function syncChatGoalControls', 'function chatRecipientWords')}
+    `});
+    await page.evaluate(() => {
+      $('theBigChatAttach').disabled = false;
+      syncChatGoalControls('shared');
+    });
+    assert.equal(await page.locator('#theBigChatAttach').isEnabled(), true);
+    assert.equal(await page.locator('#theBigChatSend').innerText(), 'Send to team');
+    await page.evaluate(() => { goal.status = 'cancelling'; syncChatGoalControls('shared'); });
+    assert.equal(await page.locator('#theBigChatAttach').isEnabled(), false);
+    await page.evaluate(() => { goal.status = 'paused'; $('theBigChatAttach').disabled = false; syncChatGoalControls('shared'); });
+    for (const selector of ['#theBigChatBox', '#fixtureCompact textarea']) {
+      const sent = await page.evaluate(async selector => {
+        swarmChatAttachments.clear(); renderChatAttachments('shared');
+        const box = document.querySelector(selector); box.value = 'Inspect screenshot';
+        const canvas = document.createElement('canvas'); canvas.width = 80; canvas.height = 50;
+        const paint = canvas.getContext('2d'); paint.fillStyle = '#17b7cf'; paint.fillRect(0,0,80,50);
+        paint.fillStyle = '#06212b'; paint.font = '12px sans-serif'; paint.fillText('Evidence', 12, 29);
+        const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+        const transfer = new DataTransfer(); transfer.items.add(new File([blob], 'followup.png', {type:'image/png'}));
+        box.dispatchEvent(new ClipboardEvent('paste', {clipboardData:transfer,bubbles:true,cancelable:true}));
+        while (swarmChatAttachmentLoads.size) await new Promise(resolve => setTimeout(resolve, 1));
+        const before = document.querySelectorAll('#theBigChatAttachments .chat-attachment').length;
+        window.sendFixture = () => sendToActiveChatGoal('shared', box);
+        return {before};
+      }, selector);
+      if (selector === '#theBigChatBox') {
+        await page.evaluate(() => {
+          $('theBigChatSaid').replaceChildren();
+          $('theBigChat').style.height = '760px';
+          $('theBigChat').style.maxHeight = '760px';
+          $('theBigChatTeamGoal').hidden = false;
+        });
+        await page.locator('#theBigChatAttach').scrollIntoViewIfNeeded();
+        await page.screenshot({path:path.join(output,'paused-team-attachment-before-send.png'),fullPage:false});
+      }
+      const accepted = await page.evaluate(async () => {
+        await window.sendFixture();
+        return {after:document.querySelectorAll('#theBigChatAttachments .chat-attachment').length,
+          post:window.posts.at(-1), notice:window.notice};
+      });
+      assert.equal(sent.before, 1);
+      assert.equal(accepted.after, 0);
+      assert.equal(await page.locator(selector).inputValue(), '');
+      assert.match(accepted.post.payload.attachments[0].data, /^data:image\/png;base64,iVBOR/);
+      assert.match(accepted.notice, /message is saved/);
+    }
+    // Capture picker origin before switching, then finish the actual input.
+    await page.locator('#theBigChatAttach').click();
+    await page.evaluate(() => { held.conversation = 'different'; });
+    await page.locator('#theBigChatFiles').setInputFiles({name:'origin.txt',mimeType:'text/plain',buffer:Buffer.from('origin')});
+    await page.waitForFunction(() => swarmChatAttachmentLoads.size === 0);
+    assert.deepEqual(await page.evaluate(() => ({
+      original:swarmChatAttachments.get('shared:blue')?.map(one => one.name),
+      current:swarmChatAttachments.has('shared:different'),
+    })), {original:['origin.txt'],current:false});
+    // A persisted assistant correlation must disclose omitted historical files
+    // in both renderers after JSON serialization/reload.
+    await page.evaluate(() => {
+      const turns=JSON.parse(JSON.stringify([{who:'them',text:'Saved reply',correlation:{
+        schema_version:1,attachment_context:{schema_version:1,
+          contract_fingerprint:'c0677eb7cd50f2cb1b1805643e96fd54990c4be8bcc47f439ea1d2f2b91605d4',
+          omitted_files:1,included_files:2,notice:'One earlier file was not included. Attach it again to prioritize it.'}}}]));
+      renderFixtureFull(turns);
+      putTheChatTurnsIn(document.getElementById('compactTranscript'),agent,turns,false);
+    });
+    for(const selector of ['#theBigChatSaid','#compactTranscript']) {
+      assert.equal(await page.locator(`${selector} .chat-attachment-context-notice`).count(),1);
+      assert.match(await page.locator(selector).innerText(),/One earlier file was not included/);
+    }
+    await page.screenshot({path:path.join(output,'restored-attachment-context-notice.png'),fullPage:false});
     console.log('Completion/paste evidence:', output);
   } finally { await browser.close(); }
 });

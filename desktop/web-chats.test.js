@@ -2228,3 +2228,128 @@ test("web-chat shutdown is idempotent, detaches native views, and awaits transpo
   assert.equal(manager.backgroundHosts.size, 0);
   assert.equal(manager.externalTransports.size, 0);
 });
+
+function lifecycleFixture(execute) {
+  const manager = new WebChatManager({electron: {}, owner: null,
+    readSettings: () => ({}), writeSettings: () => {}, shellPage: 'file:///fixture', shellPreload: 'none'});
+  manager.connections.set('gemini-fixture', {id: 'gemini-fixture', provider: 'gemini',
+    url: 'https://gemini.google.com/app/fixture', threads: {}});
+  let closed = 0;
+  const contents = {isLoading: () => false, isDestroyed: () => Boolean(closed),
+    getURL: () => 'https://gemini.google.com/app/fixture', getTitle: () => 'Fixture',
+    executeJavaScript: execute, close: () => {closed += 1;}};
+  const view = {webContents: contents};
+  manager.viewFor = (_id, key) => { manager.views.set(key ? `gemini-fixture\n${key}` : 'gemini-fixture', view); return view; };
+  manager.attachFiles = async () => {};
+  return {manager, contents, closed: () => closed};
+}
+
+test('hung submission observes its deadline, releases queue, and invalidates exact contents', async () => {
+  const {manager, closed} = lifecycleFixture(() => new Promise(() => {}));
+  await assert.rejects(manager.ask('gemini-fixture', 'fixture', [], '', false, Date.now() + 550),
+    error => error.deliveryState === 'unknown' && error.failureCode === 'browser_operation_failed');
+  assert.equal(manager.queues.size, 0);
+  assert.equal(manager.activeAsks.size, 0);
+  assert.equal(closed(), 1);
+});
+
+test('hung answer observation preserves accepted delivery and is cancellable', async () => {
+  let calls = 0;
+  const {manager, closed} = lifecycleFixture(async () => ++calls === 1
+    ? {ok: true, submissionState: 'acknowledged'} : new Promise(() => {}));
+  manager.answerPollMs = 1;
+  const turn = manager.ask('gemini-fixture', 'fixture');
+  const rejected = assert.rejects(turn, error => error.deliveryState === 'accepted' && error.failureCode === 'turn_cancelled');
+  while (calls < 2) await new Promise(resolve => setTimeout(resolve, 1));
+  await manager.stop('gemini-fixture');
+  await rejected;
+  assert.equal(closed(), 1);
+});
+
+test('cancelled trusted input cannot activate Send after its pending selection resolves', async () => {
+  let resolveSelection;
+  let sends = 0;
+  const {manager, contents} = lifecycleFixture(async () => ({needsTrustedInput: true}));
+  manager.connections.get('gemini-fixture').provider = 'chatgpt';
+  contents.getURL = () => 'https://chatgpt.com/c/fixture';
+  manager.connections.get('gemini-fixture').url = contents.getURL();
+  contents.executeJavaScript = async script => script.includes('setSelectionRange')
+    ? new Promise(resolve => {resolveSelection = resolve;}) : {needsTrustedInput: true};
+  contents.debugger = {isAttached: () => true, attach: () => {},
+    sendCommand: async () => {sends += 1;}};
+  const turn = manager.ask('gemini-fixture', 'fixture');
+  const rejected = assert.rejects(turn, error => error.deliveryState === 'unknown');
+  while (!resolveSelection) await new Promise(resolve => setTimeout(resolve, 1));
+  await manager.stop('gemini-fixture');
+  await rejected;
+  resolveSelection(true);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(sends, 0);
+});
+
+test('Stop rejects old queued turns while allowing fresh turns and unrelated channels', async () => {
+  const {manager} = lifecycleFixture(() => new Promise(() => {}));
+  let release;
+  const calls = [];
+  manager.askNow = async (id, prompt, files, key) => {
+    calls.push(prompt);
+    if (prompt === 'first') {
+      const active = {phase: 'submitted', cancelWaiters: new Set()};
+      manager.activeAsks.set(id, active);
+      await new Promise(resolve => {release = resolve; active.cancelWaiters.add(resolve);});
+      manager.activeAsks.delete(id);
+      throw new Error('Stopped');
+    }
+    return prompt;
+  };
+  const first = manager.ask('gemini-fixture', 'first').catch(() => {});
+  const old = assert.rejects(manager.ask('gemini-fixture', 'old'), error => error.failureCode === 'queued_turn_cancelled');
+  while (!release) await new Promise(resolve => setImmediate(resolve));
+  await manager.stop('gemini-fixture');
+  assert.equal(await manager.ask('gemini-fixture', 'fresh'), 'fresh');
+  assert.equal(await manager.ask('gemini-fixture', 'unrelated', [], 'other'), 'unrelated');
+  await Promise.all([first, old]);
+  assert.deepEqual(calls, ['first', 'fresh', 'unrelated']);
+});
+
+test('reset and removal fence only durable successful mutations', () => {
+  const {manager} = lifecycleFixture(async () => ({}));
+  const id = 'gemini-fixture';
+  manager.connections.get(id).threads = {one: {url: 'https://gemini.google.com/app/one'}, two: {url: 'https://gemini.google.com/app/two'}};
+  const a = {cancelWaiters: new Set()}, b = {cancelWaiters: new Set()};
+  manager.activeAsks.set(`${id}\none`, a); manager.activeAsks.set(`${id}\ntwo`, b);
+  manager.save = () => {throw new Error('disk full');};
+  assert.throws(() => manager.resetThread(id, 'one'), /disk full/);
+  assert.throws(() => manager.remove(id), /disk full/);
+  assert.equal(a.cancelled, undefined); assert.equal(b.cancelled, undefined);
+  assert.ok(manager.connections.get(id).threads.one);
+  manager.save = () => {};
+  assert.equal(manager.resetThread(id, 'one'), true);
+  assert.equal(a.cancelled, true); assert.equal(b.cancelled, undefined);
+  assert.equal(manager.remove(id), true); assert.equal(b.cancelled, true);
+});
+
+test('hung reply polling obeys the absolute service budget and keeps uncertainty', async () => {
+  let calls = 0;
+  const {manager, closed} = lifecycleFixture(async () => ++calls === 1
+    ? {ok: true, submissionState: 'outcome_unknown'} : new Promise(() => {}));
+  manager.answerPollMs = 1;
+  await assert.rejects(manager.ask('gemini-fixture', 'fixture', [], '', false, Date.now() + 550),
+    error => error.deliveryState === 'unknown' && error.failureCode === 'turn_match_unknown');
+  assert.equal(closed(), 1);
+  assert.equal(manager.queues.size, 0);
+});
+
+test('a hung timeout Stop is bounded and discards the old provider view', async () => {
+  const {manager, closed} = lifecycleFixture(async script => {
+    if (script.includes('const prompt =')) return {ok: true, submissionState: 'acknowledged'};
+    if (script.includes('const beforeCount =')) return {changed: false};
+    return new Promise(() => {});
+  });
+  manager.answerPollMs = 20;
+  manager.answerDeadlineMs = 1;
+  await assert.rejects(manager.ask('gemini-fixture', 'fixture'),
+    error => error.failureCode === 'reply_completion_timeout' && error.deliveryState === 'accepted');
+  assert.equal(closed(), 1);
+  assert.equal(manager.queues.size, 0);
+});

@@ -33,7 +33,7 @@ from .programmatic_workspace import (
 from .runstate import canonical_json, canonical_json_sha256
 from .safety import confined_path
 from .research_tools import RESEARCH_TOOL_DEFINITIONS, RESEARCH_TOOL_NAMES, RESEARCH_CONTRACT, ResearchTools
-from .harness_tools import TOOL_DEFINITIONS as HARNESS_TOOL_DEFINITIONS, TOOL_NAMES as HARNESS_TOOL_NAMES, CONTRACT as HARNESS_TOOL_CONTRACT, HarnessTools
+from .harness_tools import TOOL_DEFINITIONS as HARNESS_TOOL_DEFINITIONS, TOOL_NAMES as HARNESS_TOOL_NAMES, CONTRACT as HARNESS_TOOL_CONTRACT, RESOURCE_TOOLS, HarnessTools
 from .staged_coding import StagedCandidate, StagedCodingWorkspace, TextReplacement
 
 
@@ -42,6 +42,7 @@ EventEmitter = Callable[[str, str, dict[str, Any]], None]
 # Provider call IDs belong to an agent response. The engine supplies a stable
 # response scope when it can replay that response across process restarts.
 TOOL_IDENTITY_CONTRACT = "agent-tool-identity-v2:node,execution-scope,provider-call-id"
+MCP_RESULT_CONTRACT = "nexus-mcp-result:v2"
 TOOL_IDENTITY_FINGERPRINT = hashlib.sha256(TOOL_IDENTITY_CONTRACT.encode("utf-8")).hexdigest()
 
 
@@ -384,7 +385,9 @@ class AgentToolSession:
         self.run_id = run_id
         self.root = config.project_root.resolve()
         self.git_root = git_root.resolve() if git_root is not None else self.root
-        self.research_tools = ResearchTools(self.root, read_project=self._stable_regular_bytes, attachments=attachments)
+        self._mcp_resource_secret = os.urandom(32)
+        self._mcp_resource_snapshots: dict[str, dict[str, Any]] = {}
+        self.research_tools = ResearchTools(self.root, read_project=self._stable_regular_bytes, attachments=attachments, deadline=deadline)
         self.ignore_policy = IgnorePolicy(self.root, set(config.get("project.ignore", [])))
         self.max_calls = int(config.get("workflow.max_tool_calls"))
         self.per_call_bytes = int(config.get("workflow.max_tool_output_bytes"))
@@ -615,6 +618,8 @@ class AgentToolSession:
         cache_key = hashlib.sha256(
             f"{scope_prefix}{nonce}\n{capability_node}\n{volatile_call_id}\n{name}\n{canonical_arguments}".encode("utf-8")
         ).hexdigest()
+        if name == "mcp_call":
+            cache_key = canonical_json_sha256([cache_key, self.config.get("mcp.servers", [])])
         binding_key = canonical_json([node, execution_scope, call_id])
         binding_digest = hashlib.sha256(binding_key.encode("utf-8")).hexdigest()
         legacy_call_id_digest = hashlib.sha256(call_id.encode("utf-8")).hexdigest()
@@ -672,11 +677,41 @@ class AgentToolSession:
         if not call_id_collision:
             self.call_ids.setdefault(binding_key, cache_key)
         if retained is not None:
-            byte_count = int(retained["content_bytes"])
-            if self.total_bytes + byte_count > self.total_bytes_limit:
-                raise HarnessError("Retained agent tool result exceeds the remaining tool-output budget")
-            self.total_bytes += byte_count
             result = dict(retained)
+            if name in RESOURCE_TOOLS:
+                try:
+                    value = json.loads(result["content"])
+                    if not isinstance(value, dict) or result.get("truncated"):
+                        raise HarnessError("Stored MCP resource output is incomplete; make a new deliberate request")
+                    HarnessTools(self).validate_resource_result(name, arguments, value)
+                    if len(canonical_json(value).encode("utf-8")) > min(self.per_call_bytes, max(0, self.total_bytes_limit-self.total_bytes)):
+                        raise HarnessError("Stored MCP resource output exceeds the remaining output budget")
+                except (HarnessError, ValueError, TypeError) as exc:
+                    value = {"error": str(exc)}
+                    result["status"] = "error"
+                bounded, byte_count, truncated = self._bound_content(value, atomic=True)
+                result.update(content=bounded, content_bytes=byte_count, truncated=truncated)
+            else:
+                byte_count = int(retained["content_bytes"])
+                if self.total_bytes + byte_count > self.total_bytes_limit:
+                    raise HarnessError("Retained agent tool result exceeds the remaining tool-output budget")
+                self.total_bytes += byte_count
+            if name in {"mcp_call", "call_mcp_tool"}:
+                # A receipt is evidence that an external call already ran. Keep
+                # its identity even across upgrades; migrate presentation only.
+                try:
+                    held = json.loads(result.get("content", "{}"))
+                except (ValueError, TypeError):
+                    held = {}
+                if isinstance(held, dict) and isinstance(held.get("result"), dict) and held["result"].get("isError") is True:
+                    result["status"] = "error"
+                result["result_contract"] = MCP_RESULT_CONTRACT
+                previous_route = result.get("provenance", {}).get("mcp_config_sha256")
+                if not previous_route:
+                    result["route_binding"] = "legacy_receipt_unknown_configuration"
+                if previous_route and previous_route != canonical_json_sha256(self.config.get("mcp.servers", [])):
+                    result["status"] = "error"
+                    result["recovery"] = "This receipt belongs to an earlier MCP configuration. The previous call was preserved and was not sent again. Use a new call ID for a deliberate request on the current route."
             result.update({"span_id": span_id, "duplicate": True, "replayed": True})
             self.completed_cache_keys.add(cache_key)
             self.emit(
@@ -712,7 +747,7 @@ class AgentToolSession:
                     name, arguments, node=node,
                     call_id=call_id_digest if execution_scope and staged_tool else call_id,
                 )
-                status = "ok"
+                status = "error" if name in {"mcp_call", "call_mcp_tool"} and content.get("result", {}).get("isError") is True else "ok"
             except (cancellation.ChatCancelled, DeadlineExpired):
                 raise
             except HarnessError as exc:
@@ -734,7 +769,12 @@ class AgentToolSession:
             content = {"error": str(exc)}
             status = "error"
             deadline_error = exc
-        if name in ({"read_file"} | RESEARCH_TOOL_NAMES) and status == "ok" and len(canonical_json(content).encode("utf-8")) > min(
+        if name in RESOURCE_TOOLS and status == "ok":
+            try:
+                HarnessTools(self).validate_resource_result(name, arguments, content)
+            except HarnessError as exc:
+                content, status = {"error": str(exc)}, "error"
+        if name in ({"read_file", "read_local_skill"} | RESEARCH_TOOL_NAMES | RESOURCE_TOOLS) and status == "ok" and len(canonical_json(content).encode("utf-8")) > min(
             self.per_call_bytes, max(0, self.total_bytes_limit - self.total_bytes),
         ):
             # A cached page was sized for an earlier, larger allowance. Never
@@ -745,7 +785,7 @@ class AgentToolSession:
             }
             status = "error"
         mcp_classification = content.get("classification") if isinstance(content, dict) else None
-        content, byte_count, truncated = self._bound_content(content)
+        content, byte_count, truncated = self._bound_content(content, atomic=name in RESOURCE_TOOLS)
         if byte_count == 0:
             status = "error"
         provenance = {
@@ -759,6 +799,8 @@ class AgentToolSession:
             "idempotent": volatile or name != "mcp_call" or mcp_classification in {"read_only", "idempotent"},
             "untrusted_data": True,
         }
+        if name in {"mcp_call", "call_mcp_tool"}:
+            provenance.update(result_contract=MCP_RESULT_CONTRACT, mcp_config_sha256=canonical_json_sha256(self.config.get("mcp.servers", [])))
         if staged_tool:
             provenance.update({"candidate_workspace": "temporary", "durable_replay": False})
         result = {
@@ -893,14 +935,23 @@ class AgentToolSession:
             ),
         }
 
-    def _bound_content(self, value: dict[str, Any]) -> tuple[str, int, bool]:
+    def _bound_content(self, value: dict[str, Any], *, atomic: bool = False) -> tuple[str, int, bool]:
         raw = json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
         remaining = max(0, self.total_bytes_limit - self.total_bytes)
         limit = min(self.per_call_bytes, remaining)
         if limit <= 0:
+            if atomic:
+                raise HarnessError("MCP resource output budget exhausted; no complete error envelope can fit")
             return "", 0, True
         encoded = raw.encode("utf-8")
         truncated = len(encoded) > limit
+        if truncated and atomic:
+            raw = json.dumps({"error": "output_budget_exhausted"}, separators=(",", ":"))
+            if len(raw.encode()) > limit:
+                raw = '{"error":"budget"}'
+            if len(raw.encode()) > limit:
+                raise HarnessError("MCP resource output budget exhausted; no complete error envelope can fit")
+            truncated = False
         content = _truncate_utf8(raw, limit) if truncated else raw
         byte_count = len(content.encode("utf-8"))
         self.total_bytes += byte_count
@@ -1243,7 +1294,7 @@ class AgentToolSession:
         if not allowed or tool_name not in allowed:
             raise HarnessError(f"MCP tool is not explicitly allowed for agent use: {server_name}/{tool_name}")
         timeout = self.deadline.remaining_seconds("before an agent MCP call", float(self.config.get("mcp.timeout_seconds")))
-        client = MCPClient(server, timeout=max(0.001, timeout), max_response_bytes=min(self.per_call_bytes, int(self.config.get("mcp.max_response_bytes"))))
+        client = MCPClient(server, deadline=self.deadline, timeout=max(0.001, timeout), max_response_bytes=min(self.per_call_bytes, int(self.config.get("mcp.max_response_bytes"))))
         with client:
             descriptors = client.list_tools()
             descriptor = next(

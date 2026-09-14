@@ -127,11 +127,20 @@ class HarnessToolTests(unittest.TestCase):
         self.config.data["mcp"]["servers"] = [{"name": "fixture", "transport": "stdio", "command": "fixture", "args": []}]
         with patch("our_harness.harness_tools.MCPClient") as client:
             peer = client.return_value.__enter__.return_value
-            peer.request.return_value = {"resources": [{"uri": "fixture://one"}], "nextCursor": "next"}
+            peer.request.side_effect = [
+                {"resources": [{"uri": "fixture://one"}], "nextCursor": "next"},
+                {"resources": [{"uri": "fixture://two"}]},
+                {"resourceTemplates": [{"uriTemplate": "fixture://{id}"}]},
+                {"contents": [{"uri": "fixture://one", "text": "hello"}]},
+            ]
             result = self.tools.execute("list_mcp_resources", {"server": "fixture"})
-            self.assertEqual(result["result"]["nextCursor"], "next")
-            self.tools.execute("list_mcp_resource_templates", {"server": "fixture", "cursor": "next"})
-            peer.request.assert_called_with("resources/templates/list", {"cursor": "next"})
+            self.assertEqual([one["uri"] for one in result["result"]["resources"]], ["fixture://one", "fixture://two"])
+            self.assertNotIn("nextCursor", result["result"])
+            peer.request.assert_called_with("resources/list", {"cursor": "next"})
+            self.tools.execute("list_mcp_resource_templates", {"server": "fixture"})
+            peer.request.assert_called_with("resources/templates/list", {})
+            with self.assertRaisesRegex(HarnessError, "stale or foreign"):
+                self.tools.execute("list_mcp_resources", {"server": "fixture", "cursor": "next"})
             self.tools.execute("read_mcp_resource", {"server": "fixture", "uri": "fixture://one"})
             peer.request.assert_called_with("resources/read", {"uri": "fixture://one"})
         with patch("our_harness.harness_tools.fetch_public", return_value={"url": "https://html.duckduckgo.com/html/", "data": b'<a class="result__a" href="https://example.org/guide">A guide</a>'}):
@@ -188,13 +197,13 @@ for line in sys.stdin:
  if method=="initialize": result={"protocolVersion":"2025-11-25","capabilities":{"resources":{},"tools":{}},"serverInfo":{"name":"fixture","version":"1"}}
  elif method=="tools/list": result={"tools":[{"name":"inspect","annotations":{"readOnlyHint":True,"destructiveHint":False}}]}
  elif method=="tools/call": result={"content":[{"type":"text","text":"REAL_MCP_CALL "+str(request["params"]["arguments"].get("nested",{}))}]}
- elif method=="resources/list": result={"resources":[{"uri":"fixture://one","name":"One"}],"nextCursor":"second"}
+ elif method=="resources/list": result={"resources":[{"uri":"fixture://two","name":"Two"}]} if request["params"].get("cursor")=="second" else {"resources":[{"uri":"fixture://one","name":"One"}],"nextCursor":"second"}
  elif method=="resources/templates/list": result={"resourceTemplates":[{"uriTemplate":"fixture://{name}","name":"Template"}]}
  else: result={"contents":[{"uri":"fixture://one","text":"REAL_RESOURCE"}]}
  print(json.dumps({"jsonrpc":"2.0","id":request["id"],"result":result}),flush=True)
 ''', encoding="utf-8")
         self.config.data["mcp"]["servers"] = [{"name": "fixture", "command": sys.executable, "args": [str(mcp_script)], "transport": "stdio", "allowed_tools": ["inspect"]}]
-        self.assertEqual(self.tools.execute("list_mcp_resources", {"server": "fixture"})["result"]["nextCursor"], "second")
+        self.assertEqual([one["uri"] for one in self.tools.execute("list_mcp_resources", {"server": "fixture"})["result"]["resources"]], ["fixture://one", "fixture://two"])
         self.assertIn("REAL_RESOURCE", json.dumps(self.tools.execute("read_mcp_resource", {"server": "fixture", "uri": "fixture://one"})))
         self.assertTrue(self.tools.execute("mcp_status", {"server": "fixture"})["connected"])
         called = self.tools.execute("call_mcp_tool", {"server": "fixture", "tool": "inspect", "arguments_json": '{"nested":{"arbitrary_key":"preserved"}}'})

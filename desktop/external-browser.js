@@ -144,7 +144,7 @@ class ExternalPageContents extends EventEmitter {
 
   isDestroyed() { return this.closed; }
   isLoading() { return this.loading; }
-  getURL() { return this.url; }
+  getURL() { return this.turnPagePin?.page.url() || this.url; }
   getTitle() { return this.title; }
 
   async bindPage(page) {
@@ -174,9 +174,34 @@ class ExternalPageContents extends EventEmitter {
     return page;
   }
 
+  pinTurnPage() {
+    // Acquiring a turn pin must never adopt a replacement tab. Readiness has
+    // already selected the page; the caller now validates this exact page.
+    const page = this.page;
+    if (this.closed || !page || page.isClosed?.() || this.turnPagePin) {
+      throw new Error("The provider page changed before this turn could be bound. Reconnect the intended chat.");
+    }
+    const pin = {page};
+    this.turnPagePin = pin;
+    return () => {
+      if (this.turnPagePin === pin) this.turnPagePin = null;
+    };
+  }
+
+  assertPinnedPage(page) {
+    if (this.closed || page?.isClosed?.() || (this.turnPagePin
+        && (this.turnPagePin.page !== page || this.page !== page))) {
+      throw new Error("The provider page bound to this turn closed or changed. Reconnect the intended chat.");
+    }
+  }
+
   async pageForOperation({preferCurrent = false} = {}) {
     await this.ready;
     if (this.closed) throw new Error(`${this.transport.provider.label}'s browser page was closed`);
+    if (this.turnPagePin) {
+      this.assertPinnedPage(this.turnPagePin.page);
+      return this.turnPagePin.page;
+    }
     if (!preferCurrent && this.page && !this.page.isClosed()) return this.page;
     const page = await this.transport.currentProviderPage();
     if (!page) throw new Error(
@@ -208,29 +233,31 @@ class ExternalPageContents extends EventEmitter {
   }
 
   async executeJavaScript(script) {
-    let lastError = null;
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      const page = await this.pageForOperation();
-      try {
-        return await page.evaluate(String(script));
-      } catch (error) {
-        lastError = error;
-        if (!/execution context was destroyed|cannot find context|target page.*closed/i.test(
-          String(error?.message || error))) throw error;
-        if (page.isClosed?.()) this.page = null;
-        await wait(100);
-      }
-    }
-    throw lastError;
+    // Evaluation may already have activated Send when navigation destroys the
+    // context. Never replay an operation with an unknown external outcome.
+    const page = await this.pageForOperation();
+    this.assertPinnedPage(page);
+    const result = await page.evaluate(String(script));
+    this.assertPinnedPage(page);
+    return result;
   }
 
-  async pressEnter() {
+  async pressEnter(assertActive = () => {}, beforeActivation = () => {}) {
     const page = await this.pageForOperation();
+    assertActive();
+    this.assertPinnedPage(page);
+    beforeActivation();
     await page.keyboard.press("Enter");
   }
 
   async replaceTextAndSubmit(text, selectors = {}) {
     const page = await this.pageForOperation();
+    const check = () => {
+      selectors.assertActive?.();
+      this.assertPinnedPage(page);
+    };
+    check();
+    const contract = {composer: selectors.composer, send: selectors.send};
     const selected = await page.evaluate((contract) => {
       const visible = (one) => {
         if (!one) return false;
@@ -254,16 +281,18 @@ class ExternalPageContents extends EventEmitter {
       selection.removeAllRanges();
       selection.addRange(range);
       return true;
-    }, selectors);
+    }, contract);
     if (!selected) return {
       activated: false, failureCode: "composer_selection_failed",
       activationMethod: "none",
     };
+    check();
     await page.keyboard.insertText(String(text || ""));
     let previous = null;
     let target = null;
     for (let attempt = 0; attempt < 50; attempt += 1) {
       await wait(100);
+      check();
       const candidate = await page.evaluate(({selectors: contract, expected}) => {
         const visible = (one) => {
           if (!one) return false;
@@ -302,7 +331,7 @@ class ExternalPageContents extends EventEmitter {
             button.getAttribute("data-test-id"), String(button.className || ""),
           ].join("|"),
         };
-      }, {selectors, expected: String(text || "")});
+      }, {selectors: contract, expected: String(text || "")});
       if (candidate && previous
           && candidate.fingerprint === previous.fingerprint
           && Math.abs(candidate.x - previous.x) < 1
@@ -316,6 +345,8 @@ class ExternalPageContents extends EventEmitter {
       activated: false, failureCode: "submit_control_unavailable",
       activationMethod: "none",
     };
+    check();
+    selectors.beforeActivation?.();
     await page.mouse.click(target.x, target.y);
     return {activated: true, sendActivated: true, activationMethod: "trusted_pointer"};
   }

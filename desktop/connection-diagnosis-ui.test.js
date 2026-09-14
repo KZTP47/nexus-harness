@@ -44,6 +44,25 @@ function fixture() {
 }
 const plan = {repair: {state: "ready", title: "Checked route", summary: "Ready", steps: [], actions: []}};
 
+test("a timeout plan exposes deliberate live verification without sending on redraw", () => {
+  const f = fixture();
+  const requests = [];
+  f.context.runAgentRouteTest = (agent, route) => requests.push({agent, route});
+  f.context.renderAgentRepairPanel(f.context.theSwarmAgent("a"), "route-a", {repair: {
+    state: "provider-timeout", tone: "attention", title: "The last request exceeded its time limit",
+    summary: "Previous request timed out.", steps: [], actions: [
+      {id: "live-test", label: "Run live test", note: "Uses one model request", primary: true},
+      {id: "check", label: "Check again"},
+    ],
+  }});
+  assert.equal(f.context.$("swarmAgentLiveTest").hidden, false);
+  assert.equal(f.context.$("swarmAgentRepair").dataset.tone, "attention");
+  assert.match(f.context.$("swarmAgentRepairActionNote").textContent, /one model request/);
+  assert.equal(requests.length, 0);
+  f.context.$("swarmAgentLiveTest").onclick();
+  assert.deepEqual(requests, [{agent: "a", route: "route-a"}]);
+});
+
 test("diagnosis survives redraws, coalesces repeat clicks and retains success", async () => {
   const f = fixture(); const pending = f.start();
   f.redraw();

@@ -197,7 +197,8 @@ class LongHorizonDialogueTests(unittest.TestCase):
         self.assertIn("CONTEXT FRESHNESS", seen[3][1])
         builder = next(one for one in result["tasks"] if one["assigned_agent_id"] == "builder")
         self.assertEqual(builder["context_steps"][0]["state"], "superseded")
-        self.assertEqual(builder["context_steps"][0]["context_binding"]["schema_version"], 7)
+        self.assertEqual(builder["context_steps"][0]["context_binding"]["schema_version"], 9)
+        self.assertEqual(len(builder["context_steps"][0]["context_binding"]["input_contract_sha256"]), 64)
 
     def test_real_selected_verification_tool_receives_existing_artifacts_and_project_commands(self):
         self.board["projects"][0]["test_commands"] = [["fixture-runner", "checks/game.js"]]

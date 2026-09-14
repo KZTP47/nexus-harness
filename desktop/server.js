@@ -109,6 +109,7 @@ function whereTheHarnessLives(
 // has installed it properly is sent somewhere else.
 function environmentForStarting(environment = process.env, folders = []) {
   const started = { ...environment };
+  started.PYTHONDONTWRITEBYTECODE = "1";
   if (process.versions.electron) {
     started.NEXUS_EMAIL_BROWSER_NODE = process.execPath;
     started.NEXUS_EMAIL_BROWSER_WORKER = path.join(__dirname, 'email-browser-worker.js');
@@ -282,7 +283,7 @@ class HarnessServer {
       try {
         return await new Promise((resolve, reject) => {
           const child = this.spawnProcess(command, [
-            ...leadingArguments, "-m", "our_harness", "--project", projectPath,
+            ...leadingArguments, "-B", "-m", "our_harness", "--project", projectPath,
             "trust", "--yes", "--reviewed-config", options.reviewedConfig,
             "--expected-sha256", options.expectedSha256,
           ], {
@@ -313,6 +314,9 @@ class HarnessServer {
   startOnce(command, leadingArguments, projectPath, options = {}) {
     const argv = [
       ...leadingArguments,
+      // The bundled isolated Python ignores environment variables, including
+      // PYTHONDONTWRITEBYTECODE. Keep installed source read-only explicitly.
+      "-B",
       "-m", "our_harness",
       "--project", projectPath,
       "ui", "--port", "0", "--no-open-browser",

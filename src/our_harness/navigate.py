@@ -32,6 +32,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from . import cancellation
+from .mcp import MCPClient
 from .config import LoadedConfig
 from .models import HarnessError
 from .safety import confined_path
@@ -165,151 +167,159 @@ def _server_for(path: Path) -> tuple[str, tuple[str, ...]] | None:
     return None
 
 
+_LSP_WORKERS = threading.BoundedSemaphore(4)
+
+
 class _Talking:
-    """One language server, started, asked, and stopped again.
+    """One contained language server with a shared write/read deadline."""
 
-    The protocol is plain JSON with a length written above each message. It is
-    small enough to speak directly, which is better than adding something to
-    install in order to talk to something else you install.
-
-    Reading happens on its own thread, and everything it reads goes on a queue.
-    That is not tidiness: reading from a pipe blocks until something arrives,
-    and a language server that says nothing at all - still indexing, or simply
-    broken - would otherwise hold this thread for good. Waiting on a queue can
-    be given a time limit; waiting on a pipe cannot.
-    """
-
-    def __init__(self, argv: tuple[str, ...], root: Path):
-        self.root = root
+    def __init__(self, argv: tuple[str, ...], root: Path, *, deadline=None):
+        cancellation.checkpoint()
+        self.root, self.deadline = root, deadline
         self._next = 0
         self._lock = threading.Lock()
-        self._said: queue.Queue[dict[str, Any] | None] = queue.Queue()
+        self._said = queue.Queue(maxsize=16)
+        self._released = False
+        if not _LSP_WORKERS.acquire(blocking=False):
+            raise NavigateError("Language servers are still shutting down; retry after they finish")
+        self._owner = MCPClient({"command": argv[0], "args": list(argv[1:]), "cwd": str(root)}, deadline=deadline)
         try:
-            self.process = subprocess.Popen(  # noqa: S603 - the path came from this machine
-                list(argv),
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                cwd=str(root),
-                creationflags=(getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0),
-            )
-        except OSError as exc:
-            raise NavigateError(f"{argv[0]} would not start: {exc}") from exc
-        self._reading = threading.Thread(target=self._pump, daemon=True)
-        self._reading.start()
+            self._owner._start_stdio(discard_stderr=True)
+            self.process = self._owner.process
+            self._reading = threading.Thread(target=self._pump, name="nexus-lsp-reader", daemon=True)
+            self._owner.stdio_reader_thread = self._reading
+            self._reading.start()
+        except BaseException:
+            self._owner._close_without_raising()
+            _LSP_WORKERS.release()
+            self._released = True
+            raise
 
-    def _pump(self) -> None:
-        """Everything the server says, put on the queue as it arrives."""
+    def _expires(self, seconds):
+        cancellation.checkpoint()
+        remaining = self.deadline.remaining_seconds("before language server operation", seconds) if self.deadline else seconds
+        return time.monotonic() + remaining
 
+    def _offer(self, value):
+        while not self._owner._stdio_stop_event.is_set():
+            try:
+                self._said.put(value, timeout=.025)
+                return
+            except queue.Full:
+                continue
+
+    def _pump(self):
         try:
-            while True:
+            while not self._owner._stdio_stop_event.is_set():
                 one = self._one_message()
                 if one is None:
                     break
-                self._said.put(one)
+                self._offer(one)
         except (OSError, ValueError):
-            # The pipe was closed under it, which is what stopping looks like
-            # from in here.
             pass
         finally:
-            self._said.put(None)  # nothing more is coming
+            self._offer(None)
 
-    def _write(self, message: dict[str, Any]) -> None:
-        if not self.process.stdin:
-            raise NavigateError("The language server closed its input")
+    def _write(self, message, expires=None):
+        expires = self._expires(LONGEST_ASK_SECONDS) if expires is None else expires
         body = json.dumps(message).encode("utf-8")
+        if len(body) > MOST_BYTES:
+            raise NavigateError("Language server request exceeds its byte limit")
+        payload = b"Content-Length: %d\r\n\r\n" % len(body) + body
+        if self._owner.stdio_writer_thread and self._owner.stdio_writer_thread.is_alive():
+            raise NavigateError("Language server write is still shutting down")
+        completed = queue.Queue(maxsize=1)
+        def write():
+            try:
+                view = memoryview(payload)
+                while view:
+                    if self._owner._stdio_stop_event.is_set():
+                        raise OSError("Language server is closing")
+                    sent = os.write(self.process.stdin.fileno(), view)
+                    if sent <= 0:
+                        raise OSError("No write progress")
+                    view = view[sent:]
+                completed.put(None)
+            except BaseException as exc:
+                completed.put(exc)
+        writer = threading.Thread(target=write, name="nexus-lsp-writer", daemon=True)
+        self._owner.stdio_writer_thread = writer
+        writer.start()
         try:
-            self.process.stdin.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
-            self.process.stdin.flush()
-        except OSError as exc:
-            raise NavigateError(f"The language server stopped listening: {exc}") from exc
+            while True:
+                cancellation.checkpoint()
+                remaining = expires - time.monotonic()
+                if remaining <= 0:
+                    raise NavigateError("Language server write timed out")
+                try:
+                    error = completed.get(timeout=min(.025, remaining))
+                except queue.Empty:
+                    continue
+                if error:
+                    raise NavigateError(f"Language server stopped listening: {error}")
+                writer.join(timeout=min(.025, max(0, expires-time.monotonic())))
+                return
+        except BaseException:
+            self.stop()
+            raise
 
-    def _one_message(self) -> dict[str, Any] | None:
-        """One whole message, or nothing once the server has stopped talking."""
-
-        if not self.process.stdout:
-            return None
-        length = 0
+    def _one_message(self):
+        stream = self.process.stdout.buffer
+        length, headers = 0, 0
         while True:
-            line = self.process.stdout.readline()
-            if not line:
+            line = stream.readline(8193)
+            headers += len(line)
+            if not line or headers > 8192:
                 return None
             said = line.decode("utf-8", errors="replace").strip()
             if not said:
                 break
             if said.lower().startswith("content-length:"):
-                try:
-                    length = int(said.split(":", 1)[1].strip())
-                except ValueError:
-                    return None
+                length = int(said.split(":", 1)[1].strip())
         if not 0 < length <= MOST_BYTES:
             return None
-        body = self.process.stdout.read(length)
-        try:
-            held = json.loads(body.decode("utf-8", errors="replace"))
-        except json.JSONDecodeError:
-            return None
+        held = json.loads(stream.read(length).decode("utf-8"))
         return held if isinstance(held, dict) else None
 
-    def ask(self, method: str, params: dict[str, Any], seconds: float) -> Any:
-        """Ask one thing and wait for the answer to that thing."""
-
+    def ask(self, method, params, seconds):
+        until = self._expires(seconds)
         with self._lock:
             self._next += 1
             number = self._next
-        self._write({"jsonrpc": "2.0", "id": number, "method": method, "params": params})
-        until = time.monotonic() + seconds
-        while True:
-            try:
-                said = self._said.get(timeout=max(0.0, until - time.monotonic()))
-            except queue.Empty:
-                raise NavigateError(
-                    f"The language server did not answer {method} in "
-                    f"{int(seconds)} seconds, so it was stopped."
-                ) from None
-            if said is None:
-                raise NavigateError(
-                    f"The language server stopped before it answered {method}"
-                )
-            if said.get("id") != number:
-                # Something it said on its own - a diagnostic, a log line. Not
-                # what was asked for, so it is passed over.
-                continue
-            if "error" in said:
-                inside = said["error"]
-                why = inside.get("message") if isinstance(inside, dict) else inside
-                raise NavigateError(f"The language server refused {method}: {why}")
-            return said.get("result")
+        self._write({"jsonrpc": "2.0", "id": number, "method": method, "params": params}, until)
+        try:
+            while True:
+                cancellation.checkpoint()
+                remaining = until - time.monotonic()
+                if remaining <= 0:
+                    raise NavigateError(f"The language server did not answer {method} before its deadline")
+                try:
+                    said = self._said.get(timeout=min(.025, remaining))
+                except queue.Empty:
+                    continue
+                if said is None:
+                    raise NavigateError(f"The language server stopped before it answered {method}")
+                if said.get("id") != number:
+                    continue
+                if "error" in said:
+                    inside = said["error"]
+                    why = inside.get("message") if isinstance(inside, dict) else inside
+                    raise NavigateError(f"The language server refused {method}: {why}")
+                return said.get("result")
+        except BaseException:
+            self.stop()
+            raise
 
-    def tell(self, method: str, params: dict[str, Any]) -> None:
+    def tell(self, method, params):
         self._write({"jsonrpc": "2.0", "method": method, "params": params})
 
-    def stop(self) -> None:
-        try:
-            self.tell("exit", {})
-        except NavigateError:
-            pass
-        try:  # noqa: SIM105 - the two ways it can go are handled below
-            self.process.terminate()
-            self.process.wait(timeout=5)
-        except (OSError, subprocess.TimeoutExpired):
-            try:
-                self.process.kill()
-            except OSError:
-                pass
-        # The two pipes to it, closed by hand. The panel asks these questions
-        # all day; a handle left behind on each one adds up to a panel that
-        # cannot open files any more.
-        for pipe in (self.process.stdin, self.process.stdout):
-            try:
-                if pipe is not None:
-                    pipe.close()
-            except OSError:
-                pass
-        # Closing the pipe is what lets the reading thread finish. It is a
-        # daemon thread, so a stuck one would not hold the program open, but
-        # waiting a moment for it keeps a run from piling them up.
-        self._reading.join(timeout=2.0)
+    def stop(self):
+        # Do not send an exit notification into a blocked pipe. The containment
+        # owner terminates the tree before bounded joins or stream closure.
+        self._owner._close_without_raising()
+        if not self._released and self._owner.process is None:
+            _LSP_WORKERS.release()
+            self._released = True
 
 
 def _as_a_uri(path: Path) -> str:
@@ -383,7 +393,7 @@ def _places_from(result: Any, root: Path) -> list[Place]:
 
 
 def _ask_a_server(
-    config: LoadedConfig, path: str, line: int, column: int, method: str
+    config: LoadedConfig, path: str, line: int, column: int, method: str, *, deadline=None
 ) -> tuple[list[Place], str]:
     """Start a server, ask it one thing about one place, and stop it again."""
 
@@ -394,7 +404,7 @@ def _ask_a_server(
     if chosen is None:
         return [], ""
     label, argv = chosen
-    talking = _Talking(argv, config.project_root)
+    talking = _Talking(argv, config.project_root, **({"deadline": deadline} if deadline is not None else {}))
     try:
         talking.ask(
             "initialize",
@@ -934,6 +944,7 @@ def look_it_up(
     line: int = 0,
     column: int = 0,
     name: str = "",
+    deadline=None,
 ) -> Answer:
     """Where is it, what uses it, or what is it.
 
@@ -953,7 +964,7 @@ def look_it_up(
         )
     name = str(name or "").strip()
     if path:
-        places, label = _ask_a_server(config, path, int(line or 1), int(column or 1), methods[asking])
+        places, label = _ask_a_server(config, path, int(line or 1), int(column or 1), methods[asking], deadline=deadline)
         if label:
             return Answer(
                 asked=name or f"{path}:{line}",

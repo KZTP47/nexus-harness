@@ -315,7 +315,8 @@ def differing_files(document: dict[str, Any], runtime_root: Path, other_root: Pa
 def publication(document: dict[str, Any], runtime_root: Path, *, timeout_seconds: float | None = None) -> Iterator[None]:
     """Serialize publish/check sections across processes, including nested roots."""
     source, home, _folder = _layout(document, runtime_root)
-    with ProjectTransactionLock(home).held(timeout_seconds):
+    from .project_operations import publication_claim
+    with publication_claim(source, runtime_root, timeout_seconds), ProjectTransactionLock(home).held(timeout_seconds):
         transaction = FileTransaction(source, max_files=_MAX_FILES, max_bytes=_MAX_BYTES)
         with transaction.locked(timeout_seconds):
             token = _publication.set((str(home), str(source), transaction))

@@ -10,6 +10,7 @@ from __future__ import annotations
 from contextlib import closing
 from datetime import datetime, timezone
 import json
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -22,7 +23,7 @@ from .models import HarnessError
 
 INDEX_FOLDER = ".nexus-memory"
 INDEX_DATABASE = "memory-index.sqlite3"
-INDEX_SCHEMA_VERSION = 1
+INDEX_SCHEMA_VERSION = 2
 MAX_CHUNK_CHARS = 4_000
 EXCLUDED_FOLDERS = {".obsidian", INDEX_FOLDER}
 
@@ -99,10 +100,12 @@ def chunk_markdown(text: str) -> list[tuple[str, int, str]]:
 class VaultMemoryIndex:
     """Incremental FTS5 + KV index confined to one already-bound vault."""
 
-    def __init__(self, vault_root: Path):
+    def __init__(self, vault_root: Path, *, semantic: dict[str, Any] | None = None):
         self.vault_root = vault_root.resolve(strict=True)
         self.index_root = self.vault_root / INDEX_FOLDER
         self.database_path = self.index_root / INDEX_DATABASE
+        self.semantic = semantic
+        self.retrieval_trace: dict[str, Any] = {}
 
     def _validate_index_root(self) -> None:
         if self.index_root.exists() and _is_link_or_junction(self.index_root):
@@ -114,13 +117,13 @@ class VaultMemoryIndex:
         if self.database_path.exists() and _is_link_or_junction(self.database_path):
             raise HarnessError("Persistent-memory index database must not be a link or junction")
 
-    def _connect(self) -> sqlite3.Connection:
+    def _connect(self, *, timeout: float = 30.0) -> sqlite3.Connection:
         self._validate_index_root()
         try:
-            database = sqlite3.connect(self.database_path)
+            database = sqlite3.connect(self.database_path, timeout=timeout)
             database.row_factory = sqlite3.Row
             database.execute("PRAGMA foreign_keys = ON")
-            database.execute("PRAGMA busy_timeout = 30000")
+            database.execute(f"PRAGMA busy_timeout = {int(timeout * 1000)}")
             database.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS files(
@@ -150,6 +153,10 @@ class VaultMemoryIndex:
                 );
                 """
             )
+            columns = {row[1] for row in database.execute('PRAGMA table_info(files)')}
+            if 'content_sha256' not in columns:
+                database.execute("ALTER TABLE files ADD COLUMN content_sha256 TEXT NOT NULL DEFAULT ''")
+                database.commit()
             return database
         except sqlite3.Error as exc:
             raise HarnessError(f"Persistent-memory SQLite index is unavailable: {exc}") from exc
@@ -236,12 +243,13 @@ class VaultMemoryIndex:
                     seen.add(relative)
                     stat = path.stat()
                     row = database.execute(
-                        "SELECT mtime_ns, size FROM files WHERE path = ?", (relative,)
+                        "SELECT mtime_ns, size, content_sha256 FROM files WHERE path = ?", (relative,)
                     ).fetchone()
-                    if row and row["mtime_ns"] == stat.st_mtime_ns and row["size"] == stat.st_size:
+                    text = path.read_text(encoding="utf-8")
+                    content_sha256 = hashlib.sha256(text.encode('utf-8')).hexdigest()
+                    if row and row['content_sha256'] == content_sha256:
                         continue
                     self._remove_file(database, relative)
-                    text = path.read_text(encoding="utf-8")
                     for heading, line, body in chunk_markdown(text):
                         cursor = database.execute(
                             "INSERT INTO chunks(path, heading, line, body) VALUES(?, ?, ?, ?)",
@@ -252,8 +260,8 @@ class VaultMemoryIndex:
                             (cursor.lastrowid, body, heading, relative),
                         )
                     database.execute(
-                        "INSERT INTO files(path, mtime_ns, size) VALUES(?, ?, ?)",
-                        (relative, stat.st_mtime_ns, stat.st_size),
+                        "INSERT INTO files(path, mtime_ns, size, content_sha256) VALUES(?, ?, ?, ?)",
+                        (relative, stat.st_mtime_ns, stat.st_size, content_sha256),
                     )
                     changed += 1
                 indexed = {
@@ -297,6 +305,32 @@ class VaultMemoryIndex:
         return " OR ".join(f'"{token.replace(chr(34), "")}"' for token in unique)
 
     def search(self, query: str, *, limit: int = 8) -> list[dict[str, Any]]:
+        lexical = self._lexical_search(query, limit=limit)
+        self.retrieval_trace = {'mode': 'fts', 'fts_hits': len(lexical), 'vector_hits': 0, 'vector_only': False}
+        if not self.semantic or not query.strip():
+            return lexical
+        from . import semantic_memory
+        try:
+            vectors, trace = semantic_memory.search(self, self.semantic, query, limit * 2)
+        except Exception:
+            vectors, trace = [], {'state': 'unavailable', 'vector_hits': 0}
+        self.retrieval_trace.update(trace)
+        if not vectors:
+            return lexical
+        scores: dict[tuple[str, int], float] = {}
+        rows: dict[tuple[str, int], dict[str, Any]] = {}
+        sources: dict[tuple[str, int], list[str]] = {}
+        for label, candidates in (('fts', lexical), ('semantic', vectors)):
+            for rank, row in enumerate(candidates):
+                key = (row['path'], row['line'])
+                scores[key] = scores.get(key, 0) + 1 / (60 + rank + 1)
+                rows.setdefault(key, row)
+                sources.setdefault(key, []).append(label)
+        self.retrieval_trace.update(mode='hybrid', vector_only=not lexical)
+        ordered = sorted(scores, key=lambda key: (-scores[key], key))[:limit]
+        return [{**rows[key], 'score': scores[key], 'retrieval_sources': sources[key]} for key in ordered]
+
+    def _lexical_search(self, query: str, *, limit: int = 8) -> list[dict[str, Any]]:
         if limit < 1 or limit > 100:
             raise HarnessError("Persistent-memory search limit must be between 1 and 100")
         fts_query = self._fts_query(query)

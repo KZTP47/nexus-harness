@@ -296,10 +296,12 @@ class FindingAToolThatIsNotOnThePathTests(unittest.TestCase):
         ), mock.patch.object(subscription_cli, "_run_bounded", return_value=refused):
             self.assertEqual(responding_command("codex-cli"), "")
 
-    def test_a_copy_on_the_path_still_wins(self) -> None:
-        """Somebody who put one there meant that one."""
+    def test_a_copy_on_the_path_wins_without_newer_managed_builds(self) -> None:
+        """Discovery must not depend on the test machine's installed desktop."""
 
-        with mock.patch.object(
+        with mock.patch.object(subscription_cli, "_every_build_of", return_value=[]), \
+                mock.patch.object(subscription_cli, "_where_else_it_might_be", return_value=[]), \
+                mock.patch.object(
                 subscription_cli.shutil, "which", lambda one: "C:/mine/codex.exe"):
             self.assertEqual(available("codex-cli"), "C:/mine/codex.exe")
 

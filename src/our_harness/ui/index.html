@@ -637,6 +637,16 @@
             <label for="timerOnDay">On</label>
             <select id="timerOnDay"></select>
           </div>
+          <div>
+            <label for="timerWatchFiles">Run only when these files change (optional)</label>
+            <textarea id="timerWatchFiles" rows="2" placeholder="src/main.py&#10;settings.json"></textarea>
+            <small>One project-relative file per line. Leave empty to run every time.</small>
+          </div>
+          <div>
+            <label for="timerMaxLateness">Skip runs more than this many minutes late</label>
+            <input id="timerMaxLateness" type="number" min="0" max="525600" value="0">
+            <small>0 keeps the usual catch-up behavior.</small>
+          </div>
           <button id="timerAdd" class="primary" type="button">Put it on a timer</button>
         </div>
         <p id="timerHowOftenMeans" class="hint"></p>
@@ -774,8 +784,8 @@
         <label for="longGoalAccess">Agent access</label>
         <select id="longGoalAccess">
           <option value="read_only">Read only</option>
-          <option value="ask" selected>Ask before commands</option>
-          <option value="full">Full project access</option>
+          <option value="ask">Ask before commands</option>
+          <option value="full" selected>Full project access</option>
         </select>
         <p class="field-help">Controls every agent in this goal. Read only permits inspection; Ask permits edits and asks before new commands; Full permits native edits and commands. Direct work saves files immediately and reports checks separately. Private copies keep verified delivery. Native tools can affect files outside the working folder.</p>
         <label for="longGoalParticipation">How they participate</label>

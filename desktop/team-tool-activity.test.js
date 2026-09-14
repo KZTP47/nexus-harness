@@ -6,7 +6,7 @@ const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
 const {chromium} = require("playwright-core");
-const ui = path.resolve(__dirname, "../src/our_harness/ui");
+const ui = process.env.NEXUS_TEST_UI_ROOT || path.resolve(__dirname, "../src/our_harness/ui");
 const runtime = path.join(__dirname, "build-output/win-unpacked/resources/runtime");
 const manifestPath = path.join(runtime, "NEXUS_RUNTIME.json");
 const source = fs.readFileSync(path.join(ui, "app.js"), "utf8");
@@ -65,6 +65,18 @@ test("public updates and recorded tools render inline with safe expandable outpu
           result:{status:'error',content:'{"error":"read_file end_line must be at least start_line"}'}};
         document.getElementById('compact').replaceChildren(aChatToolActivityRow(tool.speaker_name,failed,tool.at,'talk-turn'));
       };
+      window.renderNative = () => {
+        const native={...payload,eventId:'native-portable-tool',origin:'provider',name:'command_execution',
+          arguments:{command:'node arbitrary-check.js'},status:'finished',result:{exit_code:0,aggregated_output:'ok'}};
+        document.getElementById('compact').replaceChildren(aChatToolActivityRow('Builder · provider tool',native,tool.at,'talk-turn'));
+      };
+      window.renderReasoning = () => {
+        const summary={who:'them',speaker_id:'builder',speaker_name:'Builder',phase:'reasoning_summary',
+          text:'I will inspect the existing API before changing it. <img src=x onerror="window.injected=true">',
+          correlation:{schema_version:1,kind:'long_horizon_provider_activity',provider_activity_id:'summary-one',event_id:'summary-one'}};
+        putTheChatTurnsIn(document.getElementById('compact'),{name:'Builder'},[summary],false);
+        document.getElementById('large').replaceChildren(aReasoningSummaryRow('Builder',normalizedReasoningSummary(summary),'the-big-chat-turn'));
+      };
       renderCompact();renderLarge();
     `});
     assert.equal(await page.evaluate(() => checkOrdinary()), null);
@@ -101,6 +113,26 @@ test("public updates and recorded tools render inline with safe expandable outpu
     const failedDetails=await page.locator('#compact .chat-tool-body').innerText();
     assert.match(failedDetails,/Input.*"end_line": 1.*"start_line": 2.*Error\s+read_file end_line must be at least start_line.*Output/s);
     assert.match(await page.locator('#compact .chat-tool-output').last().innerText(),/"status": "error"/);
+    await page.evaluate(()=>renderNative());
+    assert.match(await page.locator('#compact .chat-tool-heading').innerText(),/provider tool.*node arbitrary-check.js.*Finished/s);
+    await page.locator('#compact .chat-tool-heading').click();
+    assert.match(await page.locator('#compact .chat-tool-attribution').innerText(),/reported by the provider/);
+    assert.doesNotMatch(await page.locator('#compact .chat-tool-heading').innerText(),/Checks passed/);
+    await page.waitForFunction(() => expandedChatToolActivity.has('native-portable-tool'));
+    await page.evaluate(()=>renderNative());
+    assert.equal(await page.locator('#compact .chat-tool-body').isVisible(), true);
+    await page.screenshot({path:path.join(output,'provider-tool-timeline.png'),fullPage:true});
+    await page.evaluate(()=>renderReasoning());
+    assert.equal(await page.locator('#compact .chat-tool-body').isVisible(), false);
+    assert.equal(await page.locator('#large .chat-tool-body').isVisible(), false);
+    assert.match(await page.locator('#compact summary').innerText(), /Reasoning summary/);
+    await page.locator('#compact summary').click();
+    await page.waitForFunction(() => expandedChatToolActivity.has('summary-one'));
+    assert.match(await page.locator('#compact .chat-tool-body').innerText(), /visible only to you/);
+    assert.equal(await page.locator('#compact img').count(), 0);
+    await page.evaluate(()=>renderReasoning());
+    assert.equal(await page.locator('#large .chat-tool-body').isVisible(), true);
+    await page.screenshot({path:path.join(output,'reasoning-summary.png'),fullPage:true});
     console.log('Tool timeline screenshots:',output);
   } finally { await browser.close(); }
 });

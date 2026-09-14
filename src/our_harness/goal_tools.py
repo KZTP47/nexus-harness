@@ -29,7 +29,28 @@ FACILITATOR_DEFINITIONS[1]["description"] = (
 )
 
 
-def execute(config, root, name, arguments, *, facilitator=False):
+def execute(config, root, name, arguments, *, facilitator=False, expected_baselines=None, runtime_root=None):
+    if not isinstance(arguments, dict):
+        raise HarnessError("Nexus execution tool arguments must be an object")
+    if not facilitator:
+        return _execute(config, root, name, arguments)
+    from . import project_operations as operations, long_horizon as lh
+    try:
+        with operations.transaction(root, runtime_root, max_files=1, max_bytes=400000) as transaction:
+            if name == "write_file" and expected_baselines is not None:
+                path = str(arguments.get("path") or "").replace("\\", "/").strip()
+                if expected_baselines.get(path, "missing") != lh._path_baseline_marker(root, path):
+                    return {"status": "conflict", "executed": False,
+                            "reason": "File changed since this turn observed it: " + path + ". Return work to replan from the current files before writing."}
+            before = lh._project_baseline_manifest(root)
+            result = _execute(config, root, name, arguments, facilitator=True, transaction=transaction)
+            result["observed_changes"] = operations.observed_changes(before, lh._project_baseline_manifest(root))
+            return result
+    except operations.OperationBusy as exc:
+        return operations.unavailable(exc)
+
+
+def _execute(config, root, name, arguments, *, facilitator=False, transaction=None):
     from .changes import FileTransaction
     from .swarm_work import _validated_changes
     if not isinstance(arguments, dict):
@@ -39,7 +60,7 @@ def execute(config, root, name, arguments, *, facilitator=False):
                 or not isinstance(arguments["content"], str) or len(arguments["content"]) > 100000:
             raise HarnessError("write_file needs a bounded path and content")
         plans = _validated_changes(root, [{**arguments, "reason": "Nexus write_file tool in the agent copy"}])
-        receipt = FileTransaction(root, max_files=1, max_bytes=400000).apply(plans)
+        receipt = (transaction or FileTransaction(root, max_files=1, max_bytes=400000)).apply(plans)
         return {"applied_to": "selected_project" if facilitator else "private_agent_copy", "published": facilitator, "path": arguments["path"],
                 "transaction_id": receipt.get("transaction_id", "") if isinstance(receipt, dict) else ""}
     if name != "run_command" or set(arguments) - {"argv", "cwd", "timeout_seconds"}:

@@ -11,12 +11,183 @@ function section(start, end) {
   return source.slice(source.indexOf(start), source.indexOf(end, source.indexOf(start)));
 }
 const helpers = source.match(/^const TEAM_FOLLOW_UP_CHARACTERS = .*;$/m)[0] + "\n"
+  + section("function attachmentContextNotice", "function appendChatDeliveryNotice")
   + section("function directLongGoalCanonicalValue", "async function directLongGoalIntent")
   + section("const chatGoalRequests =", "function chatRecipientWords");
 const handlers = {
   compact: section("async function sendWhatIsTypedTo", "async function startTheChatAgainFor"),
   maximized: section("async function sendFromTheBigChat", "function wireUpTheTray"),
 };
+
+test("compact and expanded attachment pickers support the same existing file types", () => {
+  const html = fs.readFileSync(path.join(__dirname, "../src/our_harness/ui/index.html"), "utf8");
+  const expanded = html.match(/id="theBigChatFiles"[^>]*accept="([^"]+)"/)[1].split(',').sort();
+  const compact = source.match(/files\.accept = "([^"]+)"/)[1].split(',').sort();
+  assert.deepEqual(compact, expanded);
+  assert.ok(compact.includes('.zip') && compact.includes('.docx'));
+});
+
+for (const view of ["compact", "maximized"]) {
+  function withFile() {
+    const f = fixture(view);
+    f.file = {name: "evidence.png", type: "image/png", size: 3, data: "data:image/png;base64,YWJj"};
+    f.context.swarmChatAttachments.set(f.key, [f.file]);
+    return f;
+  }
+  test(`${view}: singleton Work admits only its saved participant and its goal accepts followups`, async () => {
+    const f = fixture(view);
+    f.conversation.pair = [f.agent.id]; f.goal.requested_agent_ids = [f.agent.id];
+    f.inventory = []; f.context.longGoals = [];
+    f.context.chatComposerAccessPreference = () => "read_only";
+    await f.send("work");
+    assert.equal(f.calls.filter(one => one.url === 'prepare').length, 1);
+    assert.equal(f.calls.filter(one => one.url === 'start').length, 1);
+    assert.equal(f.calls.some(one => one.url === '/api/swarm/say'), false);
+    f.inventory = [f.goal]; f.context.longGoals = [f.goal];
+    f.box.value = 'Continue this one-agent goal';
+    await f.send();
+    const steer = f.calls.find(one => one.body?.action === 'steer');
+    assert.deepEqual(steer.body.payload.participant_ids, [f.agent.id]);
+  });
+  test(`${view}: singleton ordinary chat stays direct and actual collaboration remains blocked`, async () => {
+    const f = fixture(view); f.conversation.pair = [f.agent.id];
+    f.inventory = []; f.context.longGoals = [];
+    f.context.loneAgentActionMessage = () => 'Requires a connected-agent chat';
+    await f.send('collaborate');
+    assert.equal(f.calls.some(one => one.body), false);
+    await f.send('chat');
+    assert.equal(f.calls.find(one => one.body).url, '/api/swarm/say');
+  });
+  for (const text of ['', '  Explicit question  ']) {
+    test(`${view}: ordinary file send preserves explicit text or uses neutral review text (${Boolean(text)})`, async () => {
+      const f = withFile(); f.inventory = []; f.context.longGoals = []; f.box.value = text;
+      await f.send();
+      const post = f.calls.find(one => one.url === '/api/swarm/say');
+      assert.equal(post.body.text, text.trim() || 'Please review the attached files.');
+      assert.deepEqual(post.body.attachments, [f.file]);
+    });
+  }
+  test(`${view}: empty ordinary chat sends nothing; failed file-only send retains empty original draft`, async () => {
+    const empty = fixture(view); empty.box.value = ''; await empty.send();
+    assert.equal(empty.calls.length, 0);
+    const f = withFile(); f.inventory = []; f.context.longGoals = []; f.box.value = '';
+    const prior = f.context.request;
+    f.context.request = async (url, options) => {
+      if (url === '/api/swarm/say') throw new Error('Not accepted');
+      return prior(url, options);
+    };
+    let restored;
+    f.context.restoreSwarmChatDraft = (key, value) => {restored = value;};
+    await f.send();
+    assert.equal(f.box.value, '');
+    if (view === 'compact') assert.equal(restored, '');
+    assert.equal(f.context.swarmChatAttachments.get(f.key)[0], f.file);
+  });
+  test(`${view}: screenshot-only steering uses neutral text and a verified receipt`, async () => {
+    const f = withFile(); f.box.value = "";
+    await f.send();
+    const post = f.calls.find(one => one.body);
+    assert.equal(post.body.payload.text, "Please review the attached files.");
+    assert.deepEqual(post.body.payload.attachments, [f.file]);
+    assert.ok(post.body.payload.request_id);
+    assert.equal(f.context.swarmChatAttachments.has(f.key), false);
+  });
+  test(`${view}: receipt participants are an exact set, not an ordering convention`, async () => {
+    const f = withFile(); f.receiptHook = receipt => receipt.participant_ids.reverse();
+    await f.send();
+    assert.equal(f.context.swarmChatAttachments.has(f.key), false);
+    const bad = withFile(); bad.receiptHook = receipt => receipt.participant_ids.push(receipt.participant_ids[0]);
+    await bad.send();
+    assert.equal(bad.context.swarmChatAttachments.get(bad.key)[0], bad.file);
+  });
+  for (const field of ["schema_version", "accepted", "request_id", "goal_id", "chat_id", "project_id", "participant_ids", "submission_sha256", "attachment_count"]) {
+    test(`${view}: wrong ${field} receipt preserves files and text`, async () => {
+      const f = withFile(); f.receiptHook = receipt => { receipt[field] = null; };
+      await f.send();
+      assert.equal(f.context.swarmChatAttachments.get(f.key)[0], f.file);
+      assert.equal(f.box.value, "Use keyboard controls too");
+      assert.match(f.notices.at(-1), /could not verify/);
+    });
+  }
+  test(`${view}: lost answer response replays its envelope after the question disappears`, async () => {
+    const f = withFile();
+    f.goal.pending_interrupts = [{id: "question", questions: [{id: "answer"}]}];
+    f.controlHook = async () => { throw new Error("Response lost"); };
+    await f.send();
+    const original = f.calls.find(one => one.body);
+    assert.equal(original.url, "/api/long-horizon/answer");
+    f.goal.pending_interrupts = []; f.goal.revision++;
+    f.controlHook = null;
+    await f.send();
+    const posts = f.calls.filter(one => one.body);
+    assert.equal(posts.length, 2);
+    assert.equal(posts[1].url, original.url);
+    assert.deepEqual(posts[1].body, original.body);
+    assert.equal(f.context.swarmChatAttachments.has(f.key), false);
+    f.box.value = "Use keyboard controls too";
+    f.context.swarmChatAttachments.set(f.key, [f.file]);
+    await f.send();
+    assert.notEqual(f.calls.filter(one => one.body).at(-1).body.payload.request_id, original.body.request_id);
+  });
+  for (const decision of ["single", "multiple", "risk"]) {
+    test(`${view}: attachment-only ${decision} question cannot fabricate an answer`, async () => {
+      const f = withFile(); f.box.value = "";
+      f.goal.pending_interrupts = [{id: "question", purpose: decision === "risk" ? "risk_review" : "question",
+        questions: decision === "multiple" ? [{id:"a"},{id:"b"}] : [{id:"a"}]}];
+      await f.send();
+      assert.equal(f.calls.filter(one => one.body).length, 0);
+      assert.equal(f.context.swarmChatAttachments.get(f.key)[0], f.file);
+      assert.match(f.notices.at(-1), /answer|decision cards/);
+    });
+  }
+  for (const mutation of ["new files", "replaced file", "switched chat"]) {
+    test(`${view}: accepted files preserve ${mutation} and newer text`, async () => {
+      const f = withFile(); const next = {...f.file, name: "next.png"};
+      f.controlHook = async () => {
+        f.box.value = "New text";
+        f.context.swarmChatComposerDrafts.set(f.key, {value: f.box.value});
+        f.context.theBigChatComposerDrafts.set(f.key, {value: f.box.value});
+        f.context.swarmChatAttachments.set(f.key, mutation === "new files" ? [f.file, next] : [next]);
+        if (mutation === "switched chat") {
+          f.conversation = {...f.conversation, id: "other"};
+          f.context.swarmChatAttachments.set(f.context.swarmChatKey(), [next]);
+        }
+      };
+      await f.send();
+      assert.deepEqual(Array.from(f.context.swarmChatAttachments.get(f.key)), [next]);
+      assert.equal(f.box.value, "New text");
+      if (mutation === "switched chat") assert.equal(f.context.swarmChatAttachments.get(f.context.swarmChatKey())[0], next);
+    });
+  }
+  test(`${view}: refresh failure after acceptance does not retain a resend draft`, async () => {
+    const f = withFile(); f.context.refreshLongGoals = async () => { throw new Error("Refresh unavailable"); };
+    await f.send();
+    assert.equal(f.box.value, "");
+    assert.equal(f.context.swarmChatAttachments.has(f.key), false);
+    assert.match(f.notices.at(-1), /message is saved.*Refreshing/);
+  });
+}
+
+test("timer form sends optional observations without adding an execution approval", async () => {
+  const fields = Object.fromEntries(Object.entries({timerName: 'Input check', timerAutomation: 'Build',
+    timerHowOften: 'every-hour', timerAt: '', timerOnDay: '', timerWatchFiles: ' source/a.txt\r\n\r\nsettings.json ',
+    timerMaxLateness: '15'}).map(([name, value]) => [name, {value}]));
+  let saved, existingChecks = 0;
+  const context = vm.createContext({pipelineCannotRun: false, $: name => fields[name],
+    saySoBeforeItRunsAlone: async () => { existingChecks++; return true; },
+    saveATimer: async value => { saved = JSON.parse(JSON.stringify(value)); }});
+  vm.runInContext(section('async function addATimer()', 'async function saveATimer('), context);
+  await vm.runInContext('addATimer()', context);
+  assert.deepEqual(saved.watch_files, ['source/a.txt', 'settings.json']);
+  assert.equal(saved.max_lateness_minutes, 15);
+  assert.equal(existingChecks, 1);
+  fields.timerName.value = 'Default check';
+  fields.timerWatchFiles.value = '';
+  fields.timerMaxLateness.value = '';
+  await vm.runInContext('addATimer()', context);
+  assert.deepEqual(saved.watch_files, []);
+  assert.equal(saved.max_lateness_minutes, 0);
+});
 
 test("new relay chats continue by default while explicit finite choices remain local to their chat", () => {
   const context = vm.createContext({swarmChatRoundPolicies: new Map(), DEFAULT_FINITE_TEAM_ROUNDS: 3,
@@ -96,8 +267,19 @@ test("saved team activity survives admission collapse and reports actual waiting
   assert.equal(read().stage, "Team is working");
   assert.equal(read().elapsedLabel, "Team status");
   goal.tasks = [{assigned_agent_id: "arbitrary-a", state: "running", provider_effect_state: "dispatched"}];
-  assert.equal(read().stage, "Builder is responding");
+  assert.equal(read().stage, "Waiting for Builder");
+  assert.match(read().detail, /timing unavailable/);
+  goal.tasks[0].provider_effect_id = "effect-1";
+  goal.tasks[0].provider_wait = {schema_version: 1, effect_id: "effect-1", started_ms: Date.now() - 65000, timeout_seconds: 600};
+  assert.match(read().detail, /waiting 1m 5s/);
+  assert.match(read().detail, /Request limit: 600s/);
+  goal.tasks[0].provider_wait.started_ms = Date.now() - 601000;
+  assert.match(read().detail, /deadline has elapsed/);
+  goal.tasks[0].provider_effect_id = "effect-2";
+  assert.match(read().detail, /timing unavailable/);
   goal.tasks[0].protocol_recovery = {schema_version: 1, state: "dispatched", attempts: 1, max_attempts: 2};
+  goal.tasks[0].provider_effect_id = "effect-1";
+  assert.match(read().detail, /deadline has elapsed/);
   assert.match(read().stage, /Correcting Builder/);
   assert.match(read().detail, /1 of 2/);
   goal.tasks[0].protocol_recovery.schema_version = 2;
@@ -105,7 +287,7 @@ test("saved team activity survives admission collapse and reports actual waiting
   assert.match(read().stage, /Correcting Builder/);
   assert.match(read().detail, /1 of 2/);
   goal.tasks[0].protocol_recovery.state = "corrected";
-  assert.equal(read().stage, "Builder is responding");
+  assert.equal(read().stage, "Waiting for Builder");
   goal.tasks[0].provider_effect_state = "reply_received";
   assert.equal(read().stage, "Processing the team’s reply");
   goal.status = "paused";
@@ -221,7 +403,7 @@ function fixture(view = "maximized") {
     limitsForSwarmChat() { return {input_characters: 200000}; },
     syncChatTeamReadiness() { return []; },
     confirmProjectWork() { return {allowed: true, confirmed: false}; },
-    nextSwarmChatRevision() {}, setWhatCanBePressedInSwarm() {},
+    nextSwarmChatRevision() {}, setWhatCanBePressedInSwarm() {}, renderChatAttachments() {},
     rememberSwarmChatComposer() {
       if (state.rememberLive) context.swarmChatComposerDrafts.set(context.swarmChatKey(), {value: state.box.value});
     },
@@ -267,7 +449,15 @@ function fixture(view = "maximized") {
       }
       if (["/api/long-horizon/control", "/api/long-horizon/answer"].includes(url)) {
         if (state.controlHook) await state.controlHook(body);
-        return {goal: {...state.goal, status: body.action === "pause" ? "paused" : "running"}};
+        const payload = body.action === "steer" ? body.payload : body;
+        const followup_receipt = payload.attachments ? {
+          schema_version: 1, accepted: true, request_id: payload.request_id,
+          goal_id: body.goal_id, chat_id: payload.chat_id, project_id: payload.project_id,
+          participant_ids: payload.participant_ids, submission_sha256: "a".repeat(64),
+          attachment_count: payload.attachments.length,
+        } : undefined;
+        if (state.receiptHook) state.receiptHook(followup_receipt);
+        return {goal: {...state.goal, status: body.action === "pause" ? "paused" : "running"}, followup_receipt};
       }
       if (url === "/api/swarm/say") return {said: []};
       throw new Error(`Unexpected request: ${url}`);
@@ -426,9 +616,12 @@ for (const view of ["compact", "maximized"]) {
       assert.equal(f.context.swarmChatActivity.get(f.key), newerOwner ? replacement : undefined);
       if (newerOwner) return;
       const send = {disabled: true, setAttribute() {}};
-      const stop = {textContent: "Stop", disabled: true};
+      let statusButton = null;
+      const stop = {textContent: "Stop", disabled: true, after(button) { statusButton = button; }};
+      f.context.make = (_tag, _className, textContent) => ({textContent, addEventListener() {}});
       const card = {querySelector(selector) {
-        return selector === ".swarm-chat-send" ? send : selector === ".swarm-chat-stop" ? stop : null;
+        return selector === ".swarm-chat-send" ? send : selector === ".swarm-chat-stop" ? stop
+          : selector === ".swarm-chat-status" ? statusButton : null;
       }};
       f.context.fillChatGoalPanel = () => {};
       f.context.swarmChatIsBusy = () => f.context.swarmBusy.has(f.key);
@@ -436,6 +629,8 @@ for (const view of ["compact", "maximized"]) {
       f.context.testCard = card;
       vm.runInContext("syncChatGoalControls(state.agent.id, testCard)", f.context);
       assert.equal(stop.textContent, "Resume team");
+      assert.equal(statusButton.textContent, "Check status");
+      assert.equal(statusButton.disabled, false);
       assert.equal(stop.disabled, false);
       assert.equal(send.disabled, false);
       f.context.chatComposerIsPending = () => true;
@@ -554,10 +749,10 @@ for (const view of ["compact", "maximized"]) {
     const attached = [{name: "input.txt", data: "ZXhhY3Q="}];
     files.context.swarmChatAttachments.set(files.key, attached);
     await files.send();
-    assert.equal(files.calls.filter((one) => one.body).length, 0);
-    assert.equal(files.box.value, "Use keyboard controls too");
-    assert.deepEqual(files.context.swarmChatAttachments.get(files.key), attached);
-    assert.ok(files.notices.some((text) => text.includes("files and draft have been kept")));
+    assert.equal(files.calls.filter((one) => one.body).length, 1);
+    assert.equal(files.box.value, "");
+    assert.equal(files.context.swarmChatAttachments.has(files.key), false);
+    assert.deepEqual(files.calls.find(one => one.body).body.payload.attachments, attached);
   });
 
   test(`${view}: changed project, pair, completed goal, and changed questions never become direct chat`, async () => {

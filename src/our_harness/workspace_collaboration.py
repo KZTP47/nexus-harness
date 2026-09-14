@@ -225,7 +225,10 @@ def execute(runtime, goal, task, name, args):
         # No nested agent locks: a peer's live turn never causes an A/B lock cycle.
         transaction = FileTransaction(root, max_files=int(runtime.config.get("execution.max_changed_files")),
             max_bytes=int(runtime.config.get("execution.max_changed_bytes")))
-        with transaction.locked():
+        from .project_operations import claim, require_coordinated
+        with claim(root, runtime.store.root), transaction.locked():
+            if target == "real":
+                require_coordinated(runtime, goal)
             if gw._digest(aw.inventory(root)) != args["expected_fingerprint"]:
                 raise HarnessError("The workspace changed; read it again before editing")
             artifact = transaction.apply(_validated_changes(root, args["changes"]))

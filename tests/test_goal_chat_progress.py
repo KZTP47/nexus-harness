@@ -75,6 +75,37 @@ def runner_fixture():
 
 
 class GoalChatProgressTests(unittest.TestCase):
+    def test_command_receipts_report_failure_without_interpreting_file_data(self):
+        for result, expected in [({"exit_code": 0}, "finished"),
+                                 ({"exit_code": 7}, "failed"),
+                                 ({"exit_code": 0, "timed_out": True}, "failed")]:
+            with self.subTest(result=result):
+                envelope = {"execution_contract": "nexus-goal-effect-tools/v1", "result": result}
+                self.assertEqual(goal_chat_progress.tool_outcome("run_command", envelope)[0], expected)
+                self.assertEqual(goal_chat_progress.tool_outcome("read_file", envelope)[0], "finished")
+                unknown = {**envelope, "execution_contract": "unrecognized"}
+                self.assertEqual(goal_chat_progress.tool_outcome("run_command", unknown)[0], "finished")
+                event = {"type": "context_tool_result", "payload": {"name": "run_command", "result": envelope}}
+                self.assertEqual(goal_chat_progress.milestone(event, "Builder")[1], expected)
+
+    def test_command_failure_projects_and_survives_restart(self):
+        fixture = projection_fixture.GoalChatProjectionTests(methodName="runTest")
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        step = fixture.tool_step(result=True)
+        step["calls"][0].update({"name": "run_command", "arguments": {"argv": ["fixture-check"]}})
+        step["results"][0]["result"] = {
+            "execution_contract": "nexus-goal-effect-tools/v1", "result": {"exit_code": 12},
+        }
+        fixture.goal["tasks"] = [{"id": "task-a", "context_steps": [step]}]
+        fixture.project(fixture.page([]))
+        activity = json.loads(fixture.tool_rows()[0].text)
+        self.assertEqual(activity["status"], "failed")
+        self.assertIn("code 12", activity["summary"])
+        reopened = LoadedConfig(copy.deepcopy(fixture.config.data), fixture.root, [], {})
+        fixture.project(fixture.page([]), config=reopened)
+        self.assertEqual(json.loads(fixture.tool_rows(reopened)[0].text), activity)
+
     def test_running_scheduler_publishes_intermediate_steps_before_final_reply(self):
         stages = runner_fixture()
         first = [one for one in stages[0] if one["phase"] == "nexus_progress"]

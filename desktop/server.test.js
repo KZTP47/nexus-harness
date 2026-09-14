@@ -87,9 +87,10 @@ test("the project folder is passed to the harness", async () => {
   await started;
   assert.strictEqual(seen.command, "python");
   assert.deepStrictEqual(seen.argv, [
-    "-m", "our_harness", "--project", "demo project", "ui", "--port", "0", "--no-open-browser",
+    "-B", "-m", "our_harness", "--project", "demo project", "ui", "--port", "0", "--no-open-browser",
   ]);
   assert.strictEqual(seen.options.cwd, "demo project");
+  assert.strictEqual(seen.options.env.PYTHONDONTWRITEBYTECODE, "1");
 });
 
 test("an address that is not on this machine is refused", async () => {
@@ -563,6 +564,63 @@ test("what somebody already put on the path is kept, and comes second", () => {
   const ours = path.join(os.tmpdir(), "ours");
   const said = environmentForStarting({ PYTHONPATH: mine }, [ours]);
   assert.strictEqual(said.PYTHONPATH, [ours, mine].join(path.delimiter));
+});
+
+test("bytecode prevention copies the environment even without source folders", () => {
+  const original = { PATH: "commands", PYTHONDONTWRITEBYTECODE: "0" };
+  assert.deepStrictEqual(environmentForStarting(original), {
+    PATH: "commands", PYTHONDONTWRITEBYTECODE: "1",
+  });
+  assert.strictEqual(original.PYTHONDONTWRITEBYTECODE, "0");
+});
+
+test("desktop launch flags prevent source writes under isolated Python", async () => {
+  const candidate = pythonCandidates().find(([command, leadingArguments]) => {
+    const result = childProcess.spawnSync(command, [...leadingArguments, "-I", "-B", "-c", "import sys"], {
+      windowsHide: true, timeout: 10000,
+    });
+    return result.status === 0;
+  });
+  assert.ok(candidate, "a Python interpreter is required for the launch regression");
+  const [command, leadingArguments] = candidate;
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), "nexus-bytecode-"));
+  try {
+    fs.writeFileSync(path.join(folder, "launch_probe.py"), "value = 37\n");
+    const launches = [];
+    const server = new HarnessServer({
+      candidates: [[command, leadingArguments]],
+      spawn: (executable, argv, options) => {
+        launches.push({ executable, argv, options });
+        return fakeChild((child) => {
+          if (argv.includes("trust")) child.emit("exit", 0);
+          else child.stdout.emit("data", 'harness-ui-ready {"url":"http://127.0.0.1:5000/","port":5000}\n');
+        });
+      },
+    });
+    await server.start(folder);
+    await server.trustProject(folder, {
+      reviewedConfig: path.join(folder, "reviewed.json"), expectedSha256: "a".repeat(64),
+    });
+    assert.strictEqual(launches.length, 2);
+    for (const launch of launches) {
+      const interpreterFlags = launch.argv.slice(0, launch.argv.indexOf("-m"));
+      const result = childProcess.spawnSync(launch.executable, [...interpreterFlags, "-I", "-c", [
+        "import sys",
+        "sys.path.insert(0, sys.argv[1])",
+        "import launch_probe",
+        "assert launch_probe.value == 37",
+        "assert sys.flags.isolated and sys.flags.ignore_environment",
+        "assert sys.dont_write_bytecode",
+      ].join("; "), folder], {
+        env: { ...launch.options.env, PYTHONDONTWRITEBYTECODE: "0" },
+        encoding: "utf8", windowsHide: true, timeout: 10000,
+      });
+      assert.strictEqual(result.status, 0, result.stderr || String(result.error || ""));
+      assert.deepStrictEqual(fs.readdirSync(folder), ["launch_probe.py"]);
+    }
+  } finally {
+    fs.rmSync(folder, { recursive: true, force: true });
+  }
 });
 
 test("the project's own src is looked at too, after the app's", () => {

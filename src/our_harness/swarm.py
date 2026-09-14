@@ -2160,6 +2160,15 @@ class Running:
             }
         with self._lock:
             doing = self._doing
+        try:
+            active = {
+                note.message_id for note in (doing.notes if doing is not None else [])
+                if any(turn.state == 'asking' and turn.agent == note.shown_to and turn.project == note.project
+                       for turn in doing.turns)
+            }
+            delivery['observations'] = mailbox.delivery_details(where_the_mailbox_lives(), active_message_ids=active)
+        except (OSError, HarnessError):
+            delivery['observations'] = {}
         if doing is not None:
             result = {
                 "note": doing.note,

@@ -235,6 +235,14 @@ class StreamTests(unittest.TestCase):
                 elapsed = time.monotonic() - started
                 self.assertGreaterEqual(elapsed, 0.20)
                 self.assertLess(elapsed, 0.80)
+                # The caller interrupts the socket without joining a possibly
+                # slow close. The worker must still finish bounded cleanup.
+                cleanup_deadline = time.monotonic() + 1
+                while time.monotonic() < cleanup_deadline and any(
+                    thread.name == "harness-http-stream-reader" and thread.is_alive()
+                    for thread in threading.enumerate()
+                ):
+                    time.sleep(.01)
                 self.assertFalse(
                     any(thread.name == "harness-http-stream-reader" and thread.is_alive() for thread in threading.enumerate())
                 )
@@ -451,6 +459,9 @@ class OpenAIProviderTests(unittest.TestCase):
                     return self
 
                 def __exit__(self, *_args):
+                    return None
+
+                def close(self):
                     return None
 
                 def read(self, _limit):

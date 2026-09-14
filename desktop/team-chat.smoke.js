@@ -122,6 +122,18 @@ coordination = Path(sys.argv[1])
 route = sys.argv[2]
 payload = json.loads(sys.stdin.read())
 context = str(payload.get('dynamic_context') or '')
+if context.startswith('FORMAT CORRECTION ONLY'):
+    # Correction turns intentionally omit the full project prompt. This
+    # scripted transport knows its fixture output independently of that prompt;
+    # exercise the real correction admission without requiring a work replay.
+    templates = json.loads((coordination / 'templates.json').read_text(encoding='utf-8'))
+    action = {'action':'work',
+              'summary':'TEAM-A-BASE: Teammate B, I implemented the arena mechanics. Please build the playable page and score API, then I will check your work.',
+              'evidence':[], 'risk':'low', 'changes':[{'path':'arena.js','content':templates['engine'],
+              'delete':False,'reason':'fulfil the saved team objective'}],
+              'needs_files':[],'tool_calls':[],'tasks':[],'handoff_agent_id':'','questions':[], 'criteria_evidence':[]}
+    print(json.dumps({'text':json.dumps(action),'finish_reason':'stop'}))
+    sys.exit(0)
 if context.startswith('INDEPENDENT WHOLE-GOAL CLOSEOUT JUDGE'):
     packet, _ = json.JSONDecoder().raw_decode(context[context.index('{'):])
     assert packet['verification']['status'] == 'passed', packet['verification']

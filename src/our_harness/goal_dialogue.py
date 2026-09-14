@@ -12,10 +12,35 @@ import hashlib
 import hmac
 import json
 import sqlite3
+import re
 from typing import Any
 
 from .models import ContextRequestError, HarnessError
 from .runtime_integrity import mac
+
+
+def public_attachments(supplied: object) -> list[dict[str, Any]]:
+    """Project display-only file metadata; never expose paths, IDs or bytes."""
+    if not isinstance(supplied, list):
+        return []
+    result = []
+    for raw in supplied[:6]:
+        if not isinstance(raw, dict):
+            continue
+        name = str(raw.get("name") or "attachment").replace("\\", "/").rsplit("/", 1)[-1][:180]
+        mime = str(raw.get("type") or "application/octet-stream")[:160]
+        size = raw.get("size")
+        value = {"name": name or "attachment", "type": mime,
+                 "size": size if type(size) is int and size >= 0 else 0,
+                 "image": raw.get("image", mime.startswith("image/")) is True}
+        digest = raw.get("sha256")
+        if isinstance(digest, str) and re.fullmatch(r"[a-f0-9]{64}", digest):
+            value["sha256"] = digest
+        for key in ("width", "height"):
+            if type(raw.get(key)) is int and raw[key] > 0:
+                value[key] = raw[key]
+        result.append(value)
+    return result
 
 
 SCHEMA_VERSION = 1
@@ -25,6 +50,23 @@ CONTRACT = {
     "projection": "newest-complete-messages-with-scoped-range-retrieval-v1",
     "migration": "authenticated-retained-events-and-exact-snapshot-v1",
 }
+CONVERSATION_CONTRACT = "participant-conversation-without-operator-observations/v1"
+
+
+def conversation_projection(archive: dict[str, Any]) -> dict[str, Any]:
+    value = archive.get("conversation_projection")
+    if value is None:
+        # Legacy snapshots are upgraded transactionally before the next write.
+        return {"count": int(archive.get("count") or 0),
+                "latest_sequence": int(archive.get("latest_sequence") or 0)}
+    if value.get("schema_version") != 1 or value.get("contract_fingerprint") != _digest(CONVERSATION_CONTRACT):
+        raise HarnessError("Unsupported participant conversation projection")
+    return value
+
+
+def _empty_conversation() -> dict[str, Any]:
+    return {"schema_version": 1, "contract_fingerprint": _digest(CONVERSATION_CONTRACT),
+            "count": 0, "latest_sequence": 0}
 
 
 def _json(value: object) -> str:
@@ -47,6 +89,7 @@ def empty(document: dict[str, Any]) -> dict[str, Any]:
         "contract_fingerprint_sha256": _digest(CONTRACT),
         "binding_sha256": _binding(document),
         "count": 0, "latest_sequence": 0, "head_sequence": 0, "head_sha256": "",
+        "conversation_projection": _empty_conversation(),
         "coverage": {"status": "complete", "reason": "", "unavailable_before_sequence": 0,
                      "unavailable_ranges": []},
     }
@@ -65,6 +108,9 @@ def ensure_schema(db: sqlite3.Connection) -> None:
           UNIQUE(goal_id,message_id),
           FOREIGN KEY(goal_id) REFERENCES long_goals(goal_id) ON DELETE CASCADE
         );
+        CREATE INDEX IF NOT EXISTS long_goal_peer_requests
+          ON long_goal_dialogue_messages(goal_id,sequence)
+          WHERE json_extract(message_json, '$.reply_requested') = 1;
     """)
 
 
@@ -95,7 +141,11 @@ def _decode(row: sqlite3.Row, document: dict[str, Any]) -> dict[str, Any]:
 
 
 def append(db: sqlite3.Connection, document: dict[str, Any], message: dict[str, Any]) -> None:
+    message = copy.deepcopy(message)
+    if "attachments" in message:
+        message["attachments"] = public_attachments(message["attachments"])
     held = metadata(document)
+    _ensure_conversation(db, document)
     existing = db.execute(
         "SELECT * FROM long_goal_dialogue_messages WHERE goal_id=? AND message_id=?",
         (document["goal_id"], message["id"]),
@@ -104,6 +154,8 @@ def append(db: sqlite3.Connection, document: dict[str, Any], message: dict[str, 
         previous = _decode(existing, document)
         if previous.get("summary") != message.get("summary"):
             raise HarnessError("Shared conversation message identity was reused for different text")
+        if public_attachments(previous.get("attachments")) != public_attachments(message.get("attachments")):
+            raise HarnessError("Shared conversation message identity was reused for different attachments")
         return
     sequence = int(message["sequence"])
     if sequence <= int(held["head_sequence"]):
@@ -123,6 +175,25 @@ def append(db: sqlite3.Connection, document: dict[str, Any], message: dict[str, 
     )
     held.update({"count": int(held["count"]) + 1, "head_sequence": sequence,
                  "latest_sequence": max(int(held["latest_sequence"]), sequence), "head_sha256": digest})
+    if message.get("visibility") != "operator_only":
+        projected = conversation_projection(held)
+        projected["count"] += 1
+        projected["latest_sequence"] = sequence
+
+
+def _ensure_conversation(db: sqlite3.Connection, document: dict[str, Any]) -> bool:
+    held = metadata(document)
+    if "conversation_projection" in held:
+        conversation_projection(held)
+        return False
+    value = _empty_conversation()
+    for row in db.execute("SELECT * FROM long_goal_dialogue_messages WHERE goal_id=? ORDER BY sequence", (document["goal_id"],)):
+        message = _decode(row, document)
+        if message.get("visibility") != "operator_only":
+            value["count"] += 1
+            value["latest_sequence"] = int(message["sequence"])
+    held["conversation_projection"] = value
+    return True
 
 
 def _legacy_events(db: sqlite3.Connection, document: dict[str, Any]) -> list[dict[str, Any]]:
@@ -152,7 +223,7 @@ def migrate(db: sqlite3.Connection, document: dict[str, Any]) -> bool:
     """Recover only authenticated public text that an older version still has."""
     if "dialogue_archive" in document:
         metadata(document)
-        return False
+        return _ensure_conversation(db, document)
     legacy_dialogue_sequence = int((document.get("dialogue") or {}).get("sequence") or 0)
     legacy_event_seq = int(document.get("event_seq") or 0)
     public_events = _legacy_events(db, document)
@@ -184,6 +255,7 @@ def migrate(db: sqlite3.Connection, document: dict[str, Any]) -> bool:
                 "objective_epoch": epoch,
                 "recipient": payload.get("summary_delivery") or {"kind": "team", "name": "the team"},
                 "at_ms": event.get("at_ms", 0),
+                **({"attachments": public_attachments(payload["attachments"])} if is_user and "attachments" in payload else {}),
             }
         elif snapshot:
             message = copy.deepcopy(snapshot)
@@ -291,6 +363,7 @@ def _user_message(
         "visibility": "operator_only" if unresolved else "agent_only" if recipient_id else "team",
         "source_goal_event_id": event["event_id"], "source_goal_event_seq": event["seq"],
         "source_goal_event_type": event["type"],
+        **({"attachments": public_attachments(payload["attachments"])} if "attachments" in payload else {}),
     }
 
 
@@ -328,9 +401,9 @@ def page(
         if not rows:
             raise ContextRequestError("That message is not in this goal's shared conversation")
     else:
-        rows = db.execute("SELECT * FROM long_goal_dialogue_messages WHERE goal_id=? AND sequence>? ORDER BY sequence LIMIT ?", (document["goal_id"], after, limit + 1)).fetchall()
+        rows = db.execute("SELECT * FROM long_goal_dialogue_messages WHERE goal_id=? AND sequence>? ORDER BY sequence", (document["goal_id"], after))
     messages, used, next_sequence = [], 0, after
-    for row in rows[:limit]:
+    for row in rows:
         value = _decode(row, document)
         previous = db.execute("SELECT * FROM long_goal_dialogue_messages WHERE goal_id=? AND sequence<? ORDER BY sequence DESC LIMIT 1", (document["goal_id"], row["sequence"])).fetchone()
         if previous:
@@ -346,6 +419,8 @@ def page(
                 raise ContextRequestError("That message is not addressed to this participant")
             next_sequence = int(value["sequence"])
             continue
+        if len(messages) >= limit:
+            break
         body = str(value["summary"])
         if offset > len(body):
             raise ContextRequestError("Shared conversation character offset exceeds the message length")
@@ -363,9 +438,11 @@ def page(
             break
     has_more = bool((messages and messages[-1]["has_more_characters"])
                     or (not message_id and next_sequence < int(held["head_sequence"])))
+    _ensure_conversation(db, document)
+    projected = conversation_projection(held) if viewer_agent_id else held
     return {"schema_version": SCHEMA_VERSION, "goal_id": document["goal_id"], "messages": messages,
             "next": next_sequence, "has_more": has_more, "coverage": copy.deepcopy(held["coverage"]),
-            "total_messages": int(held["count"]), "latest_sequence": int(held["latest_sequence"])}
+            "total_messages": int(projected["count"]), "latest_sequence": int(projected["latest_sequence"])}
 
 
 def clone(db: sqlite3.Connection, source: dict[str, Any], target: dict[str, Any]) -> None:

@@ -63,7 +63,7 @@ test("same-project saved chats retain their own concurrent goal and provider act
     assert.equal(found.goal, current);
     assert.equal(found.problem, "");
     const activity = f.chatGoalActivity(found);
-    assert.equal(activity.stage, "Builder is responding");
+    assert.equal(activity.stage, "Waiting for Builder");
     assert.match(activity.detail, /independent working copy/);
     assert.match(activity.detail, /after checks and conflict review/);
     assert.doesNotMatch(activity.detail, /another saved goal|project access/i);
@@ -133,8 +133,8 @@ test("new isolated admissions explain working copies and legacy project waits re
   delete current.workspace_publication;
   current.status = "waiting_for_project";
   const activity = f.chatGoalActivity({goal: current, problem: ""});
-  assert.equal(activity.stage, "Waiting for project access");
-  assert.match(activity.detail, /Another saved goal is using this project/);
+  assert.equal(activity.stage, "Waiting for legacy project work");
+  assert.match(activity.detail, /An older exclusive run is using this project/);
   assert.match(f.longHorizonAdmissionWords(current).detail, /current project owner releases it/);
 });
 

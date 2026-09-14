@@ -654,7 +654,28 @@ function answerScript(provider, began) {
         .filter((one) => (one.innerText || one.textContent || "").trim());
       if (replyNodes.length) break;
     }
-    const textOf = (one) => (one?.innerText || one?.textContent || "").trim();
+    const textOf = (one) => {
+      // A single whole-response JSON code block is a transport value. Use its
+      // text nodes, not layout-dependent innerText from syntax-highlighting
+      // spans or the surrounding Copy/language controls. Never extract a JSON
+      // snippet from prose or choose between several candidate code blocks.
+      const blocks = [...(one?.querySelectorAll?.("pre code, code-block code, pre") || [])]
+        .filter(block => !block.matches?.("pre") || !block.querySelector?.("code"));
+      if (blocks.length === 1) {
+        const raw = String(blocks[0].textContent || "").trim();
+        const clone = one.cloneNode?.(true);
+        if (clone) {
+          for (const block of clone.querySelectorAll("pre, code-block, button")) block.remove();
+          const outside = String(clone.textContent || "").trim();
+          if (/^(?:json)?$/i.test(outside)) {
+            // Preserve malformed source too: the engine owns validation and
+            // one bounded repair. innerText would further damage its contents.
+            if (raw.startsWith("{")) return raw;
+          }
+        }
+      }
+      return (one?.innerText || one?.textContent || "").trim();
+    };
     const values = replyNodes.map(textOf);
     let userNodes = [];
     for (const selector of selectors.users) {
@@ -813,6 +834,7 @@ class WebChatManager {
     this.shells = new Map();
     this.activeEmbedded = "";
     this.queues = new Map();
+    this.channelEpochs = new Map();
     this.activeAsks = new Map();
     this.externalTransports = new Map();
     this.backgroundHosts = new Map();
@@ -1578,6 +1600,9 @@ class WebChatManager {
       this.changed(null);
       throw error;
     }
+    for (const channel of new Set([...this.queues.keys(), ...this.activeAsks.keys()])) {
+      if (channel === id || channel.startsWith(`${id}\n`)) this.invalidateChannel(channel);
+    }
     // Destroy provider state only after the deletion is durable. If settings
     // are unwritable the restored connection and its recovery view stay usable.
     if (this.activeEmbedded === id || this.activeEmbedded.startsWith(`${id}\n`)) {
@@ -1602,16 +1627,6 @@ class WebChatManager {
     const key = cleanConversationKey(conversationKey);
     if (!key || !this.connections.has(id)) return false;
     const channel = channelKey(id, key);
-    if (this.activeEmbedded === channel) this.hideEmbedded();
-    const view = this.views.get(channel);
-    if (view && !view.webContents.isDestroyed()) {
-      this.releaseBackgroundHost(view);
-      if (!view.external && this.owner && !this.owner.isDestroyed()) {
-        this.owner.contentView.removeChildView(view);
-      }
-      view.webContents.close();
-    }
-    this.views.delete(channel);
     const one = this.connections.get(id);
     const changed = Boolean(one.threads?.[key]);
     if (changed) {
@@ -1624,6 +1639,17 @@ class WebChatManager {
         throw error;
       }
     }
+    this.invalidateChannel(channel);
+    if (this.activeEmbedded === channel) this.hideEmbedded();
+    const view = this.views.get(channel);
+    if (view && !view.webContents.isDestroyed()) {
+      this.releaseBackgroundHost(view);
+      if (!view.external && this.owner && !this.owner.isDestroyed()) {
+        this.owner.contentView.removeChildView(view);
+      }
+      view.webContents.close();
+    }
+    this.views.delete(channel);
     return true;
   }
 
@@ -1680,10 +1706,15 @@ class WebChatManager {
     id = String(id || "");
     const key = cleanConversationKey(conversationKey);
     const channel = channelKey(id, key);
+    const epoch = this.channelEpochs.get(channel) || 0;
     const before = this.queues.get(channel) || Promise.resolve();
     const mine = before.catch(() => {}).then(() => {
       if (this.closed) throw controlError(
         "Nexus is closing its web chats.", "NEXUS_WEB_CHAT_CLOSED");
+      if ((this.channelEpochs.get(channel) || 0) !== epoch) throw new WebChatTurnError(
+        "Stopped by you before this queued message was sent.", {
+          deliveryState: "not_accepted", failureCode: "queued_turn_cancelled",
+        });
       return this.askNow(
         id, String(prompt || ""), Array.isArray(attachments) ? attachments : [],
         key, preferExisting, serviceDeadlineMs);
@@ -1694,13 +1725,22 @@ class WebChatManager {
     });
   }
 
+  invalidateChannel(channel) {
+    this.channelEpochs.set(channel, (this.channelEpochs.get(channel) || 0) + 1);
+    const active = this.activeAsks.get(channel);
+    if (active) {
+      active.cancelled = true;
+      for (const wake of [...(active.cancelWaiters || [])]) wake();
+    }
+    return active;
+  }
+
   async stop(id, conversationKey = "") {
     id = String(id || "");
     const channel = channelKey(id, conversationKey);
-    const active = this.activeAsks.get(channel);
-    if (!active) return false;
-    active.cancelled = true;
-    for (const wake of [...(active.cancelWaiters || [])]) wake();
+    const hadQueued = this.queues.has(channel);
+    const active = this.invalidateChannel(channel);
+    if (!active) return hadQueued;
     if (active.phase === "pre_submission") {
       this.discardView(id, conversationKey, this.views.get(channel));
       return true;
@@ -1709,7 +1749,9 @@ class WebChatManager {
       const one = this.connections.get(id);
       const view = this.views.get(channel);
       if (one && view && !view.webContents.isDestroyed()) {
-        await view.webContents.executeJavaScript(stopScript(PROVIDERS[one.provider]), true);
+        await this.preSubmitOperation(
+          view.webContents.executeJavaScript(stopScript(PROVIDERS[one.provider]), true),
+          null, Date.now() + 500, "The provider Stop control did not respond.");
       }
     } catch (_error) {
       // The local cancellation is authoritative. The provider's stop control
@@ -1761,6 +1803,8 @@ class WebChatManager {
     if (typeof contents.replaceTextAndSubmit === "function") {
       return contents.replaceTextAndSubmit(text, {
         composer: provider.composer || [], send: provider.send || [],
+        assertActive: () => contents.assertTurnActive?.(),
+        beforeActivation: () => contents.markTurnActivation?.(),
       });
     }
     // sendInputEvent requires the containing BrowserWindow to be focused.
@@ -1831,6 +1875,7 @@ class WebChatManager {
             activationMethod: "none",
           };
         }
+        contents.markTurnActivation?.();
         await contents.debugger.sendCommand("Input.dispatchMouseEvent", {
           type: "mousePressed", x: current.x, y: current.y,
           button: "left", clickCount: 1,
@@ -1876,6 +1921,7 @@ class WebChatManager {
       activated: false, failureCode: previous?.code || "submit_control_unavailable",
       activationMethod: "none",
     };
+    contents.markTurnActivation?.();
     input({type: "mouseDown", x: target.x, y: target.y, button: "left", clickCount: 1});
     input({type: "mouseUp", x: target.x, y: target.y, button: "left", clickCount: 1});
     return {activated: true, sendActivated: true, activationMethod: "trusted_pointer"};
@@ -1883,7 +1929,7 @@ class WebChatManager {
 
   async pressTrustedEnter(contents, provider) {
     if (typeof contents.pressEnter === "function") {
-      await contents.pressEnter();
+      await contents.pressEnter(() => contents.assertTurnActive?.(), () => contents.markTurnActivation?.());
       return true;
     }
     if (contents.debugger?.attach && contents.debugger?.sendCommand) {
@@ -1907,6 +1953,7 @@ class WebChatManager {
           key: "Enter", code: "Enter", windowsVirtualKeyCode: 13,
           nativeVirtualKeyCode: 13,
         };
+        contents.markTurnActivation?.();
         await contents.debugger.sendCommand("Input.dispatchKeyEvent", {
           type: "keyDown", ...key, text: "\r", unmodifiedText: "\r",
         });
@@ -1919,6 +1966,7 @@ class WebChatManager {
       }
     }
     if (typeof contents.sendInputEvent !== "function") return false;
+    contents.markTurnActivation?.();
     contents.sendInputEvent({type: "keyDown", keyCode: "ENTER"});
     contents.sendInputEvent({type: "keyUp", keyCode: "ENTER"});
     return true;
@@ -1943,8 +1991,42 @@ class WebChatManager {
     const active = {cancelled: false, cancelWaiters: new Set(), phase: "pre_submission"};
     this.activeAsks.set(channel, active);
     const stopped = () => {
-      if (active.cancelled) throw new Error("Stopped by you.");
+      if (active.cancelled) throw controlError("Stopped by you.", "NEXUS_WEB_CHAT_CANCELLED");
     };
+    let turnView = null;
+    let releaseTurnPage = null;
+    let pinnedConversationUrl = "";
+    let activationStarted = false;
+    let operationDeadline = Math.min(turnStarted + this.preSubmitDeadlineMs, serviceDeadlineAt);
+    const assertActive = () => {
+      stopped();
+      if (Date.now() >= operationDeadline) throw controlError(
+        "The provider browser operation exceeded its time limit.", "NEXUS_WEB_CHAT_OPERATION_TIMEOUT");
+      if (active.phase === "submitting" && !activationStarted && pinnedConversationUrl
+          && typeof turnView.webContents.getURL === "function"
+          && !(specificConversationUrl(PROVIDERS[one.provider], pinnedConversationUrl)
+            ? sameSpecificConversation(PROVIDERS[one.provider], pinnedConversationUrl, turnView.webContents.getURL())
+            : genericConversationUrl(PROVIDERS[one.provider], turnView.webContents.getURL()))) {
+        throw controlError("The bound provider conversation changed before submission.", "NEXUS_WEB_CHAT_BINDING_DRIFT");
+      }
+    };
+    // An outer Promise race releases the caller, but its async operation can
+    // still resume later. Fence every subsequent browser command as well.
+    // External trusted-input helpers receive the same fence explicitly.
+    const guarded = (target) => new Proxy(target, {get(object, property) {
+      if (property === "assertTurnActive") return assertActive;
+      if (property === "markTurnActivation") return () => { assertActive(); activationStarted = true; };
+      if (property === "debugger") return object[property] ? guarded(object[property]) : object[property];
+      const value = object[property];
+      if (typeof value !== "function") return value;
+      return (...args) => {
+        if (!["getURL", "getTitle", "isDestroyed", "isAttached", "detach"].includes(property)) assertActive();
+        return value.apply(object, args);
+      };
+    }});
+    const operation = (action) => this.preSubmitOperation(
+      Promise.resolve().then(() => { assertActive(); return action(); }),
+      active, operationDeadline, "The provider browser operation exceeded its time limit.");
     try {
       let view;
       let provider;
@@ -1952,6 +2034,7 @@ class WebChatManager {
       const preSubmitDeadlineAt = Math.min(Date.now() + this.preSubmitDeadlineMs, serviceDeadlineAt);
       try {
         view = this.viewFor(id, key, preferExisting);
+        turnView = view;
         provider = PROVIDERS[one.provider];
         await this.waitForLoad(view.webContents, {
           active, deadlineAt: preSubmitDeadlineAt,
@@ -1969,7 +2052,9 @@ class WebChatManager {
           });
         }
         stopped();
+        releaseTurnPage = view.webContents.pinTurnPage?.() || null;
         priorUrl = this.preflightConnectionPage(id, view.webContents, key);
+        pinnedConversationUrl = priorUrl;
         await this.preSubmitOperation(
           this.attachFiles(view.webContents, provider, attachments),
           active, preSubmitDeadlineAt,
@@ -1989,6 +2074,8 @@ class WebChatManager {
         });
       }
       preparedAt = Date.now();
+      operationDeadline = Math.min(preparedAt + this.preSubmitDeadlineMs, serviceDeadlineAt);
+      view = {...view, webContents: guarded(view.webContents)};
       const nextSubmission = () => {
         const marker = `NEXUS TRANSPORT TURN ${crypto.randomUUID()}`;
         return {marker, prompt: `[${marker}]\n\n${prompt}`};
@@ -2016,6 +2103,7 @@ class WebChatManager {
                 submissionScript(provider, submission.prompt, began), true);
             }
           } else {
+            view.webContents.markTurnActivation?.();
             began = await view.webContents.executeJavaScript(
               automationScript(provider, submission.prompt, submission.marker), true);
           }
@@ -2037,7 +2125,7 @@ class WebChatManager {
       };
       active.phase = "submitting";
       let submission = nextSubmission();
-      let began = await submitTurn(submission);
+      let began = await operation(() => submitTurn(submission));
       if (!began?.ok) throw new WebChatTurnError(
         began?.error || "The provider web chat could not be sent a message", {
           deliveryState: began?.submissionState === "outcome_unknown" ? "unknown" : "not_accepted",
@@ -2048,7 +2136,9 @@ class WebChatManager {
           },
         });
       active.phase = "submitted";
+      active.deliveryState = began?.submissionState === "outcome_unknown" ? "unknown" : "accepted";
       const started = Date.now();
+      operationDeadline = Math.min(started + this.answerDeadlineMs, serviceDeadlineAt);
       let retriedVisibleError = false;
       let stable = 0;
       let previous = "";
@@ -2066,9 +2156,18 @@ class WebChatManager {
         const quietRemaining = this.answerSettleMs - (Date.now() - answerChangedAt);
         const pollDelay = previous && quietRemaining > 0
           ? Math.min(this.answerPollMs, quietRemaining) : this.answerPollMs;
-        await new Promise((resolve) => setTimeout(resolve, pollDelay));
+        await new Promise((resolve) => setTimeout(resolve, Math.min(pollDelay, Math.max(0, operationDeadline - Date.now()))));
+        if (Date.now() >= operationDeadline) break;
         stopped();
-        const state = await view.webContents.executeJavaScript(answerScript(provider, began), true);
+        let state;
+        try {
+          state = await operation(() => view.webContents.executeJavaScript(answerScript(provider, began), true));
+        } catch (error) {
+          // Expiry while entering or awaiting a poll is the same answer wait
+          // deadline as expiry between polls. Keep its delivery diagnosis.
+          if (["NEXUS_WEB_CHAT_OPERATION_TIMEOUT", "NEXUS_WEB_CHAT_PRE_SUBMIT_TIMEOUT"].includes(error?.code)) break;
+          throw error;
+        }
         polls += 1;
         lastState = state && typeof state === "object" ? state : {};
         if (state?.markerFound) {
@@ -2083,12 +2182,13 @@ class WebChatManager {
           if (state?.changed && state?.answer) {
             markedReplyFound = true;
             if (submissionState === "outcome_unknown") submissionState = "acknowledged";
+            active.deliveryState = "accepted";
           }
         }
         stopped();
         if (state?.error) {
           if (provider.retryVisibleError && !retriedVisibleError) {
-            const retried = await view.webContents.executeJavaScript(retryScript(provider), true);
+            const retried = await operation(() => view.webContents.executeJavaScript(retryScript(provider), true));
             stopped();
             if (retried) {
               retriedVisibleError = true;
@@ -2149,9 +2249,14 @@ class WebChatManager {
       try { this.rememberConnectionPage(id, view.webContents, key); } catch (_error) {}
       this.showCreatedConversationInOpenShells(id, key, view.webContents, priorUrl);
       try {
-        await view.webContents.executeJavaScript(stopScript(provider), true);
+        await this.preSubmitOperation(
+          turnView.webContents.executeJavaScript(stopScript(provider), true),
+          null, Date.now() + 500, "The provider Stop control did not respond.");
       } catch (error) {
         if (active.cancelled) throw error;
+        // A hung Stop must not keep an unusable view available to a fresh turn.
+        active.cancelled = true;
+        this.discardView(id, key, turnView);
       }
       const unknown = submissionState === "outcome_unknown";
       throw new WebChatTurnError(
@@ -2178,7 +2283,21 @@ class WebChatManager {
             page_url: String(view.webContents.getURL?.() || "").slice(0, 1000),
           },
         });
+    } catch (error) {
+      if (!(error instanceof WebChatTurnError)) {
+        active.cancelled = true;
+        this.discardView(id, key, turnView);
+        throw new WebChatTurnError(error?.message || error, {
+          deliveryState: active.phase === "pre_submission" ? "not_accepted"
+            : active.phase === "submitted" ? active.deliveryState : "unknown",
+          failureCode: error?.code === "NEXUS_WEB_CHAT_CANCELLED"
+            ? "turn_cancelled" : "browser_operation_failed",
+          diagnostics: {failure_stage: active.phase},
+        });
+      }
+      throw error;
     } finally {
+      releaseTurnPage?.();
       if (this.activeAsks.get(channel) === active) this.activeAsks.delete(channel);
     }
   }
@@ -2203,6 +2322,7 @@ class WebChatManager {
     this.activeEmbedded = "";
     this.activeAsks.clear();
     this.queues.clear();
+    this.channelEpochs.clear();
     this.shells.clear();
     this.views.clear();
     this.backgroundHosts.clear();

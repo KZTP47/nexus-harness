@@ -1127,6 +1127,8 @@ class SubscriptionCLIProvider(Provider):
                 "Use a Claude, Codex, Gemini, API, or vision-capable Ollama route."
             )
         claude_images = bool(image_attachments and recipe.id == "claude-cli")
+        claude_stream = claude_images or bool(recipe.id == "claude-cli"
+            and request.on_public_activity and self.settings.get("arguments") is None)
         if claude_images:
             if self.settings.get("arguments") is not None:
                 raise HarnessError("Claude image inputs require the standard CLI arguments; remove the route's custom arguments")
@@ -1140,6 +1142,9 @@ class SubscriptionCLIProvider(Provider):
             # Claude Code otherwise inherits its normal tool set even in -p
             # mode. Empty --tools makes this an answer-only provider call.
             argv.extend(["--tools", "default" if request.native_execution else ""])
+            if claude_stream:
+                argv[argv.index("--output-format") + 1] = "stream-json"
+                argv.append("--verbose")
         if recipe.id == "claude-cli" and self.settings.get("arguments") is None:
             argv.extend(["--no-session-persistence"])
             if request.native_execution:
@@ -1189,6 +1194,11 @@ class SubscriptionCLIProvider(Provider):
             ]
             stdin_text = None
         started = time.monotonic()
+        from ..provider_activity import PublicStream
+        if recipe.id == "claude-cli" and request.on_public_activity and not claude_stream:
+            PublicStream("claude", request.on_public_activity, self._redactor).emit(
+                "activity-coverage", "notice", text="Live provider activity is unavailable for this custom Claude command. "
+                "Nexus will still display its final reply and Nexus-managed tools.")
         result = _run_bounded(
             argv,
             cwd=request_cwd,
@@ -1196,6 +1206,9 @@ class SubscriptionCLIProvider(Provider):
             timeout_seconds=_remaining(deadline_at),
             max_output_bytes=output_limit,
             also_in_the_environment=self._what_it_is_handed(recipe),
+            **({"public_stream": PublicStream("claude", request.on_public_activity, self._redactor,
+                request.response_format.schema if request.response_format else None, output_limit)}
+               if claude_stream and request.on_public_activity else {}),
         )
         if result.timed_out:
             raise HarnessError(f"{recipe.label} ran past its {timeout:g} second limit")
@@ -1229,7 +1242,7 @@ class SubscriptionCLIProvider(Provider):
                 f"{self._and_what_it_says_about_itself(recipe, deadline_at, asked)}"
                 f" It printed: {self._just_a_glimpse(result.stderr or result.stdout)}"
             )
-        stdout = claude_input.terminal_result(result.stdout) if claude_images else result.stdout
+        stdout = claude_input.terminal_result(result.stdout) if claude_stream else result.stdout
         return self._read_answer(recipe, stdout, result.stderr, started)
 
     def _why_it_would_not(self, recipe: CliRecipe, stdout: str, stderr: str = "") -> str:
