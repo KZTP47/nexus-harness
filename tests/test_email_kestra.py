@@ -49,6 +49,17 @@ class KestraContractTests(unittest.TestCase):
                 runtime.resume("failed-id")
         request.assert_not_called()
 
+    @unittest.skipUnless(os.name == "nt", "Windows filesystem namespace")
+    def test_engine_paths_drop_extended_windows_spelling(self):
+        # Java exits during startup when its home or jar carries the prefix.
+        with tempfile.TemporaryDirectory() as root:
+            extended = "\\\\?\\" + os.path.abspath(root)
+            runtime = KestraRuntime(extended, extended, "http://127.0.0.1:9229", "token")
+            self.assertFalse(str(runtime.runtime_dir).startswith("\\\\?\\"))
+            self.assertFalse(str(runtime.data_dir).startswith("\\\\?\\"))
+            self.assertEqual(runtime.runtime_dir, Path(root).resolve())
+            self.assertEqual(runtime.data_dir.parent, Path(root).resolve())
+
     def test_data_contract_is_versioned_and_stable_across_callback_change(self):
         first = KestraRuntime("runtime", "arbitrary-state-root", "http://127.0.0.1:19333", "one")
         second = KestraRuntime("runtime", "arbitrary-state-root", "http://127.0.0.1:19444", "two")

@@ -573,7 +573,7 @@ class EmailStudio:
             sender, subject, body = payload.get('sender'), payload.get('subject'), payload.get('body')
         sender, subject, body = _text(sender, 500), _text(subject, 1000), _text(body)
         _address(sender)
-        if not body:
+        if not body and not metadata.get('browser_reference'):
             raise HarnessError('Enter the received email text.')
         if '\r' in subject or '\n' in subject:
             raise HarnessError('Subject cannot contain newlines.')
@@ -587,7 +587,7 @@ class EmailStudio:
                 if '\r' in metadata[key] or '\n' in metadata[key]:
                     raise HarnessError('Reply metadata cannot contain header line breaks.')
             received = _text(metadata.pop('received_at'), 100)
-            eligible = not bool(payload.get('answered') or payload.get('draft'))
+            eligible = bool(body) and not bool(payload.get('answered') or payload.get('draft'))
             if account.get('auto_draft_since'):
                 try:
                     eligible = eligible and datetime.fromisoformat(received.replace('Z', '+00:00')) >= datetime.fromisoformat(account['auto_draft_since'])
@@ -623,10 +623,24 @@ class EmailStudio:
                         raise HarnessError('The mailbox changed during its check. Its newer settings were kept; check again.')
                     for message in result['messages']:
                         self._ingest(current, message, message['source_id'])
+                    # A local scan reports failures under its own row key, so a conversation it
+                    # managed to read this time names that key rather than an imported message.
+                    cleared = [str(one) for one in result.get('resolved_failures', [])]
+                    cleared += [message['source_id'] for message in result['messages']]
+                    for source_id in cleared:
+                        failure_id = _fingerprint(['failed-import', current['id'], current['fingerprint'], source_id])
+                        with self._db() as db:
+                            db.execute('DELETE FROM records WHERE kind=? AND id=?', ('failed_import', failure_id))
+                    for failure in result.get('failed_messages', []):
+                        source_id = str(failure['source_id'])
+                        self._put('failed_import', dict(id=_fingerprint(['failed-import', current['id'], current['fingerprint'], source_id]),
+                                  account_id=current['id'], account_fingerprint=current['fingerprint'], source_id=source_id,
+                                  error=str(failure.get('error', 'Message could not be imported.'))[:1000], checked_at=_now()))
                     current.update(cursor=result['cursor'], last_sync=_now(), connection_state='connected',
-                                   error=' '.join(str(w) for w in result.get('warnings', []))[:1000])
+                                   error=' '.join(str(w) for w in result.get('warnings', []))[:1000],
+                                   sync_has_more=bool(result.get('has_more')))
                     self._put('account', current)
-                return {'imported': len(result['messages'])}
+                return {'imported': len(result['messages']), 'has_more': bool(result.get('has_more'))}
             except Exception as exc:
                 error = str(exc)[:1000] if isinstance(exc, HarnessError) else 'Mailbox check failed. Reopen the connection and try again.'
                 with self._mutation():

@@ -43,7 +43,7 @@ RECORDED_AUDIT_NOTES = {"docs/AUDIT.md", "src/our_harness/audit.py", "our_harnes
 # included in either the Python distribution or the Electron resources.  It
 # can legitimately bind this checkout to private local resources, so scanning
 # it as shipped application content produces a false portability failure.
-NON_DISTRIBUTABLE_PROJECT_FILES = {"AGENTS.md"}
+NON_DISTRIBUTABLE_PROJECT_FILES = {"AGENTS.md", "CLAUDE.md", ".ai-project.json"}
 
 
 def _inspect_text(label: str, text: str, findings: list[dict[str, str]]) -> bool:

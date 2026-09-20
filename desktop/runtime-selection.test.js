@@ -62,6 +62,25 @@ function fixture() {
   return { repository, desktop, selected, old };
 }
 
+test("runtime hashing preserves the exact digest without whole-file reads", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "nexus-chunked-hash-"));
+  const payload = Buffer.alloc(2 * 1024 * 1024 + 17, 0xa5);
+  payload[payload.length - 1] = 0x42;
+  fs.writeFileSync(path.join(root, "binary"), payload);
+  fs.writeFileSync(path.join(root, "empty"), "");
+  const expected = crypto.createHash("sha256")
+    .update("F\0binary\0" + payload.length + "\0").update(payload)
+    .update("F\0empty\0" + "0\0").digest("hex");
+  const originalRead = fs.readFileSync;
+  try {
+    fs.readFileSync = () => { throw new Error("Whole-file read is forbidden for this check"); };
+    assert.equal(runtimeTreeSha256(root), expected);
+  } finally {
+    fs.readFileSync = originalRead;
+    fs.rmSync(root, {recursive: true, force: true});
+  }
+});
+
 test("builder resources use the fully verified selected candidate and not stale runtime", () => {
   const held = fixture();
   try {

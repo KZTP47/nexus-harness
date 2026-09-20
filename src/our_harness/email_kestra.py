@@ -21,6 +21,7 @@ from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
 
 from .execution import _ProcessTree
+from .filesystem_paths import plain_path
 
 
 FLOW_ID = "email_review_v1"
@@ -68,6 +69,16 @@ tasks:
 """
 
 
+def _engine_path(value: str | Path) -> Path:
+    """Resolve a path the bundled JVM can read; it rejects extended Win32 paths.
+
+    Engine import roots use the extended spelling so deep installations work,
+    and every path derived from them inherits it. Java exits during startup
+    when its own home or jar is spelled that way.
+    """
+    return plain_path(plain_path(Path(value)).resolve())
+
+
 def _port() -> int:
     with socket.socket() as held:
         held.bind(("127.0.0.1", 0))
@@ -94,10 +105,10 @@ class KestraRuntime:
             raise ValueError("Email worker callback must be loopback HTTP")
         if callback.username or callback.password or callback.query or callback.fragment:
             raise ValueError("Invalid email worker callback URL")
-        self.runtime_dir = Path(runtime_dir).resolve()
+        self.runtime_dir = _engine_path(runtime_dir)
         # Never open a database written by a different engine/storage contract.
         # Domain records survive separately and can create replacement executions.
-        self.data_dir = Path(data_dir).resolve() / "kestra-1.3.38-contract-1"
+        self.data_dir = _engine_path(data_dir) / "kestra-1.3.38-contract-1"
         self.callback_base = callback_base.rstrip("/")
         self.callback_token = callback_token
         self.process: subprocess.Popen | None = None

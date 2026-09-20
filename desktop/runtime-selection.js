@@ -5,7 +5,21 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 function sha256(filename) {
-  return crypto.createHash("sha256").update(fs.readFileSync(filename)).digest("hex");
+  const held = crypto.createHash("sha256");
+  hashFileInto(held, filename, Buffer.allocUnsafe(1024 * 1024));
+  return held.digest("hex");
+}
+
+function hashFileInto(held, filename, buffer) {
+  const descriptor = fs.openSync(filename, "r");
+  try {
+    let count;
+    while ((count = fs.readSync(descriptor, buffer, 0, buffer.length, null)) > 0) {
+      held.update(buffer.subarray(0, count));
+    }
+  } finally {
+    fs.closeSync(descriptor);
+  }
 }
 
 function comparable(filename) {
@@ -52,11 +66,14 @@ function runtimeTreeSha256(runtime) {
   visit(root);
   entries.sort((left, right) => Buffer.from(left.relative).compare(Buffer.from(right.relative)));
   const held = crypto.createHash("sha256");
+  // Runtime binaries can be hundreds of megabytes. Reuse a bounded buffer
+  // without changing the byte stream covered by the distribution identity.
+  const buffer = Buffer.allocUnsafe(1024 * 1024);
   for (const entry of entries) {
     held.update(entry.type + "\0" + entry.relative + "\0");
     if (entry.type === "F") {
       held.update(String(entry.size) + "\0");
-      held.update(fs.readFileSync(entry.entry));
+      hashFileInto(held, entry.entry, buffer);
     }
   }
   return held.digest("hex");

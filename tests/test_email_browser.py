@@ -40,6 +40,38 @@ class BrowserMailTests(unittest.TestCase):
             request.assert_not_called()
         with patch.object(other,'_request',side_effect=self.request):
             self.assertEqual(other.status(result['id'])['email'],'person@example.test')
+
+    def test_connection_snapshot_does_not_wait_for_a_browser_scan(self):
+        with patch.object(self.browser, '_request', side_effect=self.request):
+            connection = self.browser.open('outlook')
+        entered, release, listed = threading.Event(), threading.Event(), threading.Event()
+        result = []
+
+        def scan(command, **payload):
+            if command == 'sync':
+                entered.set()
+                release.wait(5)
+                return {'messages': [], 'cursor': ''}
+            return self.request(command, **payload)
+
+        def snapshot():
+            result.extend(self.browser.connections())
+            listed.set()
+
+        with patch.object(self.browser, '_request', side_effect=scan):
+            scanning = threading.Thread(target=self.browser.sync, args=(connection['id'],))
+            scanning.start()
+            reader = threading.Thread(target=snapshot)
+            try:
+                self.assertTrue(entered.wait(2))
+                reader.start()
+                self.assertTrue(listed.wait(1), 'inbox progress must remain readable during a long scan')
+                self.assertEqual(result[0]['id'], connection['id'])
+            finally:
+                release.set()
+                scanning.join(5)
+                if reader.ident is not None:
+                    reader.join(5)
     def test_cross_project_binding_rejected(self):
         with patch.object(self.browser,'_request',side_effect=self.request):
             result=self.browser.open('outlook')

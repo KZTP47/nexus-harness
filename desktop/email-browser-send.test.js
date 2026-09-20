@@ -314,3 +314,27 @@ test('explicit sign-in survives background headless preference until mailbox aut
     assert.deepEqual(modes,[false,true],'authentication failure must not open a visible window automatically');
   }finally{chromium.launchPersistentContext=original;await worker.close();fs.rmSync(profile,{recursive:true,force:true});}
 });
+
+test('an Outlook self-reload during a send keeps the conversation the send opened, and clears it again afterwards',{timeout:45000},async()=>{
+  const f=await fixtureSession('browser_outlook');
+  try{
+    worker.watchReloads(f.value);
+    let duringSend;
+    const sent=f.fixture.route;
+    // The load event is raised directly because a real reload would abort the send this scoping exists for.
+    f.value.context.route('**/*',async route=>{
+      if(new URL(route.request().url()).pathname==='/__nexus_test_send__'){
+        f.value.paneDirty=true;f.value.lastOpenedRow='thread-one';f.value.lastInboxRefresh=Date.now()-60000;f.value.ownLoadPending=false;
+        f.value.page.emit('load');
+        duringSend={replying:f.value.replying,lastOpenedRow:f.value.lastOpenedRow,paneDirty:f.value.paneDirty};
+      }
+      return sent(route);
+    });
+    const result=await worker.operate(f.value,{...f.request,command:'send',incoming:f.incoming,body:'Reviewed reply.',submission_id:submissionId});
+    assert.equal(result.status,'sent');
+    assert.deepEqual(duringSend,{replying:true,lastOpenedRow:'thread-one',paneDirty:false},'a reload mid-send discards the pane but keeps the row the send stamped');
+    f.value.paneDirty=true;f.value.lastOpenedRow='thread-one';f.value.lastInboxRefresh=Date.now()-60000;f.value.ownLoadPending=false;
+    f.value.page.emit('load');
+    assert.equal(f.value.lastOpenedRow,'','outside a send the reload clears the open conversation as well');
+  }finally{await f.close();}
+});

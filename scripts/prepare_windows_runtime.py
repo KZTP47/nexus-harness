@@ -186,6 +186,10 @@ def runtime_tree_digest(root: Path) -> str:
     canonical = root.resolve()
     if _is_direct_reparse_point(root):
         raise RuntimeError(f"Private runtime root is a link or reparse point: {root}")
+    # The whole walk stays in the extended-length form. Beyond 260 characters an
+    # ordinary file answers neither is_dir nor is_file, which would otherwise be
+    # reported as an unsupported entry rather than as the path limit it is.
+    canonical = Path(extended_path(canonical))
     if not canonical.is_dir():
         raise RuntimeError(f"Private runtime is not a directory: {root}")
     held = hashlib.sha256()
@@ -380,6 +384,25 @@ def _download(url: str, destination: Path, *, sha256: str | None = None,
         raise RuntimeError(f"Downloaded npm package integrity did not match: {url}")
 
 
+def extended_path(path: Path) -> str:
+    """Windows extended-length form of an absolute path.
+
+    Chromium ships directory names long enough that an ordinary checkout, such
+    as one inside a synced Documents or Desktop folder, passes the 260-character
+    limit while extracting. The prefix lifts that limit without requiring the
+    machine-wide long-path setting, which needs an administrator.
+    """
+
+    if os.name != "nt":
+        return str(path)
+    text = os.fspath(path)
+    if text.startswith("\\\\?\\"):
+        return text
+    if text.startswith("\\\\"):
+        return "\\\\?\\UNC" + text[1:]
+    return "\\\\?\\" + text
+
+
 def _safe_zip_extract(archive: Path, destination: Path) -> None:
     destination = destination.resolve()
     with zipfile.ZipFile(archive) as packed:
@@ -387,7 +410,9 @@ def _safe_zip_extract(archive: Path, destination: Path) -> None:
             target = (destination / item.filename).resolve()
             if target != destination and destination not in target.parents:
                 raise RuntimeError(f"Archive member escapes its destination: {item.filename}")
-        packed.extractall(destination)
+        # Members are validated against the ordinary path; only the write uses
+        # the extended form, so the escape check keeps its normal semantics.
+        packed.extractall(extended_path(destination))
 
 
 def _safe_npm_extract(archive: Path, destination: Path) -> None:
@@ -624,7 +649,7 @@ def _remove_abandoned_runtime_trees() -> None:
                 raise RuntimeError(f"Refusing unsafe abandoned runtime path: {candidate}")
             try:
                 retry_owned_windows_operation(
-                    lambda target=lexical: shutil.rmtree(target),
+                    lambda target=extended_path(lexical): shutil.rmtree(target),
                     "remove abandoned private-runtime tree",
                     timeout_seconds=RUNTIME_CLEANUP_TIMEOUT_SECONDS,
                 )
@@ -642,8 +667,10 @@ def _cleanup_unreferenced_runtime_tree(path: Path, description: str) -> None:
     if not path.exists():
         return
     try:
+        # Removal walks into the runtime's deepest names, so it needs the
+        # extended-length form for the same reason extraction does.
         retry_owned_windows_operation(
-            lambda: shutil.rmtree(path), description,
+            lambda: shutil.rmtree(extended_path(path)), description,
             timeout_seconds=RUNTIME_CLEANUP_TIMEOUT_SECONDS,
         )
     except OSError as error:

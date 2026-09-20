@@ -415,6 +415,12 @@ class EmailService:
             result = self.studio.dispatch('sync', {'account_id': account_id})
             if not result.get('has_more'):
                 break
+        # Import backlog takes priority over preparing replies. A slow or failed
+        # draft workflow must not hold the next batch of inbox messages behind
+        # every already-imported message. The scheduler resumes this cursor on
+        # its next tick; draft preparation starts after the backlog is drained.
+        if result.get('has_more'):
+            return
         current = self.studio.snapshot()
         owning = next(a for a in current['accounts'] if a['id'] == account_id)
         if not owning.get('poll_enabled') or owning.get('connection_state') == 'disconnected':
