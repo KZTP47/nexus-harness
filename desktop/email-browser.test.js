@@ -1545,40 +1545,129 @@ function openMail(id){
   }finally{Object.assign(budgets.browser_outlook,saved);await browser.close();}
 });
 
-test('a message that paints after the proof was taken is not imported under it and leaves its row unchecked',{timeout:60000},async()=>{
+for(const arrivalPoint of ['before-enumeration','before-final','after-final','none']){
+  for(const changedSummary of [false,true]){
+    test(`deterministic message arrival ${arrivalPoint}, row summary ${changedSummary?'changed':'unchanged'}`,{timeout:90000},async()=>{
+      const browser=await chromium.launch({executablePath:findInstalledBrowser().executable,headless:true});
+      try{
+        const page=await browser.newPage();
+        await page.route('**/*',route=>route.fulfill({contentType:'text/html',body:`<button id="mectrl_main_trigger" aria-label="owner@example.test">Account</button><main role="main"><div role="option" data-convid="A" aria-selected="false" onclick="openMail('A')">A 1</div><div role="option" data-convid="B" aria-selected="false" onclick="openMail('B')">B 1</div><section id="pane"></section></main><script>
+const arrival=()=>sessionStorage.getItem('arrived')==='1';
+const article=(conversation,n)=>'<article data-convid="'+conversation+'" data-message-id="'+conversation+'-'+n+'"><span email="sender'+n+'@example.test">Sender</span><div role="document">Body '+conversation+' '+n+'</div></article>';
+function summary(){if(${changedSummary}&&arrival())document.querySelector('[data-convid="B"]').textContent='B 2';}
+function arrive(){sessionStorage.setItem('arrived','1');document.querySelector('#pane').insertAdjacentHTML('beforeend',article('B',2));summary();}
+function openMail(id){
+  sessionStorage.setItem('opens',String(Number(sessionStorage.getItem('opens')||0)+1));
+  document.querySelectorAll('[role=option]').forEach(row=>row.setAttribute('aria-selected',String(row.getAttribute('data-convid')===id)));
+  document.querySelector('#pane').innerHTML='<h2 data-testid="conversation-subject">Thread '+id+'</h2>'+article(id,1)+(id==='B'&&arrival()?article('B',2):'');
+}
+summary();
+</script>`}));
+        await page.goto('https://outlook.office.com/mail/inbox');
+        const evaluate=page.evaluate.bind(page);
+        let injected=false,readB=false;
+        // Await the exact worker operation and insert the arrival before returning
+        // its immutable result. No timers or page-query monkeypatches race IPC.
+        page.evaluate=async(fn,arg)=>{
+          const result=await evaluate(fn,arg);
+          if(fn===readMessage&&result.message_id==='B-1')readB=true;
+          const bSnapshot=fn===paneView&&result.bodies.some(([id])=>id==='B-1');
+          const trigger=arrivalPoint==='before-enumeration'?bSnapshot&&!readB
+            :arrivalPoint==='before-final'?fn===readMessage&&readB
+            :arrivalPoint==='after-final'?bSnapshot&&readB:false;
+          if(trigger&&!injected){injected=true;await evaluate(()=>arrive());}
+          return result;
+        };
+        const request={command:'sync',connection:{email:'owner@example.test'}};
+        let value={page,provider:'browser_outlook'};
+        const first=await operate(value,request);
+        assert.equal(injected,arrivalPoint!=='none');
+        assert.deepEqual(first.messages.map(m=>[m.message_id,m.browser_reference.row_id]),[['A-1','A'],['B-1','B']]);
+        const key=id=>createHash('sha256').update(JSON.stringify(['Focused','data-convid',id])).digest('hex');
+        const cursor=JSON.parse(first.cursor),observed=['before-enumeration','before-final'].includes(arrivalPoint);
+        assert.ok(key('A') in cursor.row_cache);
+        assert.equal(key('B') in cursor.row_cache,!observed);
+        assert.equal(first.has_more,observed);
+        assert.deepEqual(cursor.walks.Focused.pending.map(row=>row.id),observed?['B']:[]);
+        assert.deepEqual(cursor.message_offsets,{});
+        assert.deepEqual(cursor.row_failures,{},'one arrival seen at multiple boundaries never accrues cooldown failures');
+        assert.deepEqual(first.failed_messages,[]);
+        assert.equal(first.warnings.filter(w=>/gained messages/.test(w)).length,Number(observed));
+        // Restore the serialized cursor into a fresh worker state and document.
+        page.evaluate=evaluate;
+        await page.reload();
+        value={page,provider:'browser_outlook'};
+        const second=await operate(value,{...request,cursor:JSON.stringify(cursor)});
+        const immediate=observed||(arrivalPoint==='after-final'&&changedSummary);
+        assert.deepEqual(second.messages.map(m=>[m.message_id,m.browser_reference.row_id]),immediate?[['B-2','B']]:[]);
+        assert.equal(second.has_more,false);
+        let next=second;
+        if(arrivalPoint==='after-final'&&!changedSummary){
+          const aged=JSON.parse(second.cursor);
+          for(const entry of Object.values(aged.row_cache))entry.checked_at=0;
+          const reconciled=[];
+          let saved=JSON.stringify(aged);
+          for(let scan=0;scan<2;scan++){
+            next=await operate(value,{...request,cursor:saved});
+            reconciled.push(...next.messages.map(m=>[m.message_id,m.browser_reference.row_id]));
+            saved=next.cursor;
+          }
+          assert.deepEqual(reconciled,[['B-2','B']],'one unchanged row per scan completes the two-row reconciliation rotation');
+        }
+        const settled=JSON.parse(next.cursor);
+        assert.ok(key('B') in settled.row_cache);
+        assert.deepEqual(settled.walks.Focused.pending,[]);
+        assert.deepEqual(settled.message_offsets,{});
+        assert.deepEqual(settled.row_failures,{});
+        const opens=await evaluate(()=>sessionStorage.getItem('opens'));
+        const third=await operate(value,{...request,cursor:next.cursor});
+        assert.deepEqual(third.messages,[],'safely imported messages are emitted exactly once');
+        assert.equal(await evaluate(()=>sessionStorage.getItem('opens')),opens,'cached rows are not reopened on every poll');
+        assert.equal(third.has_more,false);
+      }finally{await browser.close();}
+    });
+  }
+}
+
+test('arrival before a saved message offset restarts bounded enumeration without losing or duplicating mail',{timeout:90000},async()=>{
   const browser=await chromium.launch({executablePath:findInstalledBrowser().executable,headless:true});
   try{
     const page=await browser.newPage();
-    // The pane gains a second message in the round trip between the proof and the read, so the read returns a message the
-    // proof never covered.
-    await page.route('**/*',route=>route.fulfill({contentType:'text/html',body:`<button id="mectrl_main_trigger" aria-label="owner@example.test">Account</button><main role="main"><div role="option" data-convid="A" aria-selected="false" onclick="openMail('A')">A 1</div><div role="option" data-convid="B" aria-selected="false" onclick="openMail('B')">B 1</div><section id="pane"></section></main><script>
-const all=document.querySelectorAll.bind(document);let armed=false;
-// Reopening row B takes a fresh document, and a message that already arrived is still there on it.
-const arrival=()=>sessionStorage.getItem('arrived')==='1';
-const article=(conversation,n)=>'<article data-convid="'+conversation+'" data-message-id="'+conversation+'-'+n+'"><span email="sender'+n+'@example.test">Sender</span><div role="document">Body '+conversation+' '+n+'</div></article>';
-// The body query the worker runs to read the pane is the moment B's second message arrives, one round trip after the proof.
-document.querySelectorAll=selector=>{
-  const nodes=all(selector);
-  if(armed&&String(selector).includes('[aria-label="Message body"]')){armed=false;setTimeout(()=>{sessionStorage.setItem('arrived','1');document.querySelector('#pane').insertAdjacentHTML('beforeend',article('B',2));},0);}
-  return nodes;
-};
-function openMail(id){
-  all('[role=option]').forEach(row=>row.setAttribute('aria-selected',String(row.getAttribute('data-convid')===id)));
-  document.querySelector('#pane').innerHTML='<h2 data-testid="conversation-subject">Thread '+id+'</h2>'+article(id,1)+(id==='B'&&arrival()?article('B',2):'');
-  armed=id==='B'&&!arrival();
-}
+    await page.route('**/*',route=>route.fulfill({contentType:'text/html',body:`<button id="mectrl_main_trigger" aria-label="owner@example.test">Account</button><main role="main"><div role="option" data-convid="A" onclick="openMail()">A</div><section id="pane"></section></main><script>
+const article=n=>'<article data-convid="A" data-message-id="A-'+n+'"><span email="sender@example.test">Sender</span><div role="document">Body '+n+'</div></article>';
+function openMail(){document.querySelector('[role=option]').setAttribute('aria-selected','true');document.querySelector('#pane').innerHTML='<h2 data-testid="conversation-subject">Thread A</h2>'+(sessionStorage.arrived?article(22):'')+Array.from({length:21},(_,i)=>article(i+1)).join('');}
+function arrive(){sessionStorage.arrived='1';document.querySelector('#pane h2').insertAdjacentHTML('afterend',article(22));}
 </script>`}));
     await page.goto('https://outlook.office.com/mail/inbox');
-    const value={page,provider:'browser_outlook'},request={command:'sync',connection:{email:'owner@example.test'}};
-    const first=await operate(value,request);
-    assert.deepEqual(first.messages.map(message=>[message.message_id,message.browser_reference.row_id]),[['A-1','A'],['B-1','B']],'the message the proof covered is still read');
-    assert.deepEqual(first.warnings.filter(warning=>/another check/.test(warning)),['A message needs another check: The selected message did not finish loading.'],'the message that arrived after it is reported, not imported');
-    const key=id=>createHash('sha256').update(JSON.stringify(['Focused','data-convid',id])).digest('hex');
-    const cache=JSON.parse(first.cursor).row_cache;
-    assert.ok(key('A') in cache,'the row whose pane was read in full is cached');
-    assert.ok(!(key('B') in cache),'the row whose pane gained a message is not, so the next scan reads it');
+    const evaluate=page.evaluate.bind(page);let injected=false;
+    page.evaluate=async(fn,arg)=>{
+      const result=await evaluate(fn,arg);
+      if(fn===readMessage&&!injected){injected=true;await evaluate(()=>arrive());}
+      return result;
+    };
+    const request={command:'sync',connection:{email:'owner@example.test'}};
+    const first=await operate({page,provider:'browser_outlook'},request);
+    assert.deepEqual(first.messages.map(m=>m.message_id),Array.from({length:20},(_,i)=>`A-${i+1}`));
+    assert.equal(first.has_more,true);
+    assert.deepEqual(JSON.parse(first.cursor).message_offsets,{},'arrival invalidates positional continuation');
+    assert.equal(first.warnings.filter(w=>/gained messages/.test(w)).length,1,'twenty post-read observations count as one arrival');
+    assert.deepEqual(JSON.parse(first.cursor).row_failures,{});
+    page.evaluate=evaluate;
+    await page.reload();
+    const value={page,provider:'browser_outlook'};
     const second=await operate(value,{...request,cursor:first.cursor});
-    assert.deepEqual(second.messages.map(message=>message.message_id),['B-2'],'the message that arrived late is imported on the next scan');
+    assert.deepEqual(second.messages.map(m=>[m.message_id,m.browser_reference.row_id]),[['A-22','A']]);
+    assert.equal(second.has_more,true);
+    assert.deepEqual(Object.values(JSON.parse(second.cursor).message_offsets),[20],'retry still obeys the twenty-message budget');
+    const third=await operate(value,{...request,cursor:second.cursor});
+    assert.deepEqual(third.messages.map(m=>[m.message_id,m.browser_reference.row_id]),[['A-21','A']]);
+    assert.equal(third.has_more,false);
+    const final=JSON.parse(third.cursor);
+    assert.deepEqual(final.walks.Focused.pending,[]);
+    assert.deepEqual(final.message_offsets,{});
+    assert.equal(Object.keys(final.row_cache).length,1);
+    assert.equal(new Set([...first.messages,...second.messages,...third.messages].map(m=>m.source_id)).size,22);
+    assert.deepEqual((await operate(value,{...request,cursor:third.cursor})).messages,[]);
   }finally{await browser.close();}
 });
 
