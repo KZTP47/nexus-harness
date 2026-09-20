@@ -874,8 +874,15 @@ async function operate(value,request) {
       }))];
     },value.provider));
     const visibleIds=shown.filter(ownBody);
+    let arrivalObserved=false;
+    const noteArrival=()=>{
+      if(arrivalObserved)return;
+      arrivalObserved=true;
+      incomplete.add(row.id);
+      rowWarnings.push('This conversation gained messages while being read; checking continues on the next scan.');
+    };
     // A message that painted after the proof was taken is judged by the next scan instead, so this row stays unchecked.
-    if(shown.some(id=>!view.bodies.some(([bodyId])=>bodyId===id)))noteFailure(row,refuse());
+    if(shown.some(id=>!view.bodies.some(([bodyId])=>bodyId===id)))noteArrival();
     // A pane whose identified messages all belong to another conversation proves nothing about this row.
     if(!visibleIds.length&&view.bodies.some(([id])=>id))throw refuse();
     const messageStart=(messageOffsets[rowKey(row)]||0)%Math.max(1,visibleIds.length);
@@ -919,6 +926,10 @@ async function operate(value,request) {
         // A tenant that renders no message envelope leaves the pane body without an id, so its own text is what identifies it.
         &&after.bodies.some(([id,text])=>message.message_id&&id ? id===message.message_id : text===message.body);
       if (!held) { value.paneDirty=true; noteFailure(row,refuse()); break; }
+      // Ownership of the message just read does not prove the conversation is
+      // complete. Preserve that message, but retry any newly observed IDs under
+      // a fresh proof; an arrival is pending work, not a parser failure.
+      if(after.bodies.some(([id])=>id&&!view.bodies.some(([beforeId])=>beforeId===id)))noteArrival();
     }
     parsedCount++;
     const source_id=sourceHash(value.provider,row,message);
@@ -936,6 +947,13 @@ async function operate(value,request) {
       incomplete.add(row.id);
       rowWarnings.push('This conversation has more messages to import; checking continues on the next scan.');
     }else delete messageOffsets[rowKey(row)];
+    // An insertion can move messages before the saved positional offset.
+    // Restart enumeration under the next proof; seen IDs still deduplicate it.
+    if(arrivalObserved)delete messageOffsets[rowKey(row)];
+    if(arrivalObserved&&parsedCount>parsedBefore&&!failures.has(rowKey(row))){
+      delete rowFailures[rowKey(row)];
+      resolved.add(rowKey(row));
+    }
     } catch(error) {
       // Message layout/virtualization failures are recoverable, but never hide
       // a closed browser, a changed account or a sign-in redirect as bad mail.
