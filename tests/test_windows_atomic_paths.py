@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import patch
 
 from our_harness import changes, goal_workspaces as gw, agent_workspaces as aw
-from our_harness.filesystem_paths import filesystem_path
+from our_harness.filesystem_paths import filesystem_path, plain_path
 
 
 @unittest.skipUnless(os.name == "nt", "Windows filesystem namespace")
@@ -105,3 +105,14 @@ class WindowsAtomicPaths(unittest.TestCase):
             changes.FileTransaction(source).rollback(result["transaction_id"])
             self.assertEqual(filesystem_path(original).read_bytes(), b"original")
             gw.validate(json.loads(json.dumps(goal)), runtime, full=True)
+
+
+@unittest.skipUnless(os.name == "nt", "Windows filesystem namespace")
+class PlainSpellingForOtherPrograms(unittest.TestCase):
+    def test_round_trips_the_extended_spelling(self):
+        for plain in ("C:\\Program Files\\tool", "\\\\server\\share\\tool"):
+            self.assertEqual(str(plain_path(filesystem_path(Path(plain)))), plain)
+
+    def test_keeps_a_path_that_has_no_plain_spelling(self):
+        volume = Path("\\\\?\\Volume{00000000-0000-0000-0000-000000000000}\\data")
+        self.assertEqual(plain_path(volume), volume)

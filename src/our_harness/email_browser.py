@@ -22,6 +22,7 @@ class EmailBrowser:
         self._process = None
         self._reader = None
         self._lock = threading.RLock()
+        self._metadata_lock = threading.RLock()
         self._replies = queue.Queue()
 
     def _command(self):
@@ -74,6 +75,10 @@ class EmailBrowser:
             return result['result']
 
     def _binding(self, connection_id):
+        with self._metadata_lock:
+            return self._binding_locked(connection_id)
+
+    def _binding_locked(self, connection_id):
         if not re.fullmatch(r'[a-f0-9]{32}', connection_id or ''):
             raise HarnessError('Choose a valid browser mail connection.')
         path = self.root / connection_id / 'connection.json'
@@ -150,10 +155,11 @@ class EmailBrowser:
                     'message': 'Browser mode saved. The next mailbox check uses this mode; sign-in opens visibly.'}
 
     def _save(self, data):
-        path = self.root / data['id'] / 'connection.json'
-        temporary = path.with_suffix('.tmp')
-        temporary.write_text(json.dumps(data), encoding='utf-8')
-        temporary.replace(path)
+        with self._metadata_lock:
+            path = self.root / data['id'] / 'connection.json'
+            temporary = path.with_suffix('.tmp')
+            temporary.write_text(json.dumps(data), encoding='utf-8')
+            temporary.replace(path)
 
     def _call(self, command, data, **extra):
         result = self._request(command, connection=data, profile=str(self.root / data['id'] / 'profile'), **extra)
@@ -179,7 +185,10 @@ class EmailBrowser:
 
     def connections(self):
         """Read only this product-owned metadata; never launch browsers on listing."""
-        with self._lock:
+        # Snapshot rendering must not wait for a browser operation, which may
+        # legitimately spend a minute traversing the inbox. Migrations and
+        # atomic metadata writes have their own short, shared lock.
+        with self._metadata_lock:
             result = []
             for path in sorted(self.root.glob('*/connection.json')):
                 data = self._binding(path.parent.name)

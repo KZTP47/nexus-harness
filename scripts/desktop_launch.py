@@ -11,9 +11,15 @@ import json
 import os
 import re
 import shutil
+import subprocess
+import sys
 import tempfile
 import uuid
 from pathlib import Path
+
+# Also support direct invocation through put_it_on_your_desktop.py.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from our_harness.filesystem_paths import filesystem_path
 
 CONTRACT = "nexus-desktop-launch-copy/v1"
 MANIFEST = "nexus-launch-build.json"
@@ -35,6 +41,7 @@ def _linked(path: Path) -> bool:
 
 
 def inventory(folder: Path) -> dict:
+    folder = filesystem_path(folder)
     files = {}
     def unreadable(error):
         raise error
@@ -61,6 +68,19 @@ def _read(path: Path) -> dict:
         return value if isinstance(value, dict) else {}
     except (OSError, ValueError):
         return {}
+
+
+def validate_launch(folder: Path) -> None:
+    """Exercise imports at the final launch depth before selecting this build."""
+    python = folder / "resources/runtime/python.exe"
+    if not filesystem_path(python).is_file():
+        raise RuntimeError("The launch copy is missing its private Python runtime")
+    result = subprocess.run([str(python), "-B", "-m", "our_harness", "--help"],
+                            cwd=str(folder), capture_output=True, text=True,
+                            timeout=90, check=False,
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    if result.returncode:
+        raise RuntimeError("Launch-copy startup validation failed: " + result.stderr[-3000:])
 
 
 def _current(cache: Path, owner: str) -> Path | None:
@@ -92,6 +112,11 @@ def publish_build(root: Path) -> Path:
     cache = root / ".harness" / "runtime" / "desktop-apps"
     if not cache.resolve().is_relative_to(root) or (cache.exists() and _linked(cache)):
         raise RuntimeError("Desktop launch copies must stay inside this checkout")
+    # Validate ownership with normal paths, then use native long-path I/O.
+    # Persisted identities and returned shortcut targets retain normal spelling.
+    logical_cache = cache
+    source = filesystem_path(source)
+    cache = filesystem_path(cache)
     cache.mkdir(parents=True, exist_ok=True)
     owner = _digest({"root": os.path.normcase(str(root)), "contract": CONTRACT})
     files = inventory(source)
@@ -101,7 +126,8 @@ def publish_build(root: Path) -> Path:
     previous = _current(cache, owner)
     prior = _read(previous / MANIFEST) if previous else {}
     if previous and prior == manifest and inventory(previous) == files:
-        return previous / executable
+        validate_launch(logical_cache / previous.name)
+        return logical_cache / previous.name / executable
     stage = Path(tempfile.mkdtemp(prefix=".stage-", dir=cache))
     try:
         for relative, identity in files.items():
@@ -129,6 +155,7 @@ def publish_build(root: Path) -> Path:
         name = f"build-{content}-{uuid.uuid4().hex[:12]}"
         destination = cache / name
         stage.rename(destination)
+        validate_launch(logical_cache / destination.name)
         receipt = {key: manifest[key] for key in ("schema_version", "contract", "owner_sha256", "content_sha256")}
         receipt["directory"] = name
         pending = cache / f".current-{uuid.uuid4().hex}.json"
@@ -137,7 +164,7 @@ def publish_build(root: Path) -> Path:
             os.replace(pending, cache / "current.json")
         finally:
             pending.unlink(missing_ok=True)
-        return destination / executable
+        return logical_cache / destination.name / executable
     finally:
         # This is our own unpublished temporary directory, never a live copy.
         if stage.exists() and stage.resolve().parent == cache.resolve() and stage.name.startswith(".stage-"):

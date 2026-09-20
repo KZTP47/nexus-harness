@@ -53,7 +53,7 @@ MAX_NOTES = 2_000
 MAX_NOTE_CHARS = 20_000
 DEPLOYMENT_LOCK = Path(".harness") / "desktop-deployment.lock"
 DEPLOYMENT_LOCK_OWNER = Path(".harness") / "desktop-deployment.owner.json"
-DESKTOP_CLOSEOUT_MIN_TIMEOUT_SECONDS = 900.0
+DESKTOP_CLOSEOUT_MIN_TIMEOUT_SECONDS = 1_800.0
 CURRENT_STATE_START = "<!-- nexus-managed-current:start -->"
 CURRENT_STATE_END = "<!-- nexus-managed-current:end -->"
 POST_MEMORY_LOCK = Path(INDEX_FOLDER) / "post-memory.lock"
@@ -289,6 +289,7 @@ def _is_owned_build_lock_failure(detail: str) -> bool:
         "access is denied" in folded
         or "being used by another process" in folded
         or "cannot access the file" in folded
+        or ("eperm" in folded and "operation not permitted" in folded and "rename" in folded)
     )
     return lock_wording and "win-unpacked" in folded
 
@@ -906,7 +907,8 @@ class PersistentMemoryHooks:
             raise HarnessError("The enforced Nexus Harness desktop closeout is Windows-only")
         # Ordinary test/tool commands default to a short timeout. Closeout also
         # builds a validated private runtime, may wait for legitimate consumers
-        # at its atomic swap, packages Electron/NSIS, and refreshes the shortcut.
+        # at its atomic swap, and compresses Electron, Chromium and Java into
+        # NSIS. A cold build can exceed fifteen minutes before artifact checks.
         # Give that deployment transaction its own non-escalating floor.
         timeout = max(
             float(self.config.get("execution.timeout_seconds", 3_600)),
@@ -948,6 +950,11 @@ class PersistentMemoryHooks:
 
         try:
             built = build()
+        except subprocess.TimeoutExpired as exc:
+            raise HarnessError(
+                f"Electron app and installer rebuild exceeded its {timeout:g}-second budget; "
+                "deployment is not verified and no completion note was recorded"
+            ) from exc
         except (OSError, subprocess.SubprocessError) as exc:
             raise HarnessError(f"Electron app and installer rebuild could not start: {exc}") from exc
         build_detail = f"{built.stdout}\n{built.stderr}".strip()
@@ -958,7 +965,11 @@ class PersistentMemoryHooks:
             # never kill by display name, which could hit an installed app or
             # another checkout. Then retry the gate once.
             powershell = shutil.which("powershell.exe") or shutil.which("powershell")
-            if powershell and application.is_file():
+            # Packaging can already have removed the executable before failing
+            # to rename its staging directory. The canonical owned path still
+            # identifies any process to close; absence on disk is not a waiver
+            # of the bounded retry for transient scanner/directory locks.
+            if powershell:
                 environment = dict(os.environ)
                 environment["NEXUS_CLOSEOUT_OWNED_EXE"] = str(application.resolve())
                 close_owned = subprocess.run(

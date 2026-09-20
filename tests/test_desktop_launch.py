@@ -22,9 +22,38 @@ class DesktopLaunchTests(unittest.TestCase):
         (self.source / "resources").mkdir()
         (self.source / "resources/app.js").write_text("version one", encoding="utf-8")
         self.cache = self.root / ".harness/runtime/desktop-apps"
+        validation = mock.patch.object(desktop_launch, "validate_launch")
+        self.validate_launch = validation.start()
+        self.addCleanup(validation.stop)
+
+    def test_failed_startup_does_not_select_new_copy(self):
+        self.publish()
+        receipt = (self.cache / "current.json").read_bytes()
+        (self.source / "Nexus Harness.exe").write_bytes(b"new broken runtime")
+        self.validate_launch.side_effect = RuntimeError("startup failed")
+        with self.assertRaisesRegex(RuntimeError, "startup failed"):
+            self.publish()
+        self.assertEqual((self.cache / "current.json").read_bytes(), receipt)
 
     def publish(self):
         return desktop_launch.publish_build(self.root)
+
+    def test_deep_packaged_paths_publish_and_reuse_without_machine_policy(self):
+        relative = Path("resources") / ("nested-runtime-" * 7) / ("browser-data-" * 7) / "manifest.json"
+        original = desktop_launch.filesystem_path(self.source / relative)
+        original.parent.mkdir(parents=True)
+        original.write_bytes(b"deep resource")
+        self.assertGreater(len(str(self.source / relative)), 260)
+        first = self.publish()
+        copied = desktop_launch.filesystem_path(first.parent / relative)
+        self.assertEqual(copied.read_bytes(), b"deep resource")
+        self.assertEqual(self.publish(), first)
+        self.assertFalse(str(first).startswith("\\\\?\\"))
+        (self.source / "resources/app.js").write_text("new build")
+        second = self.publish()
+        self.assertEqual(desktop_launch.filesystem_path(second.parent / relative).read_bytes(), b"deep resource")
+        # Cleanup must use the same native I/O boundary on Windows.
+        self.addCleanup(desktop_launch.shutil.rmtree, desktop_launch.filesystem_path(self.root))
 
     def test_rebuild_cannot_replace_running_copy_and_new_launch_selects_new_bytes(self):
         first = self.publish()

@@ -86,7 +86,9 @@ try {
     }
     $body = [string]$mail.Body
     if ($body.Length -gt 2000000) { throw 'An Outlook message exceeds the supported size. Move it from Inbox before retrying.' }
-    $messages += @{entry_id=[string]$id; sender=$sender; subject=[string]$mail.Subject; body=$body}
+    $received = ''
+    try { $received = [string]$mail.ReceivedTime.ToUniversalTime().ToString('o') } catch {}
+    $messages += @{entry_id=[string]$id; sender=$sender; subject=[string]$mail.Subject; body=$body; received_at=$received}
   }
   @{messages=@($messages); missing=@($missing)} | ConvertTo-Json -Depth 8 -Compress
 } catch {
@@ -227,7 +229,10 @@ class EmailClassic:
             pending = connection.get('pending')
             # Replay saved bodies before touching COM when an import was interrupted.
             if pending and cursor != pending['cursor']:
-                return {k: pending[k] for k in ('messages', 'cursor', 'warnings')}
+                # A replayed batch still has its own queue behind it, and a batch
+                # saved before this key existed must not claim an empty backlog.
+                return dict({k: pending[k] for k in ('messages', 'cursor', 'warnings')},
+                            has_more=bool(pending.get('has_more', connection.get('queue'))))
             seen = set(connection.get('seen', []))
             if pending:
                 seen.update(pending['ids'])
@@ -251,8 +256,10 @@ class EmailClassic:
                 if any(not isinstance(message.get(k), str) for k in ('sender', 'subject', 'body')) or len(message['body']) > 2_000_000:
                     raise HarnessError('Classic Outlook returned an invalid message.')
                 returned.add(entry_id)
+                received_at = message.get('received_at')
                 messages.append(dict(source_id='classic:' + _fingerprint([identity['store_id'], entry_id]),
-                    sender=message['sender'], subject=message['subject'], body=message['body']))
+                    sender=message['sender'], subject=message['subject'], body=message['body'],
+                    received_at=received_at if isinstance(received_at, str) else ''))
             missing = result.get('missing', [])
             if not isinstance(missing, list) or any(x not in selected for x in missing) or returned | set(missing) != set(selected):
                 raise HarnessError('Classic Outlook did not return the complete requested batch. Retry the connection.')
@@ -261,10 +268,11 @@ class EmailClassic:
             # them seen. A single inaccessible item cannot starve subsequent mail.
             connection['seen'] = sorted(seen & current)
             connection['queue'] = queue[len(selected):] + missing
-            batch = dict(messages=messages, cursor=uuid.uuid4().hex, warnings=warnings, ids=sorted(returned))
+            batch = dict(messages=messages, cursor=uuid.uuid4().hex, warnings=warnings, ids=sorted(returned),
+                         has_more=bool(connection['queue']))
             connection['pending'] = batch
             self._write(state)
-            return {k: batch[k] for k in ('messages', 'cursor', 'warnings')}
+            return {k: batch[k] for k in ('messages', 'cursor', 'warnings', 'has_more')}
 
     def close(self):
         """No Outlook process is owned or terminated by this adapter."""

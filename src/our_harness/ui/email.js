@@ -3,12 +3,84 @@
   'use strict';
   function createEmailStudio(root, api, options = {}) {
     const doc = root.ownerDocument;
-    const state = {snapshot: {}, localConnections: new Map(), pendingRevision: null, loaded: false, account: '', message: '', draft: '', dirty: false, busy: false, refreshing: false, refreshPromise: null, mutationRevision: 0, editRevision: null, memoryEdits: new Map(), memoryAdds: new Map(), newAccount: false, oauthRequest: '', registrationDirty: new Set(), modelByRoute: new Map(), oauthLinks: new Map(), seen: new Set(), baseline: false};
+    const state = {snapshot: {}, localConnections: new Map(), pendingRevision: null, loaded: false, account: '', message: '', draft: '', dirty: false, busy: false, refreshing: false, refreshPromise: null, mutationRevision: 0, editRevision: null, memoryEdits: new Map(), memoryAdds: new Map(), newAccount: false, providerRepair: null, oauthRequest: '', registrationDirty: new Set(), modelByRoute: new Map(), oauthLinks: new Map(), seen: new Set(), baseline: false};
     const el = (tag, text, cls) => { const node = doc.createElement(tag); if (text !== undefined) node.textContent = text; if (cls) node.className = cls; return node; };
     const by = id => root.querySelector('#' + id);
     const field = (parent, id, title, type = 'text') => { const label = el('label', title); label.htmlFor = id; const input = el(type === 'textarea' ? 'textarea' : 'input'); input.id = id; if (type !== 'textarea') input.type = type; parent.append(label, input); return input; };
     const button = (parent, id, text, handler) => { const node = el('button', text); node.id = id; node.type = 'button'; node.addEventListener('click', handler); parent.append(node); return node; };
     const select = (parent, id, title) => { const label = el('label', title); label.htmlFor = id; const node = el('select'); node.id = id; parent.append(label, node); return node; };
+    const HINTS = {
+      emailAccount: 'Choose which connected mailbox this page shows.',
+      emailNewAccount: 'Start setting up another mailbox. The current one stays connected.',
+      emailProvider: 'Choose the connected Claude or Codex route that writes your drafts.',
+      emailModel: 'Choose the model that route uses for drafting and revising.',
+      emailRefreshModels: 'Ask each connected assistant for its current model list. This sends no model request.',
+      emailProviderCheck: 'Check whether the chosen assistant is signed in, and open its sign-in window when it is not. This sends no model request.',
+      emailProviderRepairConfirm: 'Confirm before the Claude command line is signed out and signed in again.',
+      emailProviderRepairRun: 'Open Claude\u2019s own terminal to update, sign out and sign in. Nexus never sees your account or password.',
+      emailConnectionMethod: 'Choose how Nexus reaches your mailbox. The matching setup card appears below.',
+      'emailLocalOpen-browser_outlook': 'Open a Nexus browser window and sign in to Outlook there.',
+      'emailLocalOpen-browser_gmail': 'Open a Nexus browser window and sign in to Gmail there.',
+      'emailLocalOpen-classic_outlook': 'Look for mailboxes already set up in classic Outlook on this computer.',
+      'emailLocalFinish-browser_outlook': 'Tell Nexus the Outlook sign-in is done so automatic checking can start.',
+      'emailLocalFinish-browser_gmail': 'Tell Nexus the Gmail sign-in is done so automatic checking can start.',
+      'emailBrowserMode-browser_outlook': 'Choose whether later checks show the browser window or keep it hidden.',
+      'emailBrowserMode-browser_gmail': 'Choose whether later checks show the browser window or keep it hidden.',
+      'emailBrowserModeSave-browser_outlook': 'Save that choice for future Outlook checks and approved replies.',
+      'emailBrowserModeSave-browser_gmail': 'Save that choice for future Gmail checks and approved replies.',
+      'emailAutoConnect-outlook': 'Sign in to Outlook through the Microsoft API using a registration Nexus already has.',
+      'emailAutoConnect-gmail': 'Sign in to Gmail through the Google API using a registration Nexus already has.',
+      'emailConnect-outlook': 'Sign in to Outlook using the client ID saved above.',
+      'emailConnect-gmail': 'Sign in to Gmail using the client ID saved above.',
+      'emailClientId-outlook': 'Application or client ID from your Microsoft app registration.',
+      'emailClientId-gmail': 'Client ID from your Google desktop app registration.',
+      emailTenant: 'Microsoft tenant to sign in against. Leave common unless your administrator says otherwise.',
+      emailGoogleClientSecret: 'Client secret supplied with the Google registration, if there is one.',
+      emailManagedPrepare: 'Download and start a private mailbox service on this computer.',
+      emailManagedSignIn: 'Add a mailbox to that service and sign in to it.',
+      emailManagedAccounts: 'Choose which mailbox on the service to connect.',
+      emailManagedDiscover: 'List the mailboxes the service already knows about.',
+      emailManagedConnect: 'Connect the mailbox chosen above to the selected assistant.',
+      emailManagedUrl: 'Web address of the EmailEngine service, from your administrator.',
+      emailManagedToken: 'Access token for that service. It is stored locally and never shown again.',
+      emailReconnect: 'Sign in to the current mailbox again after its session expires.',
+      emailDisconnect: 'Stop checking this mailbox. Saved mail and drafts stay on this computer.',
+      emailAutoPoll: 'Let Nexus check this mailbox and prepare drafts on its own while it runs.',
+      emailAutoSeconds: 'How long to wait between automatic inbox checks, in seconds.',
+      emailSaveAssistant: 'Save the assistant, model and automatic-checking settings for this mailbox.',
+      emailEngineStart: 'Start the local workflow engine that runs drafting and sending.',
+      emailRefresh: 'Reload this page from Nexus now.',
+      emailKind: 'Choose whether this mailbox reads IMAP or only holds imported mail.',
+      emailAccountName: 'A name for this mailbox inside Nexus.',
+      emailAddress: 'The address replies are sent from.',
+      emailSync: 'Check the inbox once now instead of waiting for the next automatic check.',
+      emailInboxSearch: 'Show only the messages whose subject or sender contains this text.',
+      emailInboxSort: 'Choose the order the inbox list is shown in.',
+      emailGenerate: 'Ask the assistant to write a first reply to the selected message.',
+      emailReply: 'The version you approve. Edit it here or ask the assistant to revise it.',
+      emailRevisionRequest: 'Describe the change you want; the assistant rewrites Your reply.',
+      emailRevise: 'Send your change request and the current reply to the assistant.',
+      emailLearn: 'Save what your edits teach the assistant when you approve this reply.',
+      emailSave: 'Keep your edits without sending anything.',
+      emailRevert: 'Throw away unsaved edits and restore the last saved reply.',
+      emailDiscard: 'Delete this draft. The incoming message stays in the list.',
+      emailApprove: 'Send or export exactly the text shown in Your reply.',
+      emailRetry: 'Try drafting again after a failed attempt.',
+      emailResume: 'Finish an approved reply whose delivery step did not complete.',
+      emailDownload: 'Save the exported reply as an .eml file you can open in your mail app.',
+      emailRetryLearning: 'Try learning from this approved reply again. Nothing is resent.',
+      emailCheckDelivery: 'Ask the mailbox service what happened to this reply. Nothing is resent.',
+      emailVerifiedSendChecked: 'Tick this only after you have seen the reply in your own mailbox.',
+      emailRecordVerifiedSend: 'Record that you checked the reply arrived. Nothing is resent.',
+      emailManualLearningTab: 'Preferences you wrote or approved yourself.',
+      emailAutomaticLearningTab: 'Preferences learned from your Revise with AI requests, kept per recipient.',
+      emailSender: 'Address the imported message came from.',
+      emailSubject: 'Subject line of the imported message.',
+      emailBody: 'Text of the imported message.',
+      emailRaw: 'Paste a complete .eml message instead of filling the fields above.',
+      emailFile: 'Choose an .eml file to read the message from.'
+    };
+    function applyHints() { for (const node of root.querySelectorAll('[id]')) { const hint = HINTS[node.id]; if (hint && node.title !== hint) node.title = hint; } }
     const note = (text, error = false) => { by('emailNotice').textContent = text; by('emailNotice').classList.toggle('email-error', error); };
     const currentDraft = () => (state.snapshot.drafts || []).find(d => d.id === state.draft);
     const currentAccount = () => (state.snapshot.accounts || []).find(a => a.id === state.account);
@@ -116,6 +188,8 @@
       by('emailVerifiedSendChecked').disabled = state.busy || !mayConfirm;
       by('emailRecordVerifiedSend').disabled = state.busy || !mayConfirm || !by('emailVerifiedSendChecked').checked;
       root.querySelectorAll('button[data-learning-draft]').forEach(b => { b.disabled = state.busy || b.dataset.learningRunning === 'true'; });
+      by('emailProviderRepairPanel').hidden = !state.providerRepair;
+      by('emailProviderRepairRun').disabled = state.busy || !state.providerRepair || !by('emailProviderRepairConfirm').checked;
       renderActivity();
     }
     const heading = el('div', undefined, 'email-heading'); heading.append(el('h1', 'Email assistant'), el('p', 'Turn incoming mail into reviewed replies. Your approved edits can guide future drafts.')); root.append(heading);
@@ -312,6 +386,54 @@
     const kind = select(form, 'emailKind', 'Mailbox type'); for (const [value, text] of [['import', 'Imported mail — export replies as .eml'], ['imap', 'IMAP inbox — deliver approved replies using SMTP']]) { const o = el('option', text); o.value = value; kind.append(o); }
     field(form, 'emailAccountName', 'Mailbox name'); field(form, 'emailAddress', 'Your email address', 'email');
     const providerPicker = select(quickFields, 'emailProvider', 'AI assistant (uses your connected Claude or Codex route)'); providerPicker.addEventListener('change', () => renderModels()); const modelPicker = select(quickFields, 'emailModel', 'Model'); modelPicker.addEventListener('change', () => state.modelByRoute.set(providerPicker.value, modelPicker.value)); button(quickFields, 'emailRefreshModels', 'Refresh models', () => act('refresh_models', {}, () => ({notice: 'Refreshing model catalogs. The model list will update when the check finishes.'}))).dataset.work = '1'; quickFields.append(el('p', 'Model availability depends on your connected CLI and account. Some Claude models require a newer Claude Code version.', 'field-help email-model-help'));
+    const providerRepairBox = el('div', undefined, 'email-provider-repair');
+    const providerRepairStatus = el('p', '', 'field-help'); providerRepairStatus.id = 'emailProviderRepairStatus'; providerRepairStatus.setAttribute('role', 'status'); providerRepairStatus.setAttribute('aria-live', 'polite');
+    button(providerRepairBox, 'emailProviderCheck', 'Reconnect AI session', async () => {
+      const route = by('emailProvider').value;
+      if (!route) return note('Choose an AI assistant before checking its connection.', true);
+      if (state.busy || !state.loaded) return;
+      state.busy = true; controls(); note('Checking the AI connection\u2026');
+      try {
+        const plan = await api('/api/team/repair-plan', {method: 'POST', body: JSON.stringify({route})});
+        const repair = plan.repair || {};
+        const actions = (repair.actions || []).filter(action => action.route === route);
+        const repairable = actions.find(action => action.id === 'repair-claude');
+        state.providerRepair = repairable ? {route, fingerprint: repairable.diagnosis_fingerprint || repair.diagnosis_fingerprint || ''} : null;
+        const summary = repair.summary || plan.note || '';
+        // A route that is merely signed out needs its ordinary sign-in window, not the
+        // sign-out repair, so pressing Reconnect opens that window straight away.
+        if (actions.some(action => action.id === 'login')) {
+          const opened = await api('/api/team/login', {method: 'POST', body: JSON.stringify({route})});
+          providerRepairStatus.textContent = [summary, opened.note || 'Claude\u2019s own sign-in window is open. Finish there, then choose Reconnect AI session again.'].filter(Boolean).join(' ');
+          providerRepairStatus.classList.remove('email-error');
+          note('Finish signing in in Claude\u2019s window, then choose Reconnect AI session to check it again.');
+        } else {
+          providerRepairStatus.textContent = summary || 'This assistant reports no connection problem.';
+          providerRepairStatus.classList.toggle('email-error', !!repairable);
+          note(repairable ? 'This assistant needs a fresh sign-in. Confirm below to open Claude\u2019s own repair.' : 'Checked the AI connection.');
+        }
+      } catch (error) { state.providerRepair = null; providerRepairStatus.textContent = ''; note(error.message, true); }
+      finally { state.busy = false; controls(); }
+    }).dataset.work = '1';
+    providerRepairBox.append(providerRepairStatus);
+    const repairPanel = el('div'); repairPanel.id = 'emailProviderRepairPanel'; repairPanel.hidden = true;
+    const repairConfirm = el('input'); repairConfirm.type = 'checkbox'; repairConfirm.id = 'emailProviderRepairConfirm'; repairConfirm.addEventListener('change', controls);
+    const repairLabel = el('label', 'Sign the Claude command line out and sign in again'); repairLabel.htmlFor = repairConfirm.id;
+    repairPanel.append(repairConfirm, repairLabel, el('p', 'Claude\u2019s own terminal window handles the update and sign-in. Nexus never sees your account, password or token. Finish anything open in Claude first.', 'field-help'));
+    button(repairPanel, 'emailProviderRepairRun', 'Open Claude repair', async () => {
+      const wanted = state.providerRepair;
+      if (!wanted || !repairConfirm.checked || state.busy) return;
+      state.busy = true; controls(); note('Opening Claude\u2019s repair window\u2026');
+      try {
+        const result = await api('/api/team/repair-claude', {method: 'POST', body: JSON.stringify({route: wanted.route, diagnosis_fingerprint: wanted.fingerprint})});
+        repairConfirm.checked = false; state.providerRepair = null;
+        providerRepairStatus.textContent = result.note || 'Claude\u2019s repair opened in its own terminal.';
+        providerRepairStatus.classList.remove('email-error');
+        note('Finish the sign-in in Claude\u2019s window, then choose Reconnect AI session to check it again.');
+      } catch (error) { note(error.message, true); }
+      finally { state.busy = false; controls(); }
+    }).dataset.work = '1';
+    providerRepairBox.append(repairPanel); quickFields.append(providerRepairBox);
     const connection = el('fieldset', undefined, 'email-connection'); connection.append(el('legend', 'Mailbox connection'));
     field(connection, 'emailImapHost', 'IMAP host'); field(connection, 'emailImapPort', 'IMAP port', 'number').value = '993'; field(connection, 'emailImapFolder', 'Folder').value = 'INBOX';
     field(connection, 'emailUsername', 'Username'); const password = field(connection, 'emailPassword', 'Password / app password (leave blank to keep saved secret)', 'password'); password.autocomplete = 'new-password';
@@ -327,7 +449,14 @@
     const file = field(importForm, 'emailFile', 'Or choose an .eml file', 'file'); file.accept = '.eml,message/rfc822'; file.addEventListener('change', async () => { if (file.files[0]) raw.value = await file.files[0].text(); });
     const importButton = el('button', 'Import email'); importButton.type = 'submit'; importButton.dataset.work = '1'; importForm.append(importButton);
     importForm.addEventListener('submit', event => { event.preventDefault(); if (state.busy) return; if (state.dirty) return note('Save or revert your edits before importing another email.', true); if (!state.account) return note('Save a mailbox first.', true); act('import', {account_id: state.account, raw: raw.value || undefined, sender: by('emailSender').value, subject: by('emailSubject').value, body: by('emailBody').value}, result => { state.message = result.message?.id || ''; state.draft = (state.snapshot.drafts || []).find(d => d.message_id === state.message && d.account_id === state.account && !['discarded', 'sent', 'exported'].includes(d.status))?.id || ''; state.dirty = false; importForm.reset(); }); }); intake.append(importForm); root.append(intake);
-    const columns = el('div', undefined, 'email-columns'); const queue = el('section', undefined, 'email-queue'); queue.append(el('h2', 'Inbox & drafts')); button(queue, 'emailSync', 'Check inbox now', () => act('sync', {account_id: state.account})); const inboxStatus = el('p'); inboxStatus.id = 'emailInboxStatus'; inboxStatus.setAttribute('role', 'status'); inboxStatus.setAttribute('aria-live', 'polite'); queue.append(inboxStatus); const pollingTiming = el('p', '', 'field-help'); pollingTiming.id = 'emailPollingTiming'; queue.append(pollingTiming); const list = el('div'); list.id = 'emailQueue'; queue.append(list); columns.append(queue);
+    const columns = el('div', undefined, 'email-columns'); const queue = el('section', undefined, 'email-queue'); queue.append(el('h2', 'Inbox & drafts')); button(queue, 'emailSync', 'Check inbox now', () => act('sync', {account_id: state.account})); const inboxStatus = el('p'); inboxStatus.id = 'emailInboxStatus'; inboxStatus.setAttribute('role', 'status'); inboxStatus.setAttribute('aria-live', 'polite'); queue.append(inboxStatus); const pollingTiming = el('p', '', 'field-help'); pollingTiming.id = 'emailPollingTiming'; queue.append(pollingTiming);
+    const filters = el('div', undefined, 'email-queue-filters');
+    const inboxSearch = field(filters, 'emailInboxSearch', 'Search the inbox', 'search'); inboxSearch.placeholder = 'Subject or sender';
+    const inboxSort = select(filters, 'emailInboxSort', 'Sort by');
+    for (const [value, label] of [['newest', 'Newest first'], ['oldest', 'Oldest first'], ['sender', 'Sender A-Z'], ['subject', 'Subject A-Z']]) { const option = el('option', label); option.value = value; inboxSort.append(option); }
+    inboxSearch.addEventListener('input', () => render()); inboxSort.addEventListener('change', () => render());
+    queue.append(filters);
+    const list = el('div'); list.id = 'emailQueue'; queue.append(list); columns.append(queue);
     const review = el('section', undefined, 'email-review'); review.append(el('h2', 'Review reply')); const incoming = el('pre', 'Choose an email.'); incoming.id = 'emailIncoming'; review.append(incoming);
     button(review, 'emailGenerate', 'Create draft', () => act('create_draft', {account_id: state.account, message_id: state.message, provider_route: by('emailProvider').value, provider_model: by('emailModel').value}, result => { state.draft = result.draft?.id || state.draft; })).dataset.work = '1';
     feedback(review, 'emailGenerateStatus');
@@ -532,11 +661,29 @@
       const syncOperation = (s.operations || []).find(item => (item.id || item.kind) === 'sync:' + state.account);
       by('emailInboxStatus').textContent = syncOperation?.state === 'running' ? 'Checking inbox…' : syncOperation?.state === 'failed' ? syncOperation.error || 'Inbox check failed. Choose Check inbox now to retry.' : syncOperation?.state === 'completed' ? 'Inbox check completed' + (timestamp(syncOperation.finished_at) ? ' at ' + new Date(timestamp(syncOperation.finished_at)).toLocaleTimeString() : '') + '. Newest messages appear first.' : 'Newest messages appear first.';
       by('emailInboxStatus').classList.toggle('email-error', syncOperation?.state === 'failed');
-      by('emailQueue').replaceChildren(); const messages = (s.messages || []).filter(m => m.account_id === state.account && (!m.account_fingerprint || m.account_fingerprint === currentAccount()?.fingerprint)).sort((a, b) => (timestamp(b.received_at) || timestamp(b.imported_at) || 0) - (timestamp(a.received_at) || timestamp(a.imported_at) || 0));
-      for (const failure of (s.failed_imports || []).filter(m => m.account_id === state.account && m.account_fingerprint === currentAccount()?.fingerprint)) by('emailQueue').append(el('p', 'Message could not be imported: ' + failure.error + ' Nexus will retry on a later inbox scan.'));
+      if (currentAccount()?.sync_has_more && syncOperation?.state !== 'failed') by('emailInboxStatus').textContent = syncOperation?.state === 'running' ? 'Loading more inbox messages…' : 'More inbox messages remain. The next check continues where this one stopped.';
+      // Keep the reader's place: the list is rebuilt on every inbox refresh.
+      const keptScroll = by('emailQueue').querySelector('.email-queue-scroll')?.scrollTop || 0;
+      by('emailQueue').replaceChildren();
+      const received = m => timestamp(m.received_at) || timestamp(m.imported_at) || 0;
+      const orders = {newest: (a, b) => received(b) - received(a), oldest: (a, b) => received(a) - received(b),
+        sender: (a, b) => (a.sender || '').localeCompare(b.sender || '') || received(b) - received(a),
+        subject: (a, b) => (a.subject || '').localeCompare(b.subject || '') || received(b) - received(a)};
+      const held = (s.messages || []).filter(m => m.account_id === state.account && (!m.account_fingerprint || m.account_fingerprint === currentAccount()?.fingerprint));
+      const query = (by('emailInboxSearch')?.value || '').trim().toLowerCase();
+      const messages = held.filter(m => !query || ((m.subject || '') + ' ' + (m.sender || '')).toLowerCase().includes(query))
+        .sort(orders[by('emailInboxSort')?.value] || orders.newest);
+      const failures = (s.failed_imports || []).filter(m => m.account_id === state.account && m.account_fingerprint === currentAccount()?.fingerprint);
+      const counted = query ? 'Showing ' + messages.length + ' of ' + held.length + ' imported message' + (held.length === 1 ? '' : 's')
+        : held.length + ' imported message' + (held.length === 1 ? '' : 's');
+      by('emailQueue').append(el('p', counted + (failures.length ? '; ' + failures.length + ' conversations need another check.' : '.')));
+      if (failures.length) { const details = el('details'); details.append(el('summary', 'Show import issues (' + failures.length + ')')); for (const failure of failures) details.append(el('p', 'Message could not be imported: ' + failure.error + ' Nexus will retry on a later inbox scan.')); by('emailQueue').append(details); }
       if (state.message && !messages.some(message => message.id === state.message)) { state.message = ''; state.draft = ''; state.dirty = false; state.editRevision = null; state.pendingRevision = null; }
-       if (!messages.length) by('emailQueue').append(el('p', 'No messages yet. Import an email or check your connected inbox.'));
-      for (const m of messages) { const drafts = (s.drafts || []).filter(d => d.message_id === m.id && d.account_id === state.account); const newest = [...drafts].reverse(); const d = newest.find(d => !['discarded', 'sent', 'exported'].includes(d.status)) || newest[0]; const b = button(by('emailQueue'), '', (m.subject || '(No subject)') + '\n' + m.sender + (d ? '\n' + d.status : ''), () => { if (state.busy) return note('Wait for the current action to finish.', true); if (state.dirty) return note('Save or discard your edits before opening another email.', true); state.message = m.id; state.draft = d?.id || ''; render(); }); b.className = 'email-message'; b.setAttribute('aria-pressed', String(state.message === m.id)); }
+       if (!held.length) by('emailQueue').append(el('p', 'No messages yet. Import an email or check your connected inbox.'));
+      else if (!messages.length) by('emailQueue').append(el('p', 'No messages match your search. Clear the search box to see them all.'));
+      const scroller = el('div', undefined, 'email-queue-scroll'); if (messages.length) by('emailQueue').append(scroller);
+      for (const m of messages) { const drafts = (s.drafts || []).filter(d => d.message_id === m.id && d.account_id === state.account); const newest = [...drafts].reverse(); const d = newest.find(d => !['discarded', 'sent', 'exported'].includes(d.status)) || newest[0]; const b = button(scroller, '', (m.subject || '(No subject)') + '\n' + m.sender + (d ? '\n' + d.status : ''), () => { if (state.busy) return note('Wait for the current action to finish.', true); if (state.dirty) return note('Save or discard your edits before opening another email.', true); state.message = m.id; state.draft = d?.id || ''; render(); }); b.className = 'email-message'; b.title = 'Open this message and the reply drafted for it.'; b.setAttribute('aria-pressed', String(state.message === m.id)); }
+      scroller.scrollTop = keptScroll;
       const message = messages.find(m => m.id === state.message); by('emailIncoming').textContent = message ? 'From: ' + message.sender + '\nSubject: ' + message.subject + '\n\n' + message.body : 'Choose an email.';
       const draft = currentDraft();
       const pending = state.pendingRevision;
@@ -553,10 +700,11 @@
       renderMemories(by('emailMemories'), s.memories || [], false);
       renderMemories(by('emailAutomaticMemories'), s.automatic_memories || [], true);
       if (memoryText.dataset.account !== state.account) { memoryText.dataset.account = state.account; memoryText.value = state.memoryAdds.get(state.account) || ''; }
+      applyHints();
       controls();
     }
     async function refresh() { if (state.refreshing) return state.refreshPromise; state.refreshing = true; const revision = state.mutationRevision; state.refreshPromise = (async () => { try { const snapshot = await api('/api/email'); if (revision !== state.mutationRevision) return; state.snapshot = snapshot; lastSnapshotAt = timestamp(snapshot.captured_at) || Date.now(); state.loaded = true; if (!state.newAccount && !state.account && !by('emailAccountName').value && snapshot.accounts?.length === 1) { state.account = snapshot.accounts[0].id; render(); fillAccount(); }
-      const ready = (snapshot.drafts || []).filter(d => d.status === 'review'); const nav = doc.querySelector('[data-view="email"]'); if (nav) { nav.textContent = 'Email assistant' + (ready.length ? ' (' + ready.length + ')' : ''); nav.title = ready.length ? ready.length + ' drafts ready for review' : 'Read incoming mail, review replies, and teach your assistant'; } const newlyReady = ready.filter(d => !state.seen.has(d.id)); for (const d of ready) state.seen.add(d.id); render(); if (state.baseline && newlyReady.length) note(newlyReady.length + ' new draft' + (newlyReady.length === 1 ? '' : 's') + ' ready for review.'); state.baseline = true;
+      const ready = (snapshot.drafts || []).filter(d => d.status === 'review'); const nav = doc.querySelector('[data-view="email"]'); if (nav) { nav.textContent = 'Email assistant' + (ready.length ? ' (' + ready.length + (ready.length === 1 ? ' draft)' : ' drafts)') : ''); nav.title = ready.length ? ready.length + ' drafts ready for review' : 'Read incoming mail, review replies, and teach your assistant'; } const newlyReady = ready.filter(d => !state.seen.has(d.id)); for (const d of ready) state.seen.add(d.id); render(); if (state.baseline && newlyReady.length) note(newlyReady.length + ' new draft' + (newlyReady.length === 1 ? '' : 's') + ' ready for review.'); state.baseline = true;
     } catch (error) { note(error.message, true); } finally { state.refreshing = false; } })(); return state.refreshPromise; }
     render();
     const activityTimer = options.poll === false ? null : host.setInterval(renderActivity, 1000);
