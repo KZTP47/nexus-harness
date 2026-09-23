@@ -118,3 +118,64 @@ test("the pop-up page writes text only and the app ships every part of it", () =
   const files = require("./package.json").build.files;
   for (const needed of ["mail-notifier.js", "mail-toast-preload.js"]) assert.ok(files.includes(needed), needed);
 });
+
+test("a crashed pop-up is replaced by a fresh one instead of swallowing later notices", () => {
+  const { made, electron } = fakeElectron();
+  const notifier = new MailNotifier({ electron, page: "file:///mail-toast.html", preload: "p.js" });
+  notifier.show(notice("n-1"));
+  made[0].webContents.emit("did-finish-load");
+  made[0].visible = true;
+  made[0].webContents.emit("render-process-gone", {}, { reason: "crashed" });
+  assert.equal(made[0].destroyed, true, "the dead always-on-top window does not stay in the corner");
+  assert.equal(notifier.show(notice("n-2")), true);
+  assert.equal(made.length, 2, "the next notice builds a new pop-up");
+  made[1].webContents.emit("did-finish-load");
+  assert.deepEqual(made[1].webContents.sent.map(([, value]) => value.id), ["n-2"]);
+  // A hung page is treated the same way.
+  made[1].webContents.emit("unresponsive");
+  assert.equal(made[1].destroyed, true);
+});
+
+test("a pop-up page that never loads keeps only the newest notices and then lets the page show its own", () => {
+  const { made, electron } = fakeElectron();
+  const notifier = new MailNotifier({ electron, page: "file:///mail-toast.html", preload: "p.js" });
+  for (let n = 1; n <= 1000; n += 1) notifier.show(notice("n-" + n));
+  assert.deepEqual(notifier.waiting.map(item => item.id), ["n-998", "n-999", "n-1000"], "the wait queue is bounded");
+  // A subframe failure is not the pop-up page failing.
+  made[0].webContents.emit("did-fail-load", {}, -2, "failed", "about:blank", false);
+  assert.equal(made[0].destroyed, false);
+  made[0].webContents.emit("did-fail-load", {}, -6, "file not found", "file:///mail-toast.html", true);
+  assert.equal(made[0].destroyed, true);
+  assert.deepEqual(notifier.waiting, []);
+  assert.equal(notifier.show(notice("n-1001")), true, "one more attempt with a fresh pop-up");
+  made[1].webContents.emit("did-fail-load", {}, -6, "file not found", "file:///mail-toast.html", true);
+  assert.equal(notifier.show(notice("n-1002")), false, "after repeated failures the caller falls back to its in-page card");
+  assert.equal(made.length, 2, "no endless stream of broken windows");
+});
+
+test("a pop-up that loaded once and later crashed is still retried", () => {
+  const { made, electron } = fakeElectron();
+  const notifier = new MailNotifier({ electron, page: "file:///mail-toast.html", preload: "p.js" });
+  for (let round = 0; round < 4; round += 1) {
+    assert.equal(notifier.show(notice("n-" + round)), true);
+    made[round].webContents.emit("did-finish-load");
+    made[round].webContents.emit("render-process-gone", {}, { reason: "oom" });
+  }
+  assert.equal(made.length, 4);
+});
+
+test("destroying the pop-up while its page loads does not leave an unhandled rejection", async () => {
+  const { made, electron } = fakeElectron();
+  electron.BrowserWindow.prototype.loadURL = function loadURL() { return Promise.reject(new Error("ERR_ABORTED (-3)")); };
+  const unhandled = [];
+  const listener = reason => unhandled.push(reason);
+  process.on("unhandledRejection", listener);
+  try {
+    const notifier = new MailNotifier({ electron, page: "file:///mail-toast.html", preload: "p.js" });
+    notifier.show(notice("n-1"));
+    notifier.close();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(unhandled, []);
+    assert.equal(made[0].destroyed, true);
+  } finally { process.off("unhandledRejection", listener); }
+});

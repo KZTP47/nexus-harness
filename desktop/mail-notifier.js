@@ -10,6 +10,12 @@ const TOAST_WIDTH = 368;
 const MARGIN = 16;
 const MAX_HEIGHT = 480;
 const ID_PATTERN = /^[A-Za-z0-9:_-]{1,128}$/;
+// The page shows at most three cards, so only the newest few need to wait
+// for it to load.
+const MOST_WAITING = 3;
+// After this many pop-ups in a row broke before showing anything, report
+// failure so the page shows its own in-page card instead.
+const MOST_BROKEN = 2;
 
 function clean(value, limit) {
   return String(value ?? "")
@@ -55,6 +61,7 @@ class MailNotifier {
     this.loaded = false;
     this.waiting = [];
     this.shown = new Map();
+    this.broken = 0;
   }
 
   owns(sender) {
@@ -64,13 +71,17 @@ class MailNotifier {
   show(raw) {
     const notice = sanitizeNotice(raw);
     if (!notice) return false;
+    if (this.broken >= MOST_BROKEN) return false;
     this.shown.set(notice.id, notice);
     // Remember only what is still on screen or about to be.
     while (this.shown.size > 50) this.shown.delete(this.shown.keys().next().value);
     const target = this.ensureWindow();
     if (!target) return false;
     if (this.loaded) target.webContents.send("mail-toast:show", notice);
-    else this.waiting.push(notice);
+    else {
+      this.waiting.push(notice);
+      this.waiting.splice(0, Math.max(0, this.waiting.length - MOST_WAITING));
+    }
     return true;
   }
 
@@ -116,6 +127,7 @@ class MailNotifier {
     created.webContents.once("did-finish-load", () => {
       if (this.window !== created) return;
       this.loaded = true;
+      this.broken = 0;
       for (const notice of this.waiting.splice(0)) created.webContents.send("mail-toast:show", notice);
     });
     created.on("closed", () => {
@@ -124,8 +136,27 @@ class MailNotifier {
         this.loaded = false;
       }
     });
-    created.loadURL(this.page);
+    // A pop-up whose page crashed, hangs or never loaded would otherwise sit in
+    // the corner for the rest of the session and swallow every later notice.
+    // Drop it so the next notice builds a fresh one.
+    const discard = () => this.discard(created);
+    created.webContents.on("render-process-gone", discard);
+    created.webContents.on("unresponsive", discard);
+    created.webContents.on("did-fail-load", (_event, _code, _description, _url, isMainFrame) => {
+      if (isMainFrame !== false) discard();
+    });
+    // Destroying the pop-up while its page loads rejects the load; that is expected.
+    Promise.resolve(created.loadURL(this.page)).catch(() => {});
     return created;
+  }
+
+  discard(created) {
+    if (this.window !== created) return;
+    if (!this.loaded) this.broken += 1;
+    this.window = null;
+    this.loaded = false;
+    this.waiting = [];
+    if (!created.isDestroyed()) created.destroy();
   }
 
   // The page reports how tall its stack is. The window grows upward from the
