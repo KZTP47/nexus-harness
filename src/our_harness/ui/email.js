@@ -3,7 +3,7 @@
   'use strict';
   function createEmailStudio(root, api, options = {}) {
     const doc = root.ownerDocument;
-    const state = {snapshot: {}, localConnections: new Map(), pendingRevision: null, loaded: false, account: '', message: '', draft: '', dirty: false, busy: false, refreshing: false, refreshPromise: null, mutationRevision: 0, editRevision: null, memoryEdits: new Map(), memoryAdds: new Map(), newAccount: false, providerRepair: null, oauthRequest: '', registrationDirty: new Set(), modelByRoute: new Map(), oauthLinks: new Map(), seen: new Set(), baseline: false};
+    const state = {snapshot: {}, localConnections: new Map(), pendingRevision: null, loaded: false, account: '', message: '', draft: '', dirty: false, busy: false, refreshing: false, refreshPromise: null, mutationRevision: 0, editRevision: null, editBase: null, memoryEdits: new Map(), memoryAdds: new Map(), newAccount: false, providerRepair: null, oauthRequest: '', registrationDirty: new Set(), modelByRoute: new Map(), oauthLinks: new Map(), seen: new Set(), baseline: false};
     const el = (tag, text, cls) => { const node = doc.createElement(tag); if (text !== undefined) node.textContent = text; if (cls) node.className = cls; return node; };
     const by = id => root.querySelector('#' + id);
     const field = (parent, id, title, type = 'text') => { const label = el('label', title); label.htmlFor = id; const input = el(type === 'textarea' ? 'textarea' : 'input'); input.id = id; if (type !== 'textarea') input.type = type; parent.append(label, input); return input; };
@@ -64,7 +64,7 @@
       emailSave: 'Keep your edits without sending anything.',
       emailRevert: 'Throw away unsaved edits and restore the last saved reply.',
       emailDiscard: 'Delete this draft. The incoming message stays in the list.',
-      emailApprove: 'Send or export exactly the text shown in Your reply.',
+      emailApprove: 'Open the mail draft to review your reply before sending or exporting.',
       emailRetry: 'Try drafting again after a failed attempt.',
       emailResume: 'Finish an approved reply whose delivery step did not complete.',
       emailDownload: 'Save the exported reply as an .eml file you can open in your mail app.',
@@ -84,6 +84,9 @@
     const note = (text, error = false) => { by('emailNotice').textContent = text; by('emailNotice').classList.toggle('email-error', error); };
     const currentDraft = () => (state.snapshot.drafts || []).find(d => d.id === state.draft);
     const currentAccount = () => (state.snapshot.accounts || []).find(a => a.id === state.account);
+    const canEditDraft = draft => draft?.status === 'review' || (draft?.status === 'approved' && !!draft.error && ['browser_outlook', 'browser_gmail'].includes(currentAccount()?.kind));
+    let sendVersion = 'edited', versionDraft = '';
+
     let lastSnapshotAt = 0;
     let activeRequest = null;
     let deliveryConfirmationKey = '';
@@ -112,12 +115,12 @@
         let phase = '', text = '', start = timestamp(op?.started_at);
         const failed = requestErrors.get(kind + ':' + state.draft);
         if (kind === 'approve' && draft?.status === 'delivery_unknown') { phase = 'unknown'; text = 'Sending is not confirmed. Check your mailbox; this reply will not be resent automatically.'; }
-        else if (request) { phase = 'running'; text = 'Requesting ' + (kind === 'draft' ? 'a draft' : kind === 'revise' ? 'AI revision' : 'approval') + '…'; start = request.started; }
+        else if (request) { phase = 'running'; text = request.preparing ? (kind === 'revise' ? 'Checking draft readiness…' : 'Checking mailbox and preparing the original reply…') : 'Requesting ' + (kind === 'draft' ? 'a draft' : kind === 'revise' ? 'AI revision' : 'approval') + '…'; start = request.started; }
         else if (kind === 'approve' && ['sent', 'exported'].includes(draft?.status)) { phase = 'complete'; text = draft.status === 'exported' ? 'Reply exported; sending is not confirmed.' : draft.delivery_status === 'user_confirmed' ? 'You verified this reply was sent.' : 'Send action accepted; recipient delivery is not confirmed.'; }
         else if (kind === 'draft' && draft?.status === 'review') { phase = 'complete'; text = 'Draft ready to review.'; }
-        else if (op?.state === 'failed' || failed) { phase = 'failed'; text = op?.error || failed || 'This action failed. Your saved reply is preserved.'; }
+        else if (op?.state === 'failed' || failed) { phase = 'failed'; text = failed || (op?.error ? 'Previous attempt: ' + op.error : 'This action failed. Your saved reply is preserved.'); }
         else if (op?.state === 'running') { phase = 'running'; const preparation = ['draft:', 'approve:'].some(prefix => String(op.id || op.kind).startsWith(prefix)); text = 'Last reported: ' + (preparation ? 'starting the workflow' : verb.toLowerCase()) + '…'; }
-        else if (draft?.error && ((kind === 'draft' && draft.status === 'error') || (kind === 'approve' && draft.approved_at))) { phase = 'failed'; text = draft.error; }
+        else if (draft?.error && ((kind === 'draft' && draft.status === 'error') || (kind === 'approve' && draft.approved_at))) { phase = 'failed'; text = 'Previous attempt: ' + draft.error; }
         else if (kind === 'draft' && draft?.status === 'queued') { phase = 'queued'; text = 'Draft queued. Waiting for the workflow to start.'; }
         else if (kind === 'draft' && draft?.status === 'generating') { phase = 'waiting'; text = 'Draft generation was started. Waiting for a current activity report.'; }
         else if (kind === 'revise' && state.pendingRevision?.id === state.draft) { phase = 'queued'; text = 'Revision requested. Waiting for the AI workflow.'; }
@@ -164,19 +167,48 @@
       catch (error) { if (kind) requestErrors.set(kind + ':' + (activeRequest?.draft || state.draft), error.message); note(error.message, true); }
       finally { activeRequest = null; state.busy = false; controls(); }
     }
+    async function preflightDraft(intent) {
+      if (state.busy || !state.loaded) return false;
+      const identity = state.draft, account = state.account, text = reply.value, base = state.editBase, wasDirty = state.dirty;
+      const kind = intent === 'send' ? 'approve' : 'revise';
+      state.busy = true; state.dirty = true; state.mutationRevision += 1;
+      activeRequest = {kind, draft: identity, started: Date.now(), preparing: true};
+      requestErrors.delete(kind + ':' + identity); controls();
+      try {
+        if (state.refreshPromise) await state.refreshPromise;
+        await refresh();
+        const draft = currentDraft();
+        if (state.account !== account || draft?.id !== identity || !['review', 'approved'].includes(draft.status)) throw new Error('This reply is no longer available for editing or sending. Your text is preserved.');
+        // Metadata-only changes and an already-saved copy can be reconciled.
+        // A genuinely different saved edit must not be silently overwritten.
+        if (state.editRevision !== draft.revision && draft.edited !== base && draft.edited !== text) throw new Error('A different version was saved while you were editing. Your text is preserved. Review the saved version before replacing it.');
+        state.editRevision = draft.revision; state.editBase = draft.edited;
+        const result = await post('prepare_draft', {account_id: account, draft_id: identity, revision: draft.revision, intent, text: intent === 'send' && sendVersion === 'original' ? draft.original : text});
+        const prepared = result.draft || draft;
+        state.editRevision = prepared.revision; state.editBase = prepared.edited;
+        await refresh();
+        requestErrors.delete('approve:' + identity); requestErrors.delete('revise:' + identity);
+        return true;
+      } catch (error) { requestErrors.set(kind + ':' + identity, error.message); note(error.message, true); return false; }
+      finally { if (!wasDirty && reply.value === text && currentDraft()?.edited === text) state.dirty = false; activeRequest = null; state.busy = false; controls(); }
+    }
     function controls() {
       root.querySelectorAll('button').forEach(button => { button.disabled = button.id !== 'emailRefresh' && !state.loaded; });
       for (const kind of ['browser_outlook', 'browser_gmail']) by('emailBrowserMode-' + kind).disabled = state.busy || !state.loaded;
       if (!state.loaded) return;
       root.querySelectorAll('button[data-work]').forEach(b => { b.disabled = state.busy; });
-      const draft = currentDraft(); const editable = draft?.status === 'review';
+      by('emailComposeSend').disabled = state.busy || composeSending; by('emailComposeCancel').disabled = composeSending;
+      const draft = currentDraft(); const editable = canEditDraft(draft);
       const revising = (!!state.pendingRevision && state.pendingRevision.id === state.draft) || running('revise');
       for (const id of ['emailSave', 'emailApprove', 'emailRevise']) by(id).disabled = state.busy || !editable || revising;
       by('emailRevisionRequest').disabled = state.busy || !editable || revising;
       by('emailDiscard').disabled = state.busy || revising || !['queued', 'review', 'error', 'approved'].includes(draft?.status); by('emailRevert').disabled = state.busy || revising || !state.dirty; by('emailReply').disabled = state.busy || !editable || revising; by('emailRetry').hidden = draft?.status !== 'error'; by('emailResume').hidden = draft?.status !== 'approved'; by('emailDownload').hidden = draft?.status !== 'exported'; by('emailRetryLearning').hidden = !draft?.learning_error;
       by('emailGenerate').disabled = state.busy || !state.message || !state.account || state.dirty;
       by('emailGenerate').disabled ||= running('draft') || ['queued', 'generating'].includes(draft?.status);
-      by('emailApprove').disabled ||= running('approve');
+      by('emailApprove').disabled = state.busy || revising || running('approve') || (!editable && draft?.status !== 'approved');
+      by('emailResume').hidden = true;
+      for (const id of ['emailUseOriginal', 'emailUseEdited']) by(id).disabled = state.busy || !editable || revising || running('approve');
+      showSendVersion();
       by('emailResume').disabled ||= running('approve');
       by('emailRetry').disabled ||= running('draft');
       by('emailSync').disabled = state.busy || !state.account || !['imap', 'outlook', 'gmail', 'browser_outlook', 'browser_gmail', 'classic_outlook', 'emailengine'].includes(currentAccount()?.kind);
@@ -463,12 +495,26 @@
     const draftStatus = el('p'); draftStatus.id = 'emailDraftStatus'; draftStatus.setAttribute('role', 'status'); review.append(draftStatus);
     const recipient = el('p'); recipient.id = 'emailReplyRecipient'; review.append(recipient);
     const comparison = el('div', undefined, 'email-comparison'); const originalBox = el('div'); originalBox.append(el('h3', 'Original AI draft'), el('p', 'Read-only initial suggestion, kept here for comparison. Edit the copy in Your reply.', 'field-help')); const original = el('pre'); original.id = 'emailOriginal'; original.setAttribute('aria-label', 'Read-only original AI suggestion'); originalBox.append(original); comparison.append(originalBox);
-    const editedBox = el('div'); const reply = field(editedBox, 'emailReply', 'Your reply', 'textarea'); const replyHelp = el('p', 'Starts as a copy of the AI suggestion. Edit this text yourself or ask the AI to revise it. This is the version you approve.', 'field-help'); replyHelp.id = 'emailReplyHelp'; reply.setAttribute('aria-describedby', 'emailReplyHelp'); editedBox.insertBefore(replyHelp, reply); reply.rows = 14; reply.addEventListener('input', () => { state.dirty = true; showDiff(); controls(); }); comparison.append(editedBox); review.append(comparison);
+    const editedBox = el('div'); const reply = field(editedBox, 'emailReply', 'Your reply', 'textarea'); const replyHelp = el('p', 'Starts as a copy of the AI suggestion. Edit this text yourself or ask the AI to revise it. Select Send your reply to send this version.', 'field-help'); replyHelp.id = 'emailReplyHelp'; reply.setAttribute('aria-describedby', 'emailReplyHelp'); editedBox.insertBefore(replyHelp, reply); reply.rows = 14; reply.addEventListener('input', () => { state.dirty = true; sendVersion = 'edited'; showDiff(); controls(); }); comparison.append(editedBox); review.append(comparison);
+    for (const [parent, id, value, title] of [[originalBox, 'emailUseOriginal', 'original', 'Send original AI draft'], [editedBox, 'emailUseEdited', 'edited', 'Send your reply']]) {
+      const choice = el('input'); choice.type = 'radio'; choice.name = 'emailSendVersion'; choice.id = id; choice.value = value;
+      const label = el('label', title, 'email-version-choice'); label.append(choice); parent.prepend(label);
+      choice.addEventListener('change', () => { if (choice.checked) { sendVersion = value; showSendVersion(); } });
+    }
+    const versionNotice = el('p', '', 'email-version-notice'); versionNotice.id = 'emailSendVersionNotice'; versionNotice.setAttribute('role', 'status'); comparison.after(versionNotice);
+    function showSendVersion() {
+      if (versionDraft !== state.draft) { versionDraft = state.draft; sendVersion = 'edited'; }
+      by('emailUseOriginal').checked = sendVersion === 'original'; by('emailUseEdited').checked = sendVersion === 'edited';
+      originalBox.classList.toggle('email-selected-version', sendVersion === 'original'); editedBox.classList.toggle('email-selected-version', sendVersion === 'edited');
+      versionNotice.textContent = 'Selected for sending: ' + (sendVersion === 'original' ? 'Original AI draft' : 'Your reply') + '. You will review this exact text in the mail window.';
+    }
     const revisionBox = el('div', undefined, 'email-revision');
     field(revisionBox, 'emailRevisionRequest', 'Ask the AI to change this reply', 'textarea').placeholder = 'For example: make it shorter and friendlier, but keep the proposed date.';
     button(revisionBox, 'emailRevise', 'Revise with AI', async () => {
-      const draft = currentDraft(); const instruction = by('emailRevisionRequest').value.trim();
+      let draft = currentDraft(); const instruction = by('emailRevisionRequest').value.trim();
       if (!draft || !instruction) return note('Describe the change you want the AI to make.', true);
+      if (!await preflightDraft('revise')) return;
+      draft = currentDraft();
       const submitted = {id: draft.id, text: reply.value, revision: state.editRevision ?? draft.revision};
       await act('revise_draft', {account_id: state.account, draft_id: draft.id, revision: submitted.revision, text: submitted.text, instruction, provider_route: by('emailProvider').value, provider_model: by('emailModel').value}, () => { state.pendingRevision = submitted; state.dirty = true; return {notice: 'The AI is revising your current reply. You can review the result before approving it.'}; });
     }); feedback(revisionBox, 'emailRevisionStatus'); const automaticStatus = el('p', '', 'field-help'); automaticStatus.id = 'emailAutomaticLearningStatus'; automaticStatus.setAttribute('role', 'status'); revisionBox.append(automaticStatus); review.append(revisionBox);
@@ -477,7 +523,60 @@
     const oneOff = el('p', 'This controls learning from edits when you approve. Revise with AI learns separately in the AUTOMATICALLY tab. For a one-off AI change, say “for this reply only” in your request.', 'field-help'); review.append(oneOff);
     button(review, 'emailSave', 'Save edits', () => draftAction('save_draft')); button(review, 'emailRevert', 'Revert unsaved edits', () => { state.dirty = false; render(); note('Restored the saved reply.'); });
     button(review, 'emailDiscard', 'Discard draft', () => draftAction('discard_draft'));
-    button(review, 'emailApprove', 'Approve & export reply', () => draftAction('approve_draft'));
+    const compose = el('dialog', undefined, 'email-compose'); compose.id = 'emailCompose'; compose.setAttribute('aria-labelledby', 'emailComposeTitle');
+    const composeTitle = el('h2', 'Review your email'); composeTitle.id = 'emailComposeTitle'; compose.append(composeTitle);
+    const composeAddresses = el('div', undefined, 'email-compose-addresses');
+    const fromBox = el('div'), toBox = el('div'); composeAddresses.append(fromBox, toBox); compose.append(composeAddresses);
+    const composeFrom = field(fromBox, 'emailComposeFrom', 'From'); composeFrom.readOnly = true;
+    const composeTo = field(toBox, 'emailComposeTo', 'To'); composeTo.readOnly = true;
+    const composeSubject = field(compose, 'emailComposeSubject', 'Subject'); composeSubject.readOnly = true;
+    const composeVersion = select(compose, 'emailComposeVersion', 'Version to send');
+    for (const [value, title] of [['original', 'Original AI draft'], ['edited', 'Your reply']]) { const option = el('option', title); option.value = value; composeVersion.append(option); }
+    composeVersion.addEventListener('change', () => { sendVersion = composeVersion.value; composeBody.value = sendVersion === 'original' ? currentDraft().original : reply.value; showSendVersion(); });
+    const composeBody = field(compose, 'emailComposeBody', 'Message', 'textarea'); composeBody.rows = 14;
+    compose.append(el('p', 'From, To and Subject belong to the original conversation. Review the message before sending.', 'field-help'));
+    let composeBinding = null, composeSending = false;
+    composeBody.addEventListener('input', () => {
+      if (!composeSending && composeBinding?.id === state.draft && composeBinding.account === state.account) {
+        reply.value = composeBody.value; state.dirty = true; sendVersion = 'edited'; composeVersion.value = 'edited'; showSendVersion(); showDiff();
+      }
+    });
+    const composeError = el('p'); composeError.setAttribute('role', 'alert'); compose.append(composeError);
+    button(compose, 'emailComposeSend', 'Send', async () => {
+      if (composeSending || state.busy || !composeBinding) return;
+      const draft = currentDraft();
+      if (state.account !== composeBinding.account || draft?.id !== composeBinding.id || draft?.revision !== composeBinding.revision || draft?.status !== composeBinding.status) {
+        composeError.textContent = 'This draft changed. Cancel and reopen it to review the latest version.'; return;
+      }
+      if (!composeBody.value.trim()) { composeError.textContent = 'Enter a message before sending.'; return; }
+      if (!composeBinding.resume) { reply.value = composeBody.value; state.dirty = true; }
+      composeSending = true; composeBody.disabled = true; composeVersion.disabled = true; controls();
+      const result = composeBinding.resume ? await act('resume_draft', {account_id: state.account, draft_id: draft.id}) : await draftAction('approve_draft');
+      composeSending = false; composeBody.disabled = false; composeVersion.disabled = !!composeBinding?.resume;
+      if (result) compose.close();
+      else composeError.textContent = by('emailNotice').textContent;
+      controls();
+    });
+    button(compose, 'emailComposeCancel', 'Cancel', () => { if (!composeSending) compose.close(); });
+    compose.addEventListener('cancel', event => { if (composeSending) event.preventDefault(); });
+    compose.addEventListener('close', () => { composeBinding = null; by('emailApprove').focus(); });
+    root.append(compose);
+    button(review, 'emailApprove', 'Approve & export reply', async () => {
+      if (!currentDraft() || state.busy || compose.open) return;
+      if (!await preflightDraft('send')) return;
+      const draft = currentDraft(), account = currentAccount();
+      const message = (state.snapshot.messages || []).find(m => m.id === draft.message_id && m.account_id === state.account);
+      if (!message) return note('The original message is unavailable.', true);
+      composeBinding = {account: state.account, id: draft.id, revision: draft.revision, status: draft.status, resume: !canEditDraft(draft)};
+      composeFrom.value = account?.email || ''; composeTo.value = message.reply_to || message.sender || '';
+      composeSubject.value = /^re:/i.test(message.subject || '') ? message.subject : 'Re: ' + (message.subject || '');
+      if (composeBinding.resume) sendVersion = 'edited';
+      composeVersion.value = sendVersion; composeVersion.disabled = composeBinding.resume; composeBody.readOnly = composeBinding.resume;
+      composeBody.value = sendVersion === 'original' ? draft.original : reply.value; composeError.textContent = '';
+      showSendVersion();
+      by('emailComposeSend').textContent = ['classic_outlook', 'import'].includes(account?.kind) ? 'Export reply' : 'Send';
+      compose.showModal(); composeBody.focus();
+    });
     feedback(review, 'emailSendStatus');
     const manualDelivery = el('div', undefined, 'email-manual-confirmation'); manualDelivery.id = 'emailManualDeliveryConfirmation'; manualDelivery.hidden = true;
     const verifiedSend = el('input'); verifiedSend.type = 'checkbox'; verifiedSend.id = 'emailVerifiedSendChecked'; verifiedSend.addEventListener('change', controls);
@@ -638,7 +737,7 @@
       }
     }
 
-    async function draftAction(action) { const d = currentDraft(); if (!d) return; const text = reply.value; const browserSend = action === 'approve_draft' && ['browser_outlook', 'browser_gmail'].includes(currentAccount()?.kind); await act(action, {account_id: state.account, draft_id: d.id, revision: state.editRevision ?? d.revision, text, learn: learn.checked, ...(browserSend ? {approval_contract: 'browser-send/v1'} : {})}, () => { state.dirty = false; }); }
+    async function draftAction(action) { const d = currentDraft(); if (!d) return; const text = reply.value; const browserSend = action === 'approve_draft' && ['browser_outlook', 'browser_gmail'].includes(currentAccount()?.kind); return await act(action, {account_id: state.account, draft_id: d.id, revision: state.editRevision ?? d.revision, text, learn: learn.checked, ...(browserSend ? {approval_contract: 'browser-send/v1'} : {})}, () => { state.dirty = false; }); }
     function render() {
       const s = state.snapshot;
       renderConnections();
@@ -692,10 +791,10 @@
         if (operation?.state === 'failed') { if (draft.edited === pending.text) state.editRevision = draft.revision; state.pendingRevision = null; note(operation.error || 'AI revision failed. Your edits are preserved.', true); }
         else if (draft.revision > pending.revision && draft.status === 'review' && operation?.state !== 'running') { if (reply.value === pending.text) state.dirty = false; state.pendingRevision = null; by('emailRevisionRequest').value = ''; }
       }
-      by('emailOriginal').textContent = draft?.original || ''; if (!state.dirty) { reply.value = draft?.edited ?? draft?.original ?? ''; state.editRevision = draft?.revision ?? null; }
+      by('emailOriginal').textContent = draft?.original || ''; if (!state.dirty) { reply.value = draft?.edited ?? draft?.original ?? ''; state.editRevision = draft?.revision ?? null; state.editBase = draft?.edited ?? draft?.original ?? ''; }
       by('emailDraftStatus').textContent = draft ? 'Status: ' + ({submitted: 'Queued with the mailbox service; sending is not yet confirmed', delivery_unknown: 'Sending outcome is uncertain. Check status; do not resend automatically.', sent: draft.delivery_status === 'user_confirmed' ? 'You verified this reply was sent' : draft.delivery_status === 'browser_confirmed' ? 'Mailbox UI accepted the send action; recipient delivery is not confirmed' : 'Accepted for sending; recipient delivery is not confirmed', exported: 'Exported only; sending is not confirmed'}[draft.status] || draft.status) + (draft.error ? '\n' + draft.error : '') + (draft.learning_error ? '\nLearning failed: ' + draft.learning_error : '') : 'No draft yet.';
-      by('emailReplyRecipient').textContent = message ? 'Reply to: ' + (message.reply_to || message.sender) + (['classic_outlook', 'import'].includes(currentAccount()?.kind) ? '. Approval exports the text currently shown in Your reply.' : '. Approval sends exactly the text currently shown in Your reply.') : '';
-      by('emailApprove').textContent = ['imap', 'outlook', 'gmail', 'emailengine', 'browser_outlook', 'browser_gmail'].includes(currentAccount()?.kind) ? 'Approve & send reply' : 'Approve & export reply';
+      by('emailReplyRecipient').textContent = message ? 'Reply to: ' + (message.reply_to || message.sender) + (['classic_outlook', 'import'].includes(currentAccount()?.kind) ? '. Choose the version below, then review the exact message before exporting.' : '. Choose the version below, then review the exact message before sending.') : '';
+      by('emailApprove').textContent = ['imap', 'outlook', 'gmail', 'emailengine', 'browser_outlook', 'browser_gmail'].includes(currentAccount()?.kind) ? 'Review & send reply' : 'Review & export reply';
       by('emailDelivery').textContent = draft?.status === 'sent' && draft.delivery_status === 'user_confirmed' ? 'Sent status is based on your confirmation.' : ['browser_outlook', 'browser_gmail'].includes(currentAccount()?.kind) && draft?.status === 'delivery_unknown' ? 'The browser could not confirm sending. Check the Sent folder in your mailbox before taking further action. Nexus will not automatically resend this reply.' : draft?.export_path ? 'Reply exported: ' + draft.export_path : (['imap', 'outlook', 'gmail', 'emailengine', 'browser_outlook', 'browser_gmail'].includes(currentAccount()?.kind) ? 'Approval authorizes this reply to be sent through the connected mailbox.' : 'Approval creates an .eml reply you can open in your mail application.'); showDiff();
       renderMemories(by('emailMemories'), s.memories || [], false);
       renderMemories(by('emailAutomaticMemories'), s.automatic_memories || [], true);

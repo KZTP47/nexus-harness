@@ -35,6 +35,10 @@ class LocalAdapter:
     def snapshot(self):
         return [dict(self.connection)]
 
+    def prepare_reply(self, identity, incoming, body, submission_id):
+        self.prepared = (identity, incoming, body, submission_id)
+        return {'status': 'ready'}
+
     def submit_reply(self, identity, incoming, body, submission_id):
         self.sent.append((identity, incoming, body, submission_id))
         if isinstance(self.send_result, Exception):
@@ -319,9 +323,81 @@ class LocalWorkflowTests(unittest.TestCase):
         self.assertEqual(self.studio.finalize_draft(draft['id'])['draft']['status'], 'sent')
         self.assertEqual(self.adapter.sent[0][3], self.adapter.sent[1][3])
 
+    def test_browser_unknown_preserves_safe_worker_failure_stage(self):
+        draft = self.approve(self.draft())
+        reason = 'The browser stopped while confirming the sent reply. Check Sent mail; Nexus will not resend this approval automatically.'
+        self.adapter.send_result = {'status': 'unknown', 'error': reason}
+        with self.assertRaisesRegex(HarnessError, 'confirming the sent reply'):
+            self.studio.finalize_draft(draft['id'])
+        current = self.studio._get('draft', draft['id'])
+        self.assertEqual(current['status'], 'delivery_unknown')
+        self.assertEqual(current['error'], reason)
+
+    def test_definitely_unsent_browser_reply_can_reapprove_another_version(self):
+        draft = self.approve(self.draft())
+        self.adapter.send_result = {'status': 'not_sent', 'error': 'Reply not ready'}
+        with self.assertRaisesRegex(HarnessError, 'Reply not ready'):
+            self.studio.finalize_draft(draft['id'])
+        failed = self.studio._get('draft', draft['id'])
+        payload = dict(account_id=self.account['id'], draft_id=draft['id'], revision=failed['revision'],
+                       text=failed['original'], learn=False, approval_contract='browser-send/v1')
+        approved = self.studio.dispatch('approve_draft', payload)['draft']
+        self.assertEqual(approved['edited'], failed['original'])
+        self.assertFalse(approved['error'])
+        with self.assertRaises(HarnessError):
+            self.studio.dispatch('approve_draft', payload)
+        self.adapter.send_result = {'status': 'sent'}
+        self.assertEqual(self.studio.finalize_draft(draft['id'])['draft']['status'], 'sent')
+        self.assertEqual(self.adapter.sent[-1][2], failed['original'])
+        self.assertEqual(self.adapter.sent[0][3], self.adapter.sent[-1][3])
+
+    def test_unknown_delivery_cannot_be_edited_or_reapproved_even_with_error(self):
+        draft = self.approve(self.draft())
+        self.adapter.send_result = {'status': 'unknown'}
+        with self.assertRaises(HarnessError):
+            self.studio.finalize_draft(draft['id'])
+        for action in ('save_draft', 'approve_draft'):
+            with self.subTest(action=action), self.assertRaises(HarnessError):
+                self.studio.dispatch(action, dict(account_id=self.account['id'], draft_id=draft['id'],
+                    revision=draft['revision'], text='Different reply', approval_contract='browser-send/v1'))
+        self.assertEqual(len(self.adapter.sent), 1)
+
+    def test_preflight_recovers_failed_approval_without_sending_and_clears_old_jobs(self):
+        draft = self.approve(self.draft())
+        self.adapter.send_result = {'status': 'not_sent', 'error': 'Old Reply control failure'}
+        with self.assertRaises(HarnessError):
+            self.studio.finalize_draft(draft['id'])
+        service = self.service()
+        service._jobs['finalize:' + draft['id']] = {'state': 'failed', 'error': 'Old Reply control failure'}
+        prepared = service.dispatch('prepare_draft', dict(account_id=self.account['id'], draft_id=draft['id'],
+            revision=draft['revision'], intent='send', text='Visible reply'))['draft']
+        self.assertEqual(len(self.adapter.sent), 1)
+        self.assertEqual(self.adapter.prepared[2], 'Visible reply')
+        self.assertEqual(prepared['status'], 'review')
+        self.assertNotIn('approved_at', prepared)
+        self.assertFalse(prepared['error'])
+        self.assertNotIn('finalize:' + draft['id'], service._jobs)
+
+    def test_revision_preflight_and_direct_revision_reopen_definitely_unsent_approval(self):
+        for preflight in (False, True):
+            with self.subTest(preflight=preflight):
+                draft = self.approve(self.draft())
+                self.adapter.send_result = {'status': 'not_sent', 'error': 'Reply unavailable'}
+                with self.assertRaises(HarnessError):
+                    self.studio.finalize_draft(draft['id'])
+                payload = dict(account_id=self.account['id'], draft_id=draft['id'], revision=draft['revision'],
+                               intent='revise', text='Keep this text', instruction='Make it concise')
+                if preflight:
+                    self.studio.prepare_draft(payload)
+                result = self.studio.revise_draft(payload)['draft']
+                self.assertEqual(result['status'], 'review')
+                self.assertNotIn('approved_at', result)
+                self.assertFalse(result['error'])
+                self.assertEqual(next(context for _, context in reversed(self.calls) if 'current_reply' in context)['current_reply'], 'Keep this text')
+
     def test_browser_identity_changes_and_disconnect_block_approved_send(self):
         draft = self.approve(self.draft())
-        for field, changed in [('email', 'someone@example.test'), ('state', 'sign_in_required'),
+        for field, changed in [('email', 'someone@example.test'), ('state', 'unsupported'),
                                ('provider', 'browser_gmail'), ('config_fingerprint', 'new')]:
             old = self.adapter.connection[field]
             self.adapter.connection[field] = changed
@@ -332,6 +408,18 @@ class LocalWorkflowTests(unittest.TestCase):
         with self.assertRaises(HarnessError):
             self.studio.finalize_draft(draft['id'])
         self.assertFalse(self.adapter.sent)
+
+    def test_browser_expired_session_reaches_recovering_send_worker(self):
+        draft = self.approve(self.draft())
+        self.adapter.connection['state'] = 'sign_in_required'
+        self.adapter.send_result = {'status': 'not_sent', 'error': 'Sign in required after recovery'}
+        with self.assertRaisesRegex(HarnessError, 'after recovery'):
+            self.studio.finalize_draft(draft['id'])
+        self.assertEqual(len(self.adapter.sent), 1)
+        self.assertEqual(self.studio._get('draft', draft['id'])['status'], 'approved')
+        self.adapter.send_result = {'status': 'sent'}
+        self.assertEqual(self.studio.finalize_draft(draft['id'])['draft']['status'], 'sent')
+        self.assertEqual(self.adapter.sent[0][3], self.adapter.sent[1][3])
 
     def test_browser_reference_upgrade_preserves_original_and_draft(self):
         draft = self.draft()
