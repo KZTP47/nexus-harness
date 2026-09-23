@@ -261,7 +261,11 @@ class EmailStudio:
         if account.get('connection_state') == 'disconnected':
             raise HarnessError('Reconnect this mailbox before continuing.')
         connection = self.local_mail.status(account['kind'], account['connector_id'])
-        if (connection.get('state') != 'connected'
+        # Browser submission owns recovery and the final live identity check.
+        # Keep the saved account binding intact while allowing it to restore
+        # an expired session before any composer or Send action is used.
+        allowed_states = {'connected', 'sign_in_required'} if account['kind'] in {'browser_outlook', 'browser_gmail'} else {'connected'}
+        if (connection.get('state') not in allowed_states
                 or connection.get('provider') != account['kind']
                 or connection.get('config_fingerprint') != account['connector_fingerprint']
                 or connection.get('email', '').lower() != account['email'].lower()):
@@ -491,12 +495,21 @@ class EmailStudio:
                     raise HarnessError('This draft cannot be discarded at its current stage.')
                 draft['status'] = 'discarded'
             elif action in ('save_draft', 'approve_draft'):
-                if draft['status'] != 'review' or payload.get('revision') != draft['revision']:
+                # Delivery holds this same mutation lock. Browser failures only
+                # return to approved when definitely not sent; uncertain sends
+                # remain delivery_unknown and cannot be edited or reapproved.
+                retryable = (account['kind'] in ('browser_outlook', 'browser_gmail')
+                             and draft['status'] == 'approved' and bool(draft.get('error')))
+                if (draft['status'] != 'review' and not retryable) or payload.get('revision') != draft['revision']:
                     raise HarnessError('This draft changed. Refresh it before saving.')
                 edited = _text(payload.get('text'))
                 if not edited:
                     raise HarnessError('The reply cannot be empty.')
-                draft.update(edited=edited, revision=draft['revision'] + 1)
+                draft.update(edited=edited, revision=draft['revision'] + 1, error='')
+                if retryable and action == 'save_draft':
+                    draft['status'] = 'review'
+                    for key in ('approved_at', 'approved_revision', 'approval_contract'):
+                        draft.pop(key, None)
                 if action == 'approve_draft':
                     self._same_account(account, draft)
                     if account['kind'] in ('browser_outlook', 'browser_gmail'):
@@ -990,13 +1003,50 @@ class EmailStudio:
                 grouped[category]['evidence'] += '\n' + item['evidence']
         return list(grouped.values())
 
+    @staticmethod
+    def _reopen_unsent_review(account, draft):
+        if (account['kind'] in ('browser_outlook', 'browser_gmail')
+                and draft['status'] == 'approved' and draft.get('error')):
+            draft.update(status='review', error='')
+            for key in ('approved_at', 'approved_revision', 'approval_contract'):
+                draft.pop(key, None)
+
+    def prepare_draft(self, payload):
+        """Readiness only: never grants send approval or calls the AI."""
+        with self._mutation():
+            account = self._account(payload)
+            draft = self._get('draft', payload.get('draft_id'), account['id'])
+            self._same_account(account, draft)
+            if payload.get('revision') != draft['revision']:
+                raise HarnessError('The draft changed during preparation. Your edits are preserved; try again.')
+            if draft['status'] not in ('review', 'approved'):
+                raise HarnessError('This reply is already sending or is no longer available for review.')
+            intent = payload.get('intent')
+            if intent not in ('revise', 'send'):
+                raise HarnessError('Choose revision or sending preparation.')
+            if intent == 'revise' and draft['status'] == 'approved' and not draft.get('error'):
+                raise HarnessError('This approved reply is waiting to send. Wait for its outcome before revising.')
+            if intent == 'send' and account['kind'] in ('browser_outlook', 'browser_gmail'):
+                incoming = self._get('message', draft['message_id'], account['id'])
+                if incoming.get('account_fingerprint') != account['fingerprint']:
+                    raise HarnessError('This original belongs to a previous mailbox configuration.')
+                connector = self._check_local_account(account)
+                result = connector.prepare_reply(account['connector_id'], incoming,
+                    _text(payload.get('text') or draft['edited']), draft['id'])
+                if result.get('status') != 'ready':
+                    raise HarnessError(_text(result.get('error') or 'The mailbox is not ready yet. Your draft is preserved.', 2000))
+            self._reopen_unsent_review(account, draft)
+            self._put('draft', draft)
+            return {'draft': self._public_draft(draft), 'ready': True}
+
     def revise_draft(self, payload):
         """Persist user input first; never let a slow model overwrite a newer edit."""
         with self._mutation():
             account = self._account(payload)
             draft = self._get('draft', payload.get('draft_id'), account['id'])
+            self._reopen_unsent_review(account, draft)
             if draft['status'] != 'review' or payload.get('revision') != draft['revision']:
-                raise HarnessError('This draft changed. Refresh it before asking the AI to revise.')
+                raise HarnessError('The draft changed during revision preparation. Your text is preserved; try again.')
             self._same_account(account, draft)
             instruction = _text(payload.get('instruction'), 4000)
             text = _text(payload.get('text'))
@@ -1197,7 +1247,7 @@ class EmailStudio:
                     self._put('draft', draft)
                     raise HarnessError(draft['error'])
                 else:
-                    draft.update(status='delivery_unknown', error='Browser send outcome is unknown. Check Sent mail; Nexus will not automatically resend this reply.')
+                    draft.update(status='delivery_unknown', error=_text(result.get('error'), 2000) if isinstance(result, dict) and result.get('error') else 'Browser send outcome is unknown. Check Sent mail; Nexus will not automatically resend this reply.')
                     self._put('draft', draft)
                     raise HarnessError(draft['error'])
             elif account['kind'] == 'emailengine':

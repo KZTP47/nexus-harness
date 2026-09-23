@@ -80,3 +80,21 @@
 .email-memory-empty { color: var(--muted); padding: 12px 0; }
 
 .email-learning-attempt { border-top: 1px solid var(--line); padding: 10px 0; overflow-wrap: anywhere; }
+
+.email-compose { width: min(760px, 90vw); max-height: 90vh; overflow: auto; box-sizing: border-box; padding: 20px; border: 1px solid #537682; border-radius: 14px; background: #0b2732; color: #edf6fa; }
+.email-compose::backdrop { background: rgb(0 0 0 / 65%); }
+.email-compose label { display: block; margin-top: 12px; font-weight: 600; }
+.email-compose input, .email-compose textarea { display: block; box-sizing: border-box; width: 100%; margin: 6px 0 12px; padding: 10px; color: inherit; background: #071b23; border: 1px solid #537682; border-radius: 6px; }
+.email-compose h2 { margin-top: 0; }
+.email-compose textarea { min-height: 140px; height: clamp(140px, 25vh, 320px); resize: vertical; }
+.email-compose button { margin-right: 8px; }
+
+.email-comparison > div { padding: 10px; border: 2px solid transparent; border-radius: 10px; }
+.email-comparison > .email-selected-version { border-color: var(--cyan, #63e6ff); background: rgba(99,230,255,.06); }
+.email-version-choice { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-weight: 700; cursor: pointer; }
+.email-version-choice input { width: auto; margin: 0; }
+.email-version-notice { color: var(--cyan, #63e6ff); }
+.email-compose select { display: block; width: 100%; margin: 6px 0 12px; }
+
+.email-compose-addresses { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+@media (max-width: 600px) { .email-compose-addresses { grid-template-columns: minmax(0, 1fr); gap: 0; } }
