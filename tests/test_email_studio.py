@@ -446,4 +446,59 @@ class EmailStudioTests(unittest.TestCase):
         self.studio.dispatch('memory_delete',{'account_id':self.a['id'],'memory_id':memory['id']})
         self.assertEqual(self.studio.snapshot()['memories'],[])
 
+    def test_comma_display_name_sender_is_accepted(self):
+        m=self.incoming(sender='Müller, Hans <hans@example.test>')
+        self.assertEqual(m['sender'],'Müller, Hans <hans@example.test>')
+        with self.assertRaises(HarnessError): self.incoming(sender='Müller, Hans')
+
+    def test_one_malformed_imap_message_does_not_stop_the_mailbox(self):
+        a=self.account('imap-bad@example.test',kind='imap',imap_host='imap.example.test',smtp_host='smtp.example.test',username='mailbox',password='secret')
+        import datetime as clock, email.utils as mailutils
+        now=mailutils.format_datetime(clock.datetime.now(clock.timezone.utc)+clock.timedelta(minutes=1))
+        bad=b'From: sender@example.test\r\nSubject: Empty\r\nDate: '+now.encode()+b'\r\n\r\n'
+        good=b'From: sender@example.test\r\nSubject: Fine\r\nDate: '+now.encode()+b'\r\n\r\nReal question'
+        with patch('our_harness.email_studio.imaplib.IMAP4_SSL') as imap:
+            client=imap.return_value.__enter__.return_value
+            client.select.return_value=('OK', [])
+            client.response.return_value=('UIDVALIDITY',[b'7'])
+            def uid(command,*args):
+                if command=='search': return ('OK',[b'1 2'])
+                return ('OK',[(b'header',bad if args[0]==b'1' else good)])
+            client.uid.side_effect=uid
+            self.studio.dispatch('sync',{'account_id':a['id']})
+        messages=self.studio._all('message',a['id'])
+        self.assertEqual([m['subject'] for m in messages],['Fine'])
+        self.assertTrue(messages[0]['auto_draft_eligible'])
+        failures=self.studio._all('failed_import',a['id'])
+        self.assertEqual(len(failures),1)
+        self.assertIn('received email text',failures[0]['error'])
+        self.assertEqual(self.studio._get('account',a['id'])['cursor'],'2')
+
+    def test_new_imap_connection_treats_older_mail_as_history(self):
+        a=self.account('imap-history@example.test',kind='imap',imap_host='imap.example.test',smtp_host='smtp.example.test',username='mailbox',password='secret')
+        self.assertTrue(self.studio._get('account',a['id']).get('auto_draft_since'))
+        old=b'From: sender@example.test\r\nSubject: Old\r\nDate: Mon, 01 Jan 2001 10:00:00 +0000\r\n\r\nOld question'
+        undated=b'From: sender@example.test\r\nSubject: Undated\r\n\r\nNo date'
+        with patch('our_harness.email_studio.imaplib.IMAP4_SSL') as imap:
+            client=imap.return_value.__enter__.return_value
+            client.select.return_value=('OK', [])
+            client.response.return_value=('UIDVALIDITY',[b'9'])
+            client.uid.side_effect=lambda command,*args: ('OK',[b'1 2']) if command=='search' else ('OK',[(b'header',old if args[0]==b'1' else undated)])
+            self.studio.dispatch('sync',{'account_id':a['id']})
+        found={m['subject']:m for m in self.studio._all('message',a['id'])}
+        self.assertEqual(set(found),{'Old','Undated'})
+        self.assertFalse(found['Old']['auto_draft_eligible'])
+        self.assertFalse(found['Undated']['auto_draft_eligible'])
+        self.assertTrue(found['Old']['received_at'].startswith('2001-01-01'))
+
+    def test_html_only_mail_is_read_as_text_and_unusable_reply_to_is_refused_on_arrival(self):
+        html=b'From: sender@example.test\r\nSubject: Html\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>Can we <b>meet</b> on Monday?</p><script>alert(1)</script>'
+        m=self.studio.dispatch('import',{'account_id':self.a['id'],'raw':html})['message']
+        self.assertIn('Can we meet on Monday?',m['body'])
+        self.assertNotIn('<b>',m['body'])
+        many=b'From: sender@example.test\r\nReply-To: one@example.test, two@example.test\r\nSubject: Many\r\n\r\nWho gets this?'
+        with self.assertRaises(HarnessError): self.studio.dispatch('import',{'account_id':self.a['id'],'raw':many})
+        attachment_only=b'From: sender@example.test\r\nSubject: File\r\nContent-Type: application/pdf\r\n\r\n%PDF'
+        with self.assertRaises(HarnessError): self.studio.dispatch('import',{'account_id':self.a['id'],'raw':attachment_only})
+
 if __name__=='__main__': unittest.main()

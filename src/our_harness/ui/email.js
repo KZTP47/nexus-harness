@@ -88,7 +88,7 @@
       const kind = {create_draft: 'draft', retry_draft: 'draft', revise_draft: 'revise', approve_draft: 'approve', resume_draft: 'approve'}[action];
       if (kind) { activeRequest = {kind, draft: state.draft, started: Date.now()}; requestErrors.delete(kind + ':' + state.draft); }
       state.busy = true; state.mutationRevision += 1; controls(); note('Working…');
-      try { const result = await post(action, payload); const completion = success ? await success(result) : null; if (state.refreshPromise) await state.refreshPromise; await refresh(); note(completion?.notice || (action === 'approve_draft' ? 'Approved. The workflow will complete delivery and learning; check the status below.' : 'Saved.')); return result; }
+      try { const result = await post(action, payload); const completion = success ? await success(result) : null; if (state.refreshPromise) await state.refreshPromise; const fresh = await refresh(); if (fresh !== false) note(completion?.notice || (action === 'approve_draft' ? 'Approved. The workflow will complete delivery and learning; check the status below.' : 'Saved.')); else note('The action finished, but the email view could not be refreshed. It will retry shortly.', true); return result; }
       catch (error) { if (kind) requestErrors.set(kind + ':' + (activeRequest?.draft || state.draft), error.message); note(error.message, true); }
       finally { activeRequest = null; state.busy = false; controls(); }
     }
@@ -289,6 +289,14 @@
       });
     }).dataset.work = '1';
     const savedPolling = el('p', '', 'field-help'); savedPolling.id = 'emailPollingSettingsStatus'; savedPolling.setAttribute('role', 'status'); assistantSettings.append(savedPolling, el('p', 'This sets when checks are due. Mail delivery, browser loading and AI drafting take additional time. If a check takes longer than the interval, the next check waits for it to finish.', 'field-help')); connect.append(connectionActions, assistantSettings);
+    // Notifications belong to this project's mail workspace, not one mailbox, so
+    // they stay visible for every kind of mailbox, including manual IMAP.
+    const notifySettings = el('div', undefined, 'email-form'); notifySettings.id = 'emailNotifySettings'; connect.append(notifySettings);
+    const notifyOn = field(notifySettings, 'emailNotifyNew', 'Corner notification when new mail arrives and a reply is being drafted', 'checkbox');
+    const notifyDetails = field(notifySettings, 'emailNotifyDetails', 'Show sender and subject in that notification', 'checkbox');
+    notifySettings.append(el('p', 'Turn off sender and subject when you share your screen. Manually imported mail is not announced.', 'field-help'));
+    const saveNotify = () => { const saved = state.snapshot.notifications || {}; if (state.busy || !state.loaded) { notifyOn.checked = saved.enabled !== false; notifyDetails.checked = saved.show_details !== false; return note('Wait for the current action to finish.', true); } return act('notification_settings', {enabled: notifyOn.checked, show_details: notifyDetails.checked}, () => ({notice: !notifyOn.checked ? 'Corner notifications are off.' : notifyDetails.checked ? 'Corner notifications are on and show sender and subject.' : 'Corner notifications are on without sender or subject.'})); };
+    notifyOn.addEventListener('change', saveNotify); notifyDetails.addEventListener('change', saveNotify);
     const registrations = el('details', undefined, 'email-registrations'); registrations.append(el('summary', 'Advanced: app registration for Outlook or Gmail'), el('p', 'The API connection method needs a registered app. Browser and classic Outlook connections above do not require these fields. Your organization or app distributor can provide the client ID. These settings do not sign in to a mailbox.'));
     for (const [provider, title] of [['outlook', 'Outlook'], ['gmail', 'Gmail']]) {
       const panel = el('details'); panel.append(el('summary', title + ' app registration')); registrationPanels[provider] = panel;
@@ -532,11 +540,15 @@
       const syncOperation = (s.operations || []).find(item => (item.id || item.kind) === 'sync:' + state.account);
       by('emailInboxStatus').textContent = syncOperation?.state === 'running' ? 'Checking inbox…' : syncOperation?.state === 'failed' ? syncOperation.error || 'Inbox check failed. Choose Check inbox now to retry.' : syncOperation?.state === 'completed' ? 'Inbox check completed' + (timestamp(syncOperation.finished_at) ? ' at ' + new Date(timestamp(syncOperation.finished_at)).toLocaleTimeString() : '') + '. Newest messages appear first.' : 'Newest messages appear first.';
       by('emailInboxStatus').classList.toggle('email-error', syncOperation?.state === 'failed');
+      const notify = s.notifications || {}; by('emailNotifyNew').checked = notify.enabled !== false; by('emailNotifyDetails').checked = notify.show_details !== false; by('emailNotifyDetails').disabled = notify.enabled === false;
       by('emailQueue').replaceChildren(); const messages = (s.messages || []).filter(m => m.account_id === state.account && (!m.account_fingerprint || m.account_fingerprint === currentAccount()?.fingerprint)).sort((a, b) => (timestamp(b.received_at) || timestamp(b.imported_at) || 0) - (timestamp(a.received_at) || timestamp(a.imported_at) || 0));
       for (const failure of (s.failed_imports || []).filter(m => m.account_id === state.account && m.account_fingerprint === currentAccount()?.fingerprint)) by('emailQueue').append(el('p', 'Message could not be imported: ' + failure.error + ' Nexus will retry on a later inbox scan.'));
       if (state.message && !messages.some(message => message.id === state.message)) { state.message = ''; state.draft = ''; state.dirty = false; state.editRevision = null; state.pendingRevision = null; }
+      // A draft the assistant starts after the email was opened must still reach the open email.
+      if (state.message && !state.dirty && !currentDraft()) { const newest = (s.drafts || []).filter(d => d.message_id === state.message && d.account_id === state.account).reverse(); const adopted = newest.find(d => !['discarded', 'sent', 'exported'].includes(d.status)) || newest[0]; if (adopted) state.draft = adopted.id; }
+      const focusedMessage = by('emailQueue').contains(doc.activeElement) ? doc.activeElement.dataset.messageId : '';
        if (!messages.length) by('emailQueue').append(el('p', 'No messages yet. Import an email or check your connected inbox.'));
-      for (const m of messages) { const drafts = (s.drafts || []).filter(d => d.message_id === m.id && d.account_id === state.account); const newest = [...drafts].reverse(); const d = newest.find(d => !['discarded', 'sent', 'exported'].includes(d.status)) || newest[0]; const b = button(by('emailQueue'), '', (m.subject || '(No subject)') + '\n' + m.sender + (d ? '\n' + d.status : ''), () => { if (state.busy) return note('Wait for the current action to finish.', true); if (state.dirty) return note('Save or discard your edits before opening another email.', true); state.message = m.id; state.draft = d?.id || ''; render(); }); b.className = 'email-message'; b.setAttribute('aria-pressed', String(state.message === m.id)); }
+      for (const m of messages) { const drafts = (s.drafts || []).filter(d => d.message_id === m.id && d.account_id === state.account); const newest = [...drafts].reverse(); const d = newest.find(d => !['discarded', 'sent', 'exported'].includes(d.status)) || newest[0]; const b = button(by('emailQueue'), '', (m.subject || '(No subject)') + '\n' + m.sender + (d ? '\n' + d.status : ''), () => { if (state.busy) return note('Wait for the current action to finish.', true); if (state.dirty) return note('Save or discard your edits before opening another email.', true); state.message = m.id; state.draft = d?.id || ''; render(); [...by('emailQueue').children].find(node => node.dataset?.messageId === m.id)?.focus(); }); b.className = 'email-message'; b.dataset.messageId = m.id; b.setAttribute('aria-pressed', String(state.message === m.id)); if (focusedMessage === m.id) b.focus(); }
       const message = messages.find(m => m.id === state.message); by('emailIncoming').textContent = message ? 'From: ' + message.sender + '\nSubject: ' + message.subject + '\n\n' + message.body : 'Choose an email.';
       const draft = currentDraft();
       const pending = state.pendingRevision;
@@ -556,13 +568,95 @@
       controls();
     }
     async function refresh() { if (state.refreshing) return state.refreshPromise; state.refreshing = true; const revision = state.mutationRevision; state.refreshPromise = (async () => { try { const snapshot = await api('/api/email'); if (revision !== state.mutationRevision) return; state.snapshot = snapshot; lastSnapshotAt = timestamp(snapshot.captured_at) || Date.now(); state.loaded = true; if (!state.newAccount && !state.account && !by('emailAccountName').value && snapshot.accounts?.length === 1) { state.account = snapshot.accounts[0].id; render(); fillAccount(); }
-      const ready = (snapshot.drafts || []).filter(d => d.status === 'review'); const nav = doc.querySelector('[data-view="email"]'); if (nav) { nav.textContent = 'Email assistant' + (ready.length ? ' (' + ready.length + ')' : ''); nav.title = ready.length ? ready.length + ' drafts ready for review' : 'Read incoming mail, review replies, and teach your assistant'; } const newlyReady = ready.filter(d => !state.seen.has(d.id)); for (const d of ready) state.seen.add(d.id); render(); if (state.baseline && newlyReady.length) note(newlyReady.length + ' new draft' + (newlyReady.length === 1 ? '' : 's') + ' ready for review.'); state.baseline = true;
-    } catch (error) { note(error.message, true); } finally { state.refreshing = false; } })(); return state.refreshPromise; }
+      const ready = (snapshot.drafts || []).filter(d => d.status === 'review'); const nav = doc.querySelector('[data-view="email"]'); if (nav) { nav.textContent = 'Email assistant' + (ready.length ? ' (' + ready.length + ')' : ''); nav.title = ready.length ? ready.length + ' drafts ready for review' : 'Read incoming mail, review replies, and teach your assistant'; } const newlyReady = ready.filter(d => !state.seen.has(d.id)); for (const d of ready) state.seen.add(d.id); render(); if (state.baseline && newlyReady.length) note(newlyReady.length + ' new draft' + (newlyReady.length === 1 ? '' : 's') + ' ready for review.'); state.baseline = true; return true;
+    } catch (error) { lastSnapshotAt = Date.now(); note(error.message, true); return false; } finally { state.refreshing = false; } })(); return state.refreshPromise; }
     render();
     const activityTimer = options.poll === false ? null : host.setInterval(renderActivity, 1000);
     const timer = options.poll === false ? null : host.setInterval(() => { const delay = currentAccount()?.poll_enabled ? Math.min(6000, Math.max(1000, Number(currentAccount().poll_seconds || 60) * 1000)) : 6000; if (!state.busy && Date.now() - lastSnapshotAt >= delay) refresh(); }, 1000);
-    return {refresh, state, destroy() { if (timer) host.clearInterval(timer); if (activityTimer) host.clearInterval(activityTimer); }};
+    async function open(target = {}) {
+      await refresh();
+      const message = (state.snapshot.messages || []).find(m => m.id === target.message_id && (!target.account_id || m.account_id === target.account_id));
+      if (!message) { note('That email is no longer in this mailbox.', true); return false; }
+      if (state.message === message.id) { render(); return true; }
+      if (state.busy || state.dirty) { note('A new email from ' + (message.sender || 'a sender') + ' is waiting. Save or discard your edits to open it.'); return false; }
+      if (state.account !== message.account_id) { state.newAccount = false; state.account = message.account_id; fillAccount(); }
+      const drafts = (state.snapshot.drafts || []).filter(d => d.message_id === message.id && d.account_id === message.account_id).reverse();
+      state.message = message.id; state.draft = (drafts.find(d => !['discarded', 'sent', 'exported'].includes(d.status)) || drafts[0])?.id || '';
+      render(); by('emailIncoming')?.scrollIntoView?.({block: 'nearest'});
+      return true;
+    }
+    return {refresh, open, state, destroy() { if (timer) host.clearInterval(timer); if (activityTimer) host.clearInterval(activityTimer); }};
   }
-  if (typeof module !== 'undefined' && module.exports) module.exports = {createEmailStudio};
-  if (host.document) { let studio; host.nexusEmail = {refresh() { const root = host.document.getElementById('emailView'); if (!studio) studio = createEmailStudio(root, (path, options) => request(path, options)); return studio.refresh(); }}; }
+  // Corner notifications ("new mail, the assistant is drafting a reply"), shown
+  // whatever tab is open. The words are chosen here once, for both the desktop
+  // pop-up and the in-page fallback a plain browser gets.
+  const MOST_CARDS_AT_ONCE = 3;
+  function noticeCard(notice) {
+    const target = {account_id: notice.account_id || '', message_id: notice.message_id || '', draft_id: notice.draft_id || ''};
+    if (notice.kind === 'summary') return {id: notice.id, title: notice.count + ' new emails', action: 'Nexus AI is drafting replies', detail: notice.account ? 'In ' + notice.account : 'Click to review them', avatar: notice.count > 99 ? '99' : String(notice.count), ...target};
+    if (notice.private || !notice.sender) return {id: notice.id, title: 'New email', action: 'Nexus AI is drafting a reply', detail: notice.private ? 'Open Nexus Harness to read it' : (notice.subject || '(No subject)'), avatar: '@', ...target};
+    return {id: notice.id, title: notice.sender, action: 'New email \u00b7 Nexus AI is drafting a reply', detail: notice.subject || '(No subject)', avatar: ([...notice.sender.trim()][0] || '@').toUpperCase(), ...target};
+  }
+  function cardsFor(notices) {
+    if (notices.length <= MOST_CARDS_AT_ONCE) return notices.map(noticeCard);
+    const newest = notices[notices.length - 1]; const accounts = new Set(notices.map(n => n.account));
+    return [noticeCard({...newest, id: 'summary-' + newest.id, kind: 'summary', count: notices.length, account: accounts.size === 1 ? newest.account : ''})];
+  }
+  function watchNotifications(api, show, options = {}) {
+    const every = options.every || 4000; let boot = ''; let cursor = null; let failures = 0; let timer = null; let stopped = false;
+    async function tick() {
+      timer = null; let feed = null;
+      try { feed = await api('/api/email/notifications' + (cursor === null ? '' : '?after=' + cursor)); failures = 0; } catch (_) { failures += 1; }
+      if (feed && Array.isArray(feed.items) && !stopped) {
+        // A restarted server numbers from one again: read its whole feed once.
+        if (cursor !== null && feed.boot !== boot) { cursor = null; boot = ''; timer = host.setTimeout(tick, 0); return; }
+        const replay = Number(feed.replay_seconds) || 120;
+        const fresh = feed.items.filter(item => cursor === null ? Number(item.age_seconds) <= replay : Number(item.seq) > cursor);
+        boot = String(feed.boot || ''); cursor = Math.max(cursor || 0, Number(feed.seq) || 0);
+        for (const card of cardsFor(fresh)) { try { await show(card); } catch (_) { /* one card must not stop the rest */ } }
+      }
+      if (!stopped) timer = host.setTimeout(tick, every * Math.min(8, 2 ** failures));
+    }
+    timer = host.setTimeout(tick, 0);
+    return {tick, stop() { stopped = true; if (timer) host.clearTimeout(timer); }};
+  }
+  function showInPage(doc, card, onOpen) {
+    let stack = doc.getElementById('nexusMailToasts');
+    if (!stack) { stack = doc.createElement('div'); stack.id = 'nexusMailToasts'; stack.className = 'nexus-mail-toasts'; stack.setAttribute('role', 'log'); stack.setAttribute('aria-live', 'polite'); stack.setAttribute('aria-label', 'New email notifications'); doc.body.append(stack); }
+    const span = (text, cls) => { const node = doc.createElement('span'); node.className = cls; node.textContent = text; return node; };
+    const item = doc.createElement('div'); item.className = 'nexus-mail-toast'; item.dataset.id = card.id;
+    const openButton = doc.createElement('button'); openButton.type = 'button'; openButton.className = 'nexus-mail-toast-open'; openButton.title = 'Open this email';
+    const words = span('', 'nexus-mail-toast-text'); words.append(span(card.title, 'nexus-mail-toast-title')); if (card.action) words.append(span(card.action, 'nexus-mail-toast-action')); if (card.detail) words.append(span(card.detail, 'nexus-mail-toast-detail'));
+    const avatar = span(card.avatar, 'nexus-mail-toast-avatar'); avatar.setAttribute('aria-hidden', 'true'); openButton.append(avatar, words);
+    const close = doc.createElement('button'); close.type = 'button'; close.className = 'nexus-mail-toast-close'; close.textContent = '\u00d7'; close.setAttribute('aria-label', 'Dismiss notification');
+    let timer = null; let remaining = 7000; let started = 0;
+    const leave = () => { host.clearTimeout(timer); item.remove(); };
+    const count = () => { started = Date.now(); timer = host.setTimeout(leave, remaining); };
+    item.addEventListener('mouseenter', () => { host.clearTimeout(timer); remaining = Math.max(1200, remaining - (Date.now() - started)); });
+    item.addEventListener('mouseleave', count); item.addEventListener('focusin', () => host.clearTimeout(timer)); item.addEventListener('focusout', count);
+    openButton.addEventListener('click', () => { leave(); onOpen(card); }); close.addEventListener('click', leave);
+    item.append(openButton, close); stack.append(item);
+    const live = [...stack.children]; for (const old of live.slice(0, Math.max(0, live.length - MOST_CARDS_AT_ONCE))) old.remove();
+    count();
+  }
+  if (typeof module !== 'undefined' && module.exports) module.exports = {createEmailStudio, noticeCard, cardsFor, watchNotifications};
+  if (host.document) {
+    let studio; let watcher = null;
+    const ensure = () => { const root = host.document.getElementById('emailView'); if (!studio) studio = createEmailStudio(root, (path, options) => request(path, options)); return studio; };
+    const openFromNotice = async target => { if (typeof host.switchView === 'function') host.switchView('email', {userInitiated: true}); return ensure().open(target); };
+    host.nexusEmail = {
+      refresh() { return ensure().refresh(); },
+      open: openFromNotice,
+      watch() {
+        if (watcher) return watcher;
+        const desktop = host.harnessDesktop;
+        desktop?.onMailNotificationActivated?.(target => { void openFromNotice(target); });
+        watcher = watchNotifications((path, options) => request(path, options), async card => {
+          if (desktop?.showMailNotification) { try { if (await desktop.showMailNotification(card)) return; } catch (_) { /* fall back to the page */ } }
+          showInPage(host.document, card, openFromNotice);
+        });
+        return watcher;
+      },
+    };
+  }
 })(typeof window !== 'undefined' ? window : globalThis);

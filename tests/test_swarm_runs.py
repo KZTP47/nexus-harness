@@ -796,6 +796,53 @@ class SwarmRunStoreTests(unittest.TestCase):
         self.assertIs(result["provider_failures"][0]["outcome_unknown"], True)
         self.assertEqual(store.get(run_id)["status"], "complete")
 
+    def test_board_run_keeps_going_after_one_uncertain_web_turn_and_never_resends_it(self) -> None:
+        standing = self._standing()
+        standing["board"]["agents"] = [
+            {"id": "agent-1", "name": "Uncertain", "who": "web:uncertain-route", "job": "",
+             "ready": True, "filed_as": "uncertain", "why_not": ""},
+            {"id": "agent-2", "name": "Healthy", "who": "web:healthy-route", "job": "",
+             "ready": True, "filed_as": "healthy", "why_not": ""},
+        ]
+        standing["board"]["works_on"] = [
+            {"agent": "agent-1", "project": "project-1"},
+            {"agent": "agent-2", "project": "project-1"},
+        ]
+        standing["board"]["talks_to"] = [{"one": "agent-1", "other": "agent-2"}]
+        dispatched: list[str] = []
+
+        def answer(config, route, _text, filed_as="", **_kwargs):
+            with provider_effect(config, route, filed_as or route, f"{route}-{len(dispatched)}"):
+                dispatched.append(route)
+                if route == "web:uncertain-route":
+                    raise ProviderOutcomeUnknown("browser vanished after Send")
+                return {"answer": {"who": "them", "text": f"{route} answered", "at": ""}}
+
+        store = SwarmRunStore(self.config)
+        running = swarm.Running(store)
+        board_file = self.container / "settings" / "swarm.json"
+        with mock.patch.object(swarm, "where_it_lives", return_value=board_file), \
+                mock.patch.object(chat, "say", side_effect=answer):
+            started = running.start(self.config, standing, "one-uncertain-web-turn")
+            running.wait(20)
+        durable = store.get(started["run_id"])
+        # One uncertain turn used to make the next progress save refuse, which
+        # skipped every remaining agent and lost what they said.
+        self.assertEqual(durable["status"], "complete", durable.get("error"))
+        doing = durable["result"]["doing"]
+        states = [(one["agent"], one["round"], one["state"]) for one in doing["turns"]]
+        self.assertEqual(states[:2], [
+            ("agent-1", swarm.ON_ITS_OWN, "went wrong"),
+            ("agent-2", swarm.ON_ITS_OWN, "done"),
+        ])
+        self.assertIs(doing["turns"][0]["outcome_unknown"], True)
+        self.assertEqual(
+            [one["id"] for one in durable["result"]["provider_failures"]], ["agent-1"],
+        )
+        # The uncertain conversation is never sent to again, in this run or later.
+        self.assertEqual(dispatched.count("web:uncertain-route"), 1)
+        self.assertIn("uncertain prior delivery", doing["turns"][2]["why_not"])
+
     def test_parallel_workers_journal_overlapping_provider_effects_before_final_checkpoint(self) -> None:
         store, run_id = self._running("parallel-provider-effects")
         active = 0

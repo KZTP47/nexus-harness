@@ -1062,8 +1062,11 @@ def _binding_problem(
             "message": (
                 f"This chat is paused because {detail}. Nexus kept the transcript "
                 "and will not apply its "
-                "history to a different folder. Start a fresh chat with the current setup."
+                "history to a different folder on its own. Choose this chat's "
+                "project again to continue it in the current folder, or start a "
+                "fresh chat with the current setup."
             ),
+            "can_rebind_project": True,
             "action": "start_fresh",
             "action_label": "Start fresh with current setup",
         }
@@ -1084,10 +1087,21 @@ def _binding_problem(
     return None
 
 
+_PROJECT_REBIND_PROBLEMS = frozenset({
+    "project_binding_changed", "project_access_changed",
+})
+
+
 def fence_for_board_change(
     config: LoadedConfig, before: dict[str, Any], after: dict[str, Any]
 ) -> int:
-    """Fence saved chats when any authority-bearing board binding changes."""
+    """Fence each saved chat whose own authority-bearing board inputs changed.
+
+    Board saves are frequent (every drag autosaves) and are not refused while
+    a pair-chat or goal run is in flight, so fencing is per chat: renaming an
+    unrelated agent, adding an agent or project, or drawing an unrelated line
+    must leave every running conversation intact.
+    """
 
     def authority(board: dict[str, Any]) -> str:
         agents = sorted(
@@ -1113,6 +1127,47 @@ def fence_for_board_change(
                 tuple(sorted((str(one.get("one") or ""), str(one.get("other") or ""))))
                 for one in board.get("talks_to", []) if isinstance(one, dict)
             ),
+        }
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+    def chat_authority(board: dict[str, Any], conversation: dict[str, Any]) -> str:
+        """Only the inputs that bind this one chat: its members, the talk
+        line between them, its selected project and their works-on lines."""
+
+        pair = conversation.get("pair", [])
+        pair = [str(one) for one in pair] if isinstance(pair, list) else []
+        agents = _agents(board)
+        members = [
+            [
+                member_id, str(agents[member_id].get("name") or ""),
+                str(agents[member_id].get("who") or ""),
+                str(agents[member_id].get("filed_as") or ""),
+            ] if member_id in agents else [member_id, None]
+            for member_id in pair
+        ]
+        project_id = str(conversation.get("project") or "")
+        project = next((
+            one for one in board.get("projects", [])
+            if isinstance(one, dict) and str(one.get("id") or "") == project_id
+        ), None) if project_id else None
+        works_on = {
+            (str(one.get("agent") or ""), str(one.get("project") or ""))
+            for one in board.get("works_on", []) if isinstance(one, dict)
+        }
+        payload = {
+            "workspace_id": _board_workspace_id(board),
+            "members": members,
+            "talks": (
+                swarm_lab.may_they_talk(board, pair[0], pair[1])
+                if len(pair) == 2 else None
+            ),
+            "project": (
+                [project_id, str(project.get("path") or "")]
+                if project is not None else [project_id, None]
+            ),
+            "works_on": [
+                (member_id, project_id) in works_on for member_id in pair
+            ] if project_id else [],
         }
         return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
@@ -1142,6 +1197,10 @@ def fence_for_board_change(
             if not isinstance(conversation, dict):
                 continue
             if conversation.get("workspace_id") != before_workspace:
+                continue
+            if chat_authority(before, conversation) == chat_authority(
+                after, conversation
+            ):
                 continue
             pair = conversation.get("pair", [])
             first = str(pair[0]) if isinstance(pair, list) and pair else ""
@@ -2184,7 +2243,12 @@ def select_project(
             require_current_binding=False,
         )
         problem = _binding_problem(config, board, raw, agents_by_id)
-        if problem:
+        # Choosing the project is the explicit user rebind that a project-only
+        # problem asks for ("Use a different folder on this computer", or a
+        # re-clone at the same path). Chat identity and history are kept and
+        # the new folder's identity is bound below. Provider/agent problems
+        # are never cleared here: they need reconnect review or a fresh chat.
+        if problem and problem.get("code") not in _PROJECT_REBIND_PROBLEMS:
             raise swarm_lab.SwarmError(str(problem["message"]))
         valid = {
             str(one.get("id")) for one in _shared_projects(board, raw["pair"])
@@ -2203,7 +2267,9 @@ def select_project(
                 "Nexus cannot verify a stable local identity for that project folder. "
                 "Restore or choose the folder before granting this chat project authority."
             )
-        if str(raw.get("project") or "") != project_id:
+        if str(raw.get("project") or "") != project_id or problem:
+            # A rebind onto a different folder invalidates writers that were
+            # started against the old one, exactly like choosing another project.
             from .collaboration_ledger import fence_ledger
 
             current = _agents(board).get(agent_id) or {}

@@ -105,20 +105,31 @@ def _owner_is_alive(pid: int, token: str, thread_id: int = 0) -> bool:
     if os.name == "nt":
         try:
             import ctypes
+            from ctypes import wintypes
 
-            process = ctypes.windll.kernel32.OpenProcess(0x100000 | 0x1000, False, pid)
+            # Only a library loaded with use_last_error records the Windows
+            # error code that ctypes.get_last_error() reads; the shared
+            # ctypes.windll one always reports 0 and made live processes look dead.
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+            kernel32.WaitForSingleObject.restype = wintypes.DWORD
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            process = kernel32.OpenProcess(0x100000 | 0x1000, False, pid)
             if not process:
                 # Access denied proves a process owns the PID but prevents
                 # birth-token verification, so fail closed. Invalid/missing
                 # PIDs are dead and may be recovered.
                 return int(ctypes.get_last_error()) == 5
             try:
-                if int(ctypes.windll.kernel32.WaitForSingleObject(process, 0)) != 258:
+                if int(kernel32.WaitForSingleObject(process, 0)) != 258:
                     return False
                 current = _process_token(pid)
                 return not token or not current or current == token
             finally:
-                ctypes.windll.kernel32.CloseHandle(process)
+                kernel32.CloseHandle(process)
         except (AttributeError, OSError):
             return True
     current = _process_token(pid)

@@ -1441,6 +1441,52 @@ os._exit(23)
         blocked = swarm_work._MutationSaga.recover_orphans(self.project)
         self.assertEqual(blocked[0]["status"], "rollback_conflict")
 
+    @unittest.skipUnless(os.name == "nt", "Windows process access rules")
+    def test_access_denied_live_owner_is_not_treated_as_dead(self) -> None:
+        # PID 4 (System) always exists and refuses PROCESS_QUERY_LIMITED_INFORMATION
+        # to a normal user, the same as an elevated Nexus owning a run.
+        finished = subprocess.Popen([sys.executable, "-c", "pass"])
+        finished.wait()
+        self.assertTrue(swarm_work._MutationSaga._owner_alive(4))
+        self.assertTrue(swarm_work._MutationSaga._owner_alive(os.getpid()))
+        self.assertFalse(swarm_work._MutationSaga._owner_alive(finished.pid))
+
+    def test_saga_complete_does_not_overwrite_a_compensation_outcome(self) -> None:
+        # work_together calls complete() after compensate("incomplete"); the
+        # conflict must stay durable so the next run still blocks on it.
+        target = self.project / "saga-terminal.txt"
+        target.write_text("before\n", encoding="utf-8")
+        saga = swarm_work._MutationSaga(self.project, "terminal-conflict")
+        transaction_id = FileTransaction.new_transaction_id()
+        saga.prepare(transaction_id)
+        manifest = FileTransaction(self.project).apply([ChangePlan(
+            "saga-terminal.txt", file_sha256(target), "after\n", reason="test"
+        )], transaction_id=transaction_id)
+        saga.applied(transaction_id, swarm_work._manifest_sha256(manifest))
+        target.write_text("external\n", encoding="utf-8")
+        self.assertEqual(saga.compensate("incomplete")["status"], "rollback_conflict")
+        saga.complete("no_mutations")
+        journal = json.loads(saga.path.read_text(encoding="utf-8"))
+        self.assertEqual(journal["phase"], "rollback_conflict")
+        self.assertNotIn("terminal-conflict", swarm_work._active_mutation_sagas)
+        blocked = swarm_work._MutationSaga.recover_orphans(self.project)
+        self.assertEqual(blocked[0]["status"], "rollback_conflict")
+
+        clean = self.project / "saga-clean.txt"
+        clean.write_text("before\n", encoding="utf-8")
+        rolled = swarm_work._MutationSaga(self.project, "terminal-compensated")
+        clean_id = FileTransaction.new_transaction_id()
+        rolled.prepare(clean_id)
+        clean_manifest = FileTransaction(self.project).apply([ChangePlan(
+            "saga-clean.txt", file_sha256(clean), "after\n", reason="test"
+        )], transaction_id=clean_id)
+        rolled.applied(clean_id, swarm_work._manifest_sha256(clean_manifest))
+        self.assertEqual(rolled.compensate("incomplete")["status"], "rolled_back")
+        rolled.complete("no_mutations")
+        rolled_journal = json.loads(rolled.path.read_text(encoding="utf-8"))
+        self.assertEqual(rolled_journal["phase"], "compensated")
+        self.assertEqual(rolled_journal["compensation_reason"], "incomplete")
+
     def test_project_work_reports_planning_validation_and_application(self) -> None:
         stages: list[str] = []
         plan_review_contexts: list[str] = []
@@ -3349,6 +3395,91 @@ os._exit(23)
                 self.assertNotEqual("missing_runner", result.get("basis"), result)
                 run_contained.assert_called()
 
+    def test_glob_query_skips_control_paths_instead_of_failing(self) -> None:
+        (self.project / ".git").mkdir(exist_ok=True)
+        (self.project / ".git" / "config").write_text("[core]\n", encoding="utf-8")
+        (self.project / "src").mkdir(exist_ok=True)
+        (self.project / "src" / "a.py").write_text("x = 1\n", encoding="utf-8")
+        matches, note = swarm_work._safe_query_paths(self.project, "glob:**/*")
+        relative = {one.relative_to(self.project).as_posix() for one in matches}
+        self.assertIn("src/a.py", relative, note)
+        self.assertFalse(any(one.split("/")[0] == ".git" for one in relative), relative)
+        self.assertNotIn("glob request failed", note)
+        control, control_note = swarm_work._safe_query_paths(self.project, "glob:.git/*")
+        self.assertEqual([], control)
+        self.assertIn("matched no readable files", control_note)
+        _escape, escape_note = swarm_work._safe_query_paths(self.project, "glob:../*")
+        self.assertIn("unsafe glob request rejected", escape_note)
+
+    def test_dot_slash_change_paths_match_write_roots_and_exact_grants(self) -> None:
+        (self.project / "src").mkdir(exist_ok=True)
+        (self.project / "secret.txt").write_text("keep\n", encoding="utf-8")
+        for spelling in ("./src/a.py", "src//a.py", "src/./a.py", ".\\src\\a.py"):
+            with self.subTest(spelling=spelling):
+                by_root = swarm_work._validated_changes(
+                    self.project, [{"path": spelling, "content": "x = 1\n"}],
+                    allowed_write_roots=["src"],
+                )
+                self.assertEqual(["src/a.py"], [one.path for one in by_root])
+                by_grant = swarm_work._validated_changes(
+                    self.project, [{"path": spelling, "content": "x = 1\n"}],
+                    allowed_write_roots=None, exact_write_grants={"src/a.py": {"CREATE"}},
+                )
+                self.assertEqual(["src/a.py"], [one.path for one in by_grant])
+        with self.assertRaisesRegex(HarnessError, "duplicate"):
+            swarm_work._validated_changes(self.project, [
+                {"path": "src/a.py", "content": "1\n"},
+                {"path": "./src/a.py", "content": "2\n"},
+            ])
+        for protected in ("./secret.txt", "src/../secret.txt"):
+            with self.subTest(protected=protected), self.assertRaisesRegex(
+                HarnessError, "protected",
+            ):
+                swarm_work._validated_changes(
+                    self.project, [{"path": protected, "content": "changed\n"}],
+                    protected_paths=["secret.txt"],
+                )
+        for unsafe in ("../outside.txt", "./../outside.txt", "src/../../outside.txt",
+                       str(self.root / "outside.txt"), "/outside.txt"):
+            with self.subTest(unsafe=unsafe), self.assertRaises(HarnessError):
+                swarm_work._validated_changes(
+                    self.project, [{"path": unsafe, "content": "escape\n"}],
+                )
+        self.assertFalse((self.root / "outside.txt").exists())
+
+    def test_missing_module_warning_on_a_passing_command_is_not_a_missing_dependency(self) -> None:
+        (self.project / "feature.py").write_text("enabled = True\n", encoding="utf-8")
+        project = copy.deepcopy(self.board["projects"][0])
+        project["test_commands"] = [["python", "-m", "unittest", "discover"]]
+
+        def contained(exit_code):
+            def run(_config, _root, command, **_kwargs):
+                return {
+                    "argv": list(command), "cwd": ".", "exit_code": exit_code,
+                    "stdout": "",
+                    "stderr": (
+                        "warning: No module named optional_accel, using fallback\n"
+                        "Ran 1 test in 0.001s\n\nOK\n"
+                    ),
+                    "duration_ms": 1, "timed_out": False, "output_truncated": False,
+                    "disposable_snapshot": True,
+                    "containment_profile": "bounded-test-containment",
+                }
+            return run
+
+        for exit_code, missing in ((0, False), (1, True)):
+            with self.subTest(exit_code=exit_code), mock.patch.object(
+                swarm_work, "_run_disposable_verification_command",
+                side_effect=contained(exit_code),
+            ):
+                result = swarm_work._run_selected_project_verification(
+                    self.config, self.project, project,
+                    "Create feature.py", ["feature.py"], None,
+                )
+            self.assertEqual(
+                missing, result.get("basis") == "missing_test_dependency", result,
+            )
+
     def test_empty_host_path_leaves_node_availability_to_containment_broker(self) -> None:
         (self.project / "feature.py").write_text("enabled = True\n", encoding="utf-8")
         project = copy.deepcopy(self.board["projects"][0])
@@ -3420,6 +3551,49 @@ os._exit(23)
         self.assertIn("LATEST OMITTED BLOCKER SENTINEL", summary)
         self.assertIn("MOST RECENT OMITTED EVIDENCE FIRST", summary)
         self.assertLessEqual(len(summary), 4_000)
+
+    def test_semantic_summary_keeps_structured_state_of_turns_without_text(self) -> None:
+        contributions = [{
+            "speaker_name": "Agent", "speaker_route": "route", "phase": "plan",
+            "text": "",
+            "semantic_state": {
+                "remaining": ["STRUCTURED REMAINING SENTINEL"],
+                "needs_files": ["src/needed_sentinel.py"],
+            },
+        }]
+        summary = swarm_work._semantic_history_summary(contributions, 4_000)
+        self.assertIn("STRUCTURED REMAINING SENTINEL", summary)
+        self.assertIn("src/needed_sentinel.py", summary)
+
+    def test_oversized_newest_turn_does_not_wipe_recent_complete_turns(self) -> None:
+        contributions = [
+            {
+                "speaker_name": f"Agent {index}", "speaker_route": "route",
+                "phase": "work", "text": f"RECENT COMPLETE TURN {index} " + ("r" * 500),
+            }
+            for index in range(5)
+        ]
+        contributions.append({
+            "speaker_name": "Newest", "speaker_route": "route", "phase": "work",
+            "text": "NEWEST HEAD SENTINEL " + ("n" * 200_000)
+            + " NEWEST TAIL DECISION: must keep the verification step",
+            "semantic_state": {"remaining": ["NEWEST STRUCTURED REMAINING"]},
+        })
+        prompt = swarm_work._prompt_conversation(contributions)
+        self.assertLessEqual(len(prompt), swarm_work.PROMPT_TRANSCRIPT_CHARACTERS)
+        newest_section = prompt.split("NEWEST COMPLETE TURNS", 1)[1]
+        for index in range(5):
+            self.assertIn(f"RECENT COMPLETE TURN {index} " + ("r" * 500), newest_section)
+        self.assertIn("NEWEST HEAD SENTINEL", newest_section)
+        self.assertIn("turn clipped to fit the prompt budget", newest_section)
+        self.assertLess(
+            newest_section.index("RECENT COMPLETE TURN 4"),
+            newest_section.index("NEWEST HEAD SENTINEL"),
+        )
+        self.assertIn("newest complete turns below: 5; newest turn clipped to fit: 1", prompt)
+        summary_section = prompt.split("NEWEST COMPLETE TURNS", 1)[0]
+        self.assertIn("NEWEST STRUCTURED REMAINING", summary_section)
+        self.assertIn("turn 6 · Newest", summary_section)
 
     def test_every_long_horizon_phase_uses_the_disclosed_projection(self) -> None:
         source = Path(swarm_work.__file__).read_text(encoding="utf-8")
@@ -3570,6 +3744,46 @@ os._exit(23)
         self.assertTrue(saw_result)
         ledger = next((self.root / ".harness" / "chats").glob("*.collaboration.jsonl"))
         self.assertIn('"phase":"context_tool_result"', ledger.read_text(encoding="utf-8"))
+
+    def test_tool_call_limit_is_told_to_the_agent_without_rolling_back_work(self) -> None:
+        (self.project / "source.txt").write_text("needed evidence\n", encoding="utf-8")
+        self.config.data["workflow"]["max_tool_calls"] = 1
+        work_calls: dict[str, int] = {}
+        limit_seen: dict[str, bool] = {}
+
+        def answer(_config, route, _text, **kwargs):
+            response_format = kwargs.get("response_format")
+            if response_format is swarm_work.PLAN_FORMAT:
+                value = {"contribution": "inspect", "message_to_lead": "ready", "needs_files": []}
+            elif response_format is swarm_work.PLAN_REVIEW_FORMAT:
+                value = {"contribution": "review", "message_to_lead": "ready", "needs_files": [], "ready_to_execute": True, "remaining": []}
+            elif response_format is swarm_work.WORK_FORMAT:
+                count = work_calls[route] = work_calls.get(route, 0) + 1
+                if "tool_call_limit_reached" in kwargs.get("context", ""):
+                    limit_seen[route] = True
+                read = {"name": "read_file", "arguments": {"path": "source.txt", "start_line": 1, "end_line": 5, "max_bytes": 2_000}}
+                if route == "claude" and count >= 2:
+                    value = {"reply": "created", "changes": [{"path": "limit-kept.txt", "content": "kept\n", "reason": "requested"}], "tool_calls": []}
+                else:
+                    # Codex keeps asking for tools even after being told.
+                    value = {"reply": "need context", "changes": [], "tool_calls": [{"call_id": f"{route}-{count}", **read}]}
+            else:
+                value = {"goal_complete": True, "feedback": "done", "remaining": []}
+            return {"text": json.dumps(value), "milliseconds": 1, "model": route}
+
+        with mock.patch.object(chat, "ask_once", side_effect=answer):
+            result = swarm_work.work_together(self.config, self.board, "agent-1", "Create limit-kept.txt")
+        self.assertTrue(result["goal_complete"], result)
+        self.assertEqual((self.project / "limit-kept.txt").read_text(encoding="utf-8"), "kept\n")
+        self.assertTrue(limit_seen.get("codex"), work_calls)
+        # Told once, asked again, then its turn ends: never an endless loop.
+        self.assertLessEqual(work_calls["codex"], 3)
+        ledger = next((self.root / ".harness" / "chats").glob("*.collaboration.jsonl")).read_text(encoding="utf-8")
+        self.assertIn('"phase":"context_tool_call_limit_reached"', ledger)
+        self.assertNotIn('"phase":"provider_transport_failure"', ledger)
+        journals = [json.loads(path.read_text(encoding="utf-8")) for path in
+                    (self.project / ".harness" / "swarm-mutation-sagas").glob("*.json")]
+        self.assertFalse(any(value.get("phase") == "compensated" for value in journals), journals)
 
     def test_selected_verification_tool_uses_budget_idempotence_and_durable_replay(self) -> None:
         config = LoadedConfig(copy.deepcopy(self.config.data), self.root, [], {})
@@ -4238,6 +4452,32 @@ os._exit(23)
                         self.config, self.board, "agent-1", f"Update {candidate}"
                     )
                 ask.assert_not_called()
+
+    def test_prose_that_is_not_a_path_never_stops_a_goal(self) -> None:
+        cases = (
+            ("Fix the crash on localhost:3000 in server.py", ["server.py"]),
+            ("Fix the crash on localhost:3000/login in server.py", ["server.py"]),
+            ("Use std::vector in engine.cpp", ["engine.cpp"]),
+            ("Use std::chrono::duration.count() in timer.cpp", ["timer.cpp"]),
+            ("Meeting at 10:30, update notes.md", ["notes.md"]),
+            ("Replace // comments in main.js", ["main.js"]),
+            ("Fix the error at parser.py:120", ["parser.py"]),
+        )
+        for goal, expected in cases:
+            with self.subTest(goal=goal):
+                self.assertEqual(expected, swarm_work._goal_named_paths(goal))
+                spec = swarm_work._compile_goal_spec(self.project, goal)
+                self.assertTrue(
+                    all(":" not in one for one in spec["write_policy"]["grants"]), spec,
+                )
+        for goal in (
+            "Update file.txt::$DATA", "Update localhost:3000/../secret.md",
+            "Update x::y/../../z.md", "Update a::b:c.md",
+        ):
+            with self.subTest(unsafe=goal), self.assertRaisesRegex(
+                HarnessError, "Unsafe explicit project path",
+            ):
+                swarm_work._compile_goal_spec(self.project, goal)
 
     def test_read_only_work_rejects_provider_mutations_and_proves_zero_write(self) -> None:
         (self.project / "parser.py").write_text("value = 1\n", encoding="utf-8")

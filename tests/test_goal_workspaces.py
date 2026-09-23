@@ -174,6 +174,46 @@ class GoalWorkspaces(unittest.TestCase):
             workspaces.root(document, self.runtime)
             workspaces.validate(document, self.runtime)
 
+    def test_project_edit_during_copy_creation_restarts_from_a_fresh_listing_on_retry(self) -> None:
+        for interruption in ["changed", "crashed"]:
+            with self.subTest(interruption=interruption):
+                source = self.folder / ("edited-during-copy-" + interruption)
+                source.mkdir()
+                (source / "app.txt").write_text("before")
+                (source / "removed.txt").write_text("deleted by the user mid-copy")
+                (source / "locked.txt").write_text("read only bytes")
+                os.chmod(source / "locked.txt", 0o444)
+                self.addCleanup(os.chmod, source / "locked.txt", 0o666)
+                document = {"goal_id": "copy-" + interruption, "project": {"path": str(source)},
+                            "project_authority_id": "selected-authority"}
+                original = workspaces._copy_file
+                def edit_while_copying(*args):
+                    original(*args)
+                    if not (source / "added.txt").exists():
+                        (source / "app.txt").write_text("edited while copying")
+                        (source / "removed.txt").unlink()
+                        (source / "added.txt").write_text("added while copying")
+                        if interruption == "crashed":
+                            raise OSError("process stopped mid-copy")
+                with patch.object(workspaces, "_copy_file", side_effect=edit_while_copying):
+                    with self.assertRaises((HarnessError, OSError)):
+                        workspaces.create(document, self.runtime)
+                # Every retry used to refuse against the stale listing forever.
+                document["execution_workspace"] = workspaces.create(document, self.runtime)
+                copy = workspaces.root(document, self.runtime)
+                self.assertEqual(sorted(path.name for path in copy.iterdir()), ["added.txt", "app.txt", "locked.txt"])
+                self.assertEqual((copy / "app.txt").read_text(), "edited while copying")
+                self.assertEqual(workspaces.differing_files(document, self.runtime), [])
+                workspaces.validate(document, self.runtime, full=True)
+                self.assertEqual(workspaces.create(document, self.runtime), document["execution_workspace"])
+
+    def test_ready_workspace_is_never_discarded_when_the_project_later_changes(self) -> None:
+        document = self.goal()
+        (workspaces.root(document, self.runtime) / "app.txt").write_text("agent work")
+        (self.source / "support.txt").write_text("user edited after the copy was ready")
+        self.assertEqual(workspaces.create(document, self.runtime), document["execution_workspace"])
+        self.assertEqual((workspaces.root(document, self.runtime) / "app.txt").read_text(), "agent work")
+
     def test_interrupted_rebase_retains_the_original_goal_delta_on_retry(self) -> None:
         document = self.goal()
         candidate = workspaces.root(document, self.runtime)

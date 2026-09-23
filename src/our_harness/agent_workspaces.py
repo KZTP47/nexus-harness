@@ -23,7 +23,15 @@ from .filesystem_paths import filesystem_path
 from .safety import ProjectTransactionLock, confined_path, portable_relative_path_key
 
 CONTRACT = "nexus-agent-workspace/v1"
-_GENERATED = {".git", ".harness", ".nexus-verification", "node_modules", ".venv", "venv", "__pycache__"}
+_GENERATED = {".git", ".harness", ".nexus-verification", "node_modules", ".venv", "venv", "__pycache__",
+              # Caches that test, lint and build tools write on their own while an
+              # agent works. They are not the agent's changes, and collecting them
+              # used up the publication budget and published tool litter. Output
+              # folders such as dist, build and target can be real deliverables,
+              # so they are deliberately not listed here.
+              ".pytest_cache", ".mypy_cache", ".ruff_cache", ".hypothesis", ".tox", ".nox",
+              ".coverage", ".ipynb_checkpoints", ".eslintcache", ".parcel-cache", ".turbo",
+              ".gradle", ".cache"}
 
 
 def inventory(root: Path) -> dict:

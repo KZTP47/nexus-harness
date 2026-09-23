@@ -275,3 +275,23 @@ class EmailHTTPTests(PanelTestCase):
         for action in ("bind_execution", "rebind_execution"):
             with self.assertRaises(HarnessError):
                 self.panel.email.dispatch(action, {})
+
+    def test_notification_feed_needs_the_session_token_and_reads_after_a_cursor(self):
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}/api/email/notifications")
+        with self.assertRaises(urllib.error.HTTPError):
+            urllib.request.urlopen(request, timeout=10)
+        service = self.panel.email
+        account = {'id': 'synthetic-mailbox', 'name': 'Work'}
+        service._announce_drafting(account, {'id': 'm1', 'sender': 'a@example.test', 'subject': 'One'}, {'id': 'd1'})
+        service._announce_drafting(account, {'id': 'm2', 'sender': 'b@example.test', 'subject': 'Two'}, {'id': 'd2'})
+        status, feed = self.ask('/api/email/notifications')
+        self.assertEqual(status, 200, feed)
+        self.assertEqual([item['subject'] for item in feed['items']], ['One', 'Two'])
+        self.assertEqual(feed['seq'], 2)
+        status, later = self.ask('/api/email/notifications?after=1')
+        self.assertEqual([item['draft_id'] for item in later['items']], ['d2'])
+        self.assertEqual(later['boot'], feed['boot'])
+        status, garbled = self.ask('/api/email/notifications?after=not-a-number')
+        self.assertEqual(len(garbled['items']), 2)
+        # Polling the feed is read-only: it never opens a mail store.
+        self.assertFalse((self.root / '.harness' / 'email-studio').exists())

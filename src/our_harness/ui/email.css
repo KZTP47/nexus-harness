@@ -72,3 +72,21 @@
 .email-memory-empty { color: var(--muted); padding: 12px 0; }
 
 .email-learning-attempt { border-top: 1px solid var(--line); padding: 10px 0; overflow-wrap: anywhere; }
+
+/* Corner notifications in a plain browser (the desktop app shows its own
+   always-on-top pop-up instead). Same look: a dark card sliding up from the
+   corner, square avatar, bold name, quiet action line, detail in colour. */
+.nexus-mail-toasts { position: fixed; right: 16px; bottom: 16px; z-index: 2147483000; display: flex; flex-direction: column; gap: 8px; width: min(368px, calc(100vw - 32px)); pointer-events: none; }
+.nexus-mail-toast { position: relative; pointer-events: auto; border: 1px solid rgba(102, 192, 244, .45); border-radius: 4px; background: linear-gradient(180deg, #2a475e 0%, #1b2838 100%); box-shadow: 0 6px 18px rgba(0, 0, 0, .55); color: #fff; animation: nexus-mail-toast-in 320ms cubic-bezier(.2, .9, .3, 1) both; }
+.nexus-mail-toast-open { display: grid; grid-template-columns: 56px minmax(0, 1fr); gap: 12px; align-items: center; width: 100%; min-height: 84px; padding: 12px 34px 12px 12px; border: 0; background: transparent; color: inherit; font: 13px/1.35 "Segoe UI", system-ui, sans-serif; text-align: left; cursor: pointer; }
+.nexus-mail-toast-open:focus-visible, .nexus-mail-toast-close:focus-visible { outline: 2px solid #fff2a8; outline-offset: -2px; }
+.nexus-mail-toast-avatar { display: grid; place-items: center; width: 56px; height: 56px; border: 2px solid #a4d007; border-radius: 2px; background: linear-gradient(160deg, #66c0f4, #1a6ea0); font-size: 24px; font-weight: 700; }
+.nexus-mail-toast-text { min-width: 0; }
+.nexus-mail-toast-title, .nexus-mail-toast-action, .nexus-mail-toast-detail { display: block; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.nexus-mail-toast-title { font-weight: 700; font-size: 14px; }
+.nexus-mail-toast-action { color: #b8c6d1; }
+.nexus-mail-toast-detail { color: #a4d007; font-weight: 600; }
+.nexus-mail-toast-close { position: absolute; top: 6px; right: 6px; width: 24px; height: 24px; padding: 0; border: 0; border-radius: 3px; background: transparent; color: #b8c6d1; font-size: 16px; cursor: pointer; }
+.nexus-mail-toast-close:hover { background: rgba(255, 255, 255, .12); color: #fff; }
+@keyframes nexus-mail-toast-in { from { transform: translateY(110%); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .nexus-mail-toast { animation-duration: 1ms; } }

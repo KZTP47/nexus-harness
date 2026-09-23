@@ -142,7 +142,7 @@ def _payload_body(where: Path, one: dict[str, Any]) -> str:
 def _externalize_body(where: Path, one: dict[str, Any]) -> dict[str, Any]:
     """Move one queued canonical body out of the frequently rewritten index."""
 
-    if one.get("state") == "acknowledged":
+    if one.get("state") in _SETTLED:
         held = dict(one)
         if "body" in held:
             body = str(held.pop("body") or "")
@@ -194,19 +194,109 @@ def _write(where: Path, messages: list[dict[str, Any]]) -> None:
     }, indent=2) + "\n")
 
 
+# Finished with: answered, or left behind when the project's jobs changed. Only
+# these may fall off the end of the bounded history.
+_SETTLED = {"acknowledged", "superseded"}
+
+
 def _pruned(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Bound the history without silently discarding undelivered work."""
 
     if len(messages) <= MOST_MESSAGES:
         return messages
-    queued = [one for one in messages if one.get("state") != "acknowledged"]
-    acknowledged = [one for one in messages if one.get("state") == "acknowledged"]
+    queued = [one for one in messages if one.get("state") not in _SETTLED]
+    settled = [one for one in messages if one.get("state") in _SETTLED]
     if len(queued) > MOST_MESSAGES:
         raise MailboxError(
             "The agent mailbox is full of undelivered messages. Let the receiving "
             "agents catch up before starting another run."
         )
-    return acknowledged[-(MOST_MESSAGES - len(queued)):] + queued
+    # Counted from the front: at exactly the limit, "-0:" would have kept
+    # every settled message instead of none.
+    return settled[len(settled) - (MOST_MESSAGES - len(queued)):] + queued
+
+
+def _release_body(where: Path, one: dict[str, Any]) -> Path | None:
+    """Drop a settled message's text from the index; return its payload file."""
+
+    reference = str(one.get("body_ref") or "").strip()
+    payload = (
+        _payload_folder(where) / reference
+        if reference and Path(reference).name == reference else None
+    )
+    if "body" in one:
+        body = str(one.get("body") or "")
+        one["body_sha256"] = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        one["body_characters"] = len(body)
+    one.pop("body", None)
+    one.pop("body_ref", None)
+    one["body_removed_after_acknowledgement"] = True
+    return payload
+
+
+def _remove_unreferenced(where: Path, messages: list[dict[str, Any]], payloads: Iterable[Path]) -> None:
+    remaining_references = {
+        str(one.get("body_ref") or "") for one in messages
+        if one.get("state") not in _SETTLED and one.get("body_ref")
+    }
+    # Only after the settled metadata is durable, and only when no other
+    # queued fan-out delivery still refers to the same exact payload.
+    for payload in set(payloads):
+        if payload.name in remaining_references:
+            continue
+        try:
+            payload.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _supersede(
+    where: Path, messages: list[dict[str, Any]], current_goals: dict[str, str],
+) -> tuple[int, list[Path]]:
+    """Settle queued mail whose project now has a different list of jobs.
+
+    A changed job list is a changed goal, and mail is only ever delivered into
+    the goal it was written for, so these can never be delivered or
+    acknowledged. Left queued they would count toward the limit forever and
+    eventually refuse every new handoff.
+    """
+
+    count = 0
+    payloads: list[Path] = []
+    for one in messages:
+        if one.get("state") != "queued":
+            continue
+        project = str(one.get("project") or "")
+        if project not in current_goals or one.get("shared_goal_id") == current_goals[project]:
+            continue
+        payload = _release_body(where, one)
+        if payload is not None:
+            payloads.append(payload)
+        one["state"] = "superseded"
+        one["superseded_at"] = _now()
+        one["last_error"] = ""
+        count += 1
+    return count, payloads
+
+
+def retire_superseded_goals(where: Path, current_goals: dict[str, str]) -> int:
+    """Settle queued mail written for a project's earlier jobs; return how many.
+
+    Only projects named in ``current_goals`` are touched, so mail for a
+    project that is simply not on this board right now is left alone.
+    """
+
+    wanted = {_clean(project): _clean(goal, 100) for project, goal in current_goals.items()
+              if _clean(project) and _clean(goal, 100)}
+    if not wanted:
+        return 0
+    with _lock:
+        messages = _read(where)
+        count, payloads = _supersede(where, messages, wanted)
+        if count:
+            _write(where, _pruned(messages))
+            _remove_unreferenced(where, messages, payloads)
+    return count
 
 
 def enqueue(
@@ -263,8 +353,13 @@ def enqueue(
     )
     with _lock:
         messages = _read(where)
+        # This message says which jobs its project has now. Mail still queued
+        # for the project's earlier jobs can never be delivered, so it must
+        # not take up room this one needs.
+        _count, payloads = _supersede(where, messages, {message.project: message.shared_goal_id})
         messages.append(message.to_dict())
         _write(where, _pruned(messages))
+        _remove_unreferenced(where, messages, payloads)
     return message
 
 
@@ -368,33 +463,14 @@ def acknowledge(where: Path, message_ids: Iterable[str]) -> None:
         for one in messages:
             if one.get("message_id") not in wanted:
                 continue
-            reference = str(one.get("body_ref") or "").strip()
-            if reference and Path(reference).name == reference:
-                payloads_to_remove.append(_payload_folder(where) / reference)
-            if "body" in one:
-                body = str(one.get("body") or "")
-                one["body_sha256"] = hashlib.sha256(body.encode("utf-8")).hexdigest()
-                one["body_characters"] = len(body)
-            one.pop("body", None)
-            one.pop("body_ref", None)
-            one["body_removed_after_acknowledgement"] = True
+            payload = _release_body(where, one)
+            if payload is not None:
+                payloads_to_remove.append(payload)
             one["state"] = "acknowledged"
             one["acknowledged_at"] = _now()
             one["last_error"] = ""
         _write(where, _pruned(messages))
-        remaining_references = {
-            str(one.get("body_ref") or "") for one in messages
-            if one.get("state") != "acknowledged" and one.get("body_ref")
-        }
-        # Only after acknowledged metadata is durable, and only when no other
-        # queued fan-out delivery still refers to the same exact payload.
-        for payload in set(payloads_to_remove):
-            if payload.name in remaining_references:
-                continue
-            try:
-                payload.unlink(missing_ok=True)
-            except OSError:
-                pass
+        _remove_unreferenced(where, messages, payloads_to_remove)
 
 
 def status(where: Path) -> dict[str, int]:
@@ -419,6 +495,12 @@ def delivery_details(where: Path, *, active_message_ids: Iterable[str] = ()) -> 
     for one in messages:
         identity = str(one.get('message_id', ''))
         acknowledged = one.get('state') == 'acknowledged'
+        if one.get('state') == 'superseded':
+            result[identity] = {
+                'stage': 'superseded', 'age_seconds': 0, 'attention': False,
+                'label': 'Not delivered: the jobs for this project changed after it was written',
+            }
+            continue
         try:
             age = max(0, int((datetime.now() - datetime.fromisoformat(one['created_at'])).total_seconds()))
         except (ValueError, TypeError, KeyError):

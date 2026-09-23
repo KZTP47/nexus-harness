@@ -18,7 +18,8 @@ test("team panel remembers collapse, expands for fresh input, preserves drafts a
     await page.route("http://nexus.test/**", route => route.fulfill({contentType:"text/html",body:'<main class="the-big-chat-transcript"><section id="panel" class="chat-team-goal"></section></main><input id="composer" aria-label="Message">'}));
     await page.goto("http://nexus.test/");
     await page.addStyleTag({content:fs.readFileSync(path.join(ui,"styles.css"),"utf8")});
-    const script = source.slice(source.indexOf("function fillChatGoalPanel"),source.indexOf("function syncChatGoalControls"));
+    const script = source.slice(source.indexOf("function fillChatGoalPanel"),source.indexOf("function syncChatGoalControls"))
+      + source.slice(source.indexOf("function chatCanContinueInThisFolder"),source.indexOf("// The cards move when they are dragged"));
     await page.addScriptTag({content:script + `
       function make(tag,cls='',text=''){const n=document.createElement(tag);n.className=cls;n.textContent=text;return n;}
       window.chat='first';window.goal={goal_id:'goal-one',project:{id:'portable-project'},status:'running',revision:1};
@@ -31,6 +32,10 @@ test("team panel remembers collapse, expands for fresh input, preserves drafts a
       window.problem='';window.repair=null;window.reconnect=null;window.actions=[];
       const chatGoalParticipants=conversation=>conversation.pair;
       const createConversationFor=(...args)=>window.actions.push(['fresh',...args]);
+      const swarmConversationSwitching=new Set(),swarmChatIsHydrating=()=>false;
+      const activeConversationFor=()=>window.repair;
+      const activateConversationFor=async(...args)=>window.actions.push(['activate',...args]);
+      const selectConversationProject=async(...args)=>window.actions.push(['select',...args]);
       const appendProviderReconnectControl=(panel,agent,conversation)=>{
         const button=make('button','','Reconnect saved chat');button.onclick=()=>window.actions.push(['reconnect',agent,conversation.id]);panel.append(button);
       };
@@ -98,6 +103,24 @@ test("team panel remembers collapse, expands for fresh input, preserves drafts a
     assert.equal(await page.getByLabel('Hidden until setup is fixed').count(),0);
     await page.getByRole('button',{name:'Start fresh with current setup'}).click();
     assert.deepEqual(await page.evaluate(()=>actions.pop()),['fresh','agent','peer','']);
+    assert.equal(await page.getByRole('button',{name:'Continue in this folder'}).count(),0,
+      "a binding problem the server cannot rebind offers no continue-in-folder action");
+    // A moved or changed project folder the server can safely rebind offers to
+    // continue the same chat there, only when pressed, with its own project.
+    await page.evaluate(()=>{
+      window.repair={id:'saved-chat',pair:['agent','peer'],project:'portable-project',
+        binding_problem:{code:'project_binding_changed',project_id:'portable-project',can_rebind_project:true,
+          action_label:'Start fresh with current setup'}};
+      window.actions=[];render();
+    });
+    assert.deepEqual(await page.evaluate(()=>actions),[],"nothing is sent until the user presses it");
+    await page.getByRole('button',{name:'Continue in this folder'}).click();
+    assert.deepEqual(await page.evaluate(()=>actions.pop()),['select','agent','portable-project']);
+    assert.equal(await page.getByRole('button',{name:'Start fresh with current setup'}).count(),1);
+    await page.evaluate(()=>{
+      window.repair={id:'saved-chat',pair:['agent','peer'],binding_problem:{action_label:'Start fresh with current setup'}};
+      render();
+    });
     await page.evaluate(()=>{window.reconnect=window.repair;render();});
     await page.getByRole('button',{name:'Reconnect saved chat'}).click();
     assert.deepEqual(await page.evaluate(()=>actions.pop()),['reconnect','agent','saved-chat']);

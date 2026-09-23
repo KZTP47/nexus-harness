@@ -176,6 +176,24 @@ class SharedGoalVerificationTests(unittest.TestCase):
                 self.assertEqual(result["status"], expected, result)
                 self.assertTrue("containment" in result["basis"] or "escape" in result["basis"], result)
 
+    def test_missing_module_text_only_fails_a_nonzero_command(self):
+        warning = "warning: No module named optional_accel, using fallback\n"
+        with mock.patch.object(
+            swarm_work, "_run_disposable_verification_command",
+            return_value=self.result(stderr=warning + "Ran 1 test in 0.001s\n\nOK\n"),
+        ):
+            passed = self.verify()
+        self.assertEqual(passed["status"], "passed", passed)
+        with mock.patch.object(
+            swarm_work, "_run_disposable_verification_command",
+            return_value=self.result(
+                exit_code=1, stderr="ModuleNotFoundError: No module named 'pytest_asyncio'\n",
+            ),
+        ):
+            missing = self.verify()
+        self.assertEqual(missing["status"], "failed", missing)
+        self.assertEqual(missing["basis"], "missing_test_dependency", missing)
+
     def test_real_project_tree_drift_refuses_otherwise_positive_results(self):
         def changed_during_execution(*_args, **_kwargs):
             (self.root / "outside-copy.txt").write_text("unexpected original-tree write", encoding="utf-8")

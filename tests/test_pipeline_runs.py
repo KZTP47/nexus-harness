@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 import shutil
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -264,6 +266,15 @@ class PipelineRunStoreTests(unittest.TestCase):
         self.assertEqual(recovered["state"], "interrupted")
         self.assertFalse(recovered["result"]["passed"])
         self.assertIn("owner stopped", recovered["result"]["said"])
+
+    @unittest.skipUnless(os.name == "nt", "Windows access-denied process handles")
+    def test_access_denied_live_owner_keeps_its_lease_and_dead_owner_is_recovered(self) -> None:
+        # The System process (PID 4) always exists and refuses a normal
+        # user's query handle. That must read as "alive", never as dead.
+        self.assertTrue(pipeline_runs._owner_is_alive(4, "unverifiable-birth-token"))
+        finished = subprocess.Popen([sys.executable, "-c", "pass"])
+        finished.wait(10)
+        self.assertFalse(pipeline_runs._owner_is_alive(finished.pid, ""))
 
     def test_runtime_path_inside_project_is_rejected(self) -> None:
         os.environ["OUR_HARNESS_PIPELINE_RUN_DIR"] = str(self.root / ".runtime")

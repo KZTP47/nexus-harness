@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from email import policy
 from email.message import EmailMessage
 from email.parser import BytesParser
-from email.utils import parseaddr
+from email.utils import parseaddr, parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +59,11 @@ def _address(value):
     if '\r' in value or '\n' in value:
         raise HarnessError('Email addresses cannot contain newlines.')
     address = parseaddr(value)[1]
+    if not address:
+        # Decoded headers such as `Müller, Hans <h@x.de>` carry an unquoted
+        # comma that parseaddr rejects; the angle address is still exact.
+        found = re.search(r'<([^\s@<>]+@[^\s@<>]+)>\s*$', value)
+        address = found.group(1) if found else ''
     if not re.fullmatch(r'[^\s@<>]+@[^\s@<>]+', address):
         raise HarnessError('Enter a valid email address.')
     return address
@@ -541,6 +546,8 @@ class EmailStudio:
         fingerprint = _fingerprint({k: value[k] for k in ('email', 'kind', 'imap_host', 'imap_port', 'imap_folder', 'username', 'smtp_host', 'smtp_port', 'smtp_mode')})
         if existing and existing.get('fingerprint') != fingerprint:
             value.update(cursor='', uidvalidity='', credential='', last_sync='', error='Mailbox configuration changed; reconnect before syncing.')
+        if value['kind'] == 'imap' and (not existing or existing.get('fingerprint') != fingerprint):
+            value['auto_draft_since'] = _now()
         if payload.get('password'):
             value['credential'] = self.secrets.protect(_text(payload['password'], 10000))
         value.update(fingerprint=fingerprint, schema_version=SCHEMA_VERSION)
@@ -563,12 +570,25 @@ class EmailStudio:
             if len(raw) > 2_000_000:
                 raise HarnessError('This email exceeds the 2 MB import limit.')
             mail = BytesParser(policy=policy.default).parsebytes(raw)
-            part = mail.get_body(preferencelist=('plain',)) if mail.is_multipart() else mail
-            body = part.get_content() if part and part.get_content_type() == 'text/plain' else '[No plain-text body. HTML and attachments are not executed.]'
+            from .email_connectors import _plain_html, _single_reply_to
+            part = mail.get_body(preferencelist=('plain', 'html')) if mail.is_multipart() else mail
+            kind = part.get_content_type() if part else ''
+            # HTML-only mail is read as text (never rendered or executed), so
+            # the assistant drafts from what the sender actually wrote.
+            body = part.get_content() if kind == 'text/plain' else _plain_html(part.get_content()) if kind == 'text/html' else ''
+            body = body.strip()  # No readable text is refused below rather than drafted from a placeholder.
             sender, subject = str(mail.get('From', '')), str(mail.get('Subject', ''))
             source_id = source_id or str(mail.get('Message-ID', '')) or hashlib.sha256(raw).hexdigest()
-            metadata.update(reply_to=str(mail.get('Reply-To', '')), internet_message_id=str(mail.get('Message-ID', '')),
+            # The same single-recipient rule the mailbox connectors use: a reply
+            # that can never be addressed must be refused on arrival, not after approval.
+            metadata.update(reply_to=_single_reply_to(mail.get('Reply-To', '')), internet_message_id=str(mail.get('Message-ID', '')),
                             references=str(mail.get('References', '')))
+            if not metadata.get('received_at'):
+                try:
+                    dated = parsedate_to_datetime(str(mail.get('Date', '')))
+                    metadata['received_at'] = (dated if dated.tzinfo else dated.replace(tzinfo=timezone.utc)).isoformat()
+                except (TypeError, ValueError, IndexError):
+                    pass  # A missing date is history under a connection baseline.
         else:
             sender, subject, body = payload.get('sender'), payload.get('subject'), payload.get('body')
         sender, subject, body = _text(sender, 500), _text(subject, 1000), _text(body)
@@ -604,6 +624,19 @@ class EmailStudio:
                 return self._put('message', existing)
         return existing
 
+    def _ingest_or_record(self, account, message, source_id):
+        """Store one synced message, or record why it could not be stored and move on."""
+        failure_id = _fingerprint(['failed-import', account['id'], account['fingerprint'], str(source_id)])
+        try:
+            stored = self._ingest(account, message, source_id)
+        except HarnessError as exc:
+            self._put('failed_import', dict(id=failure_id, account_id=account['id'], account_fingerprint=account['fingerprint'],
+                                            source_id=str(source_id), error=str(exc)[:1000], checked_at=_now()))
+            return None
+        with self._db() as db:
+            db.execute('DELETE FROM records WHERE kind=? AND id=?', ('failed_import', failure_id))
+        return stored
+
     def _sync(self, account):
         if account['kind'] in LOCAL_KINDS:
             if account.get('connection_state') == 'disconnected':
@@ -622,7 +655,7 @@ class EmailStudio:
                             or current.get('connection_state') == 'disconnected'):
                         raise HarnessError('The mailbox changed during its check. Its newer settings were kept; check again.')
                     for message in result['messages']:
-                        self._ingest(current, message, message['source_id'])
+                        self._ingest_or_record(current, message, message['source_id'])
                     current.update(cursor=result['cursor'], last_sync=_now(), connection_state='connected',
                                    error=' '.join(str(w) for w in result.get('warnings', []))[:1000])
                     self._put('account', current)
@@ -653,10 +686,7 @@ class EmailStudio:
                             or current.get('connection_state') == 'disconnected'):
                         raise HarnessError('The mailbox changed during synchronization. Its newer settings were kept.')
                     for message in result['messages']:
-                        self._ingest(current, message, message['source_id'])
-                        failure_id = _fingerprint(['failed-import', current['id'], current['fingerprint'], message['source_id']])
-                        with self._db() as db:
-                            db.execute('DELETE FROM records WHERE kind=? AND id=?', ('failed_import', failure_id))
+                        self._ingest_or_record(current, message, message['source_id'])
                     for failure in result.get('failed_messages', []):
                         source_id = str(failure['source_id'])
                         self._put('failed_import', dict(id=_fingerprint(['failed-import', current['id'], current['fingerprint'], source_id]),
@@ -693,7 +723,7 @@ class EmailStudio:
                     if status != 'OK':
                         raise HarnessError('The mailbox could not return a message.')
                     raw = next((item[1] for item in data if isinstance(item, tuple)), b'')
-                    self._ingest(account, {'raw': raw}, validity + ':' + uid.decode())
+                    self._ingest_or_record(account, {'raw': raw}, validity + ':' + uid.decode())
                     account.update(cursor=uid.decode(), uidvalidity=validity)
                     self._put('account', account)
                     count += 1

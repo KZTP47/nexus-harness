@@ -113,6 +113,80 @@ class DurableAgentMailbox(unittest.TestCase):
             allowed_senders=["agent-1"],
         ), [])
 
+    def test_mail_for_a_projects_earlier_jobs_never_blocks_new_handoffs(self) -> None:
+        with mock.patch.object(mailbox, "MOST_MESSAGES", 3):
+            for number in range(3):
+                mailbox.enqueue(
+                    self.where, shared_goal_id="old-jobs", sender="agent-1",
+                    sender_name="Reviewer", receiver="agent-2", receiver_name="Writer",
+                    project="project-1", project_name="Nexus", body=f"old answer {number}",
+                )
+            # The jobs changed, so the goal changed: the full mailbox of old
+            # mail used to refuse every new handoff forever.
+            fresh = self.queued("new-jobs")
+            messages = json.loads(self.where.read_text(encoding="utf-8"))["messages"]
+            self.assertEqual(
+                sorted(one["state"] for one in messages),
+                ["queued", "superseded", "superseded"],
+            )
+            self.assertFalse(any("body_ref" in one for one in messages if one["state"] == "superseded"))
+            payloads = list((self.where.parent / f"{self.where.stem}-payloads").glob("*.txt"))
+            self.assertEqual(len(payloads), 1)
+            self.assertEqual(mailbox.pending(
+                self.where, shared_goal_id="old-jobs", receiver="agent-2",
+                allowed_senders=["agent-1"],
+            ), [])
+            self.assertEqual([one.message_id for one in mailbox.pending(
+                self.where, shared_goal_id="new-jobs", receiver="agent-2",
+                allowed_senders=["agent-1"],
+            )], [fresh.message_id])
+            details = mailbox.delivery_details(self.where)
+            self.assertEqual(
+                sorted(one["stage"] for one in details.values()),
+                ["queued", "superseded", "superseded"],
+            )
+            # Undelivered mail for the current goal is still never dropped.
+            self.queued("new-jobs")
+            self.queued("new-jobs")
+            with self.assertRaisesRegex(mailbox.MailboxError, "catch up"):
+                self.queued("new-jobs")
+
+    def test_retiring_earlier_jobs_leaves_other_and_absent_projects_alone(self) -> None:
+        stale = self.queued("old-jobs")
+        elsewhere = mailbox.enqueue(
+            self.where, shared_goal_id="their-goal", sender="agent-1",
+            sender_name="Reviewer", receiver="agent-2", receiver_name="Writer",
+            project="project-2", project_name="Other", body="other project",
+        )
+        absent = mailbox.enqueue(
+            self.where, shared_goal_id="absent-goal", sender="agent-1",
+            sender_name="Reviewer", receiver="agent-2", receiver_name="Writer",
+            project="project-3", project_name="Not on this board", body="kept",
+        )
+        retired = mailbox.retire_superseded_goals(
+            self.where, {"project-1": "new-jobs", "project-2": "their-goal"},
+        )
+        self.assertEqual(retired, 1)
+        states = {one["message_id"]: one["state"]
+                  for one in json.loads(self.where.read_text(encoding="utf-8"))["messages"]}
+        self.assertEqual(states, {
+            stale.message_id: "superseded",
+            elsewhere.message_id: "queued",
+            absent.message_id: "queued",
+        })
+        self.assertEqual(mailbox.retire_superseded_goals(
+            self.where, {"project-1": "new-jobs"},
+        ), 0)
+
+    def test_pruning_at_exactly_the_limit_keeps_no_settled_history(self) -> None:
+        settled = [{"message_id": "done", "state": "acknowledged"},
+                   {"message_id": "left", "state": "superseded"}]
+        queued = [{"message_id": f"q{number}", "state": "queued"} for number in range(3)]
+        with mock.patch.object(mailbox, "MOST_MESSAGES", 3):
+            self.assertEqual(mailbox._pruned(settled + queued), queued)
+        with mock.patch.object(mailbox, "MOST_MESSAGES", 4):
+            self.assertEqual(mailbox._pruned(settled + queued), settled[1:] + queued)
+
     def test_a_removed_communication_line_cannot_receive_old_mail(self) -> None:
         self.queued()
         self.assertEqual(mailbox.pending(

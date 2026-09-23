@@ -4569,6 +4569,35 @@ class LongHorizonTests(unittest.TestCase):
             ["legacy-run:older-overlapping"],
         )
 
+    def test_legacy_projects_whose_folders_vanished_never_block_long_horizon_admission(self):
+        vanished = self.base / "moved-or-deleted-project"
+        nested_gone = self.project / "deleted-subfolder"
+        gone_board = copy.deepcopy(self.board)
+        gone_board["projects"][0].update({"id": "gone", "path": str(vanished)})
+        panel = harness_server.HarnessHTTPServer(("127.0.0.1", 0), self.config)
+        self.addCleanup(panel.server_close)
+        fake_runs = mock.Mock()
+        fake_runs.active_runs.return_value = [
+            {"run_id": "board-gone", "snapshot": {"kind": "board_order", "board": gone_board}},
+            {"run_id": "work-gone", "snapshot": {
+                "selected_mode": "work", "project_id": "gone",
+                "board": gone_board, "conversation": {"project": "gone"},
+            }},
+        ]
+        fake_queue = mock.Mock()
+        fake_queue.active_project_paths.return_value = [str(vanished)]
+        panel._swarm_runs = fake_runs
+        panel._swarm_goal_queue = fake_queue
+        # A missing folder elsewhere is no conflict, and is not an error.
+        self.assertEqual(panel.legacy_project_conflicts(self.project), [])
+        # A missing folder still reserves its recorded place.
+        fake_runs.active_runs.return_value = []
+        fake_queue.active_project_paths.return_value = [str(nested_gone)]
+        self.assertEqual(
+            panel.legacy_project_conflicts(self.project),
+            ["legacy-goal-queue:" + str(nested_gone.resolve())],
+        )
+
     def test_attachment_failure_cannot_persist_or_block_a_goal(self):
         runtime = long_horizon.LongHorizonRuntime(self.config)
         self.addCleanup(runtime.close)

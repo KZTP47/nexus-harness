@@ -530,3 +530,63 @@ class LocalWorkflowTests(unittest.TestCase):
         self.assertTrue(errors)
         self.assertEqual(self.studio.snapshot()['accounts'][0]['connection_state'], 'disconnected')
         self.assertNotEqual(self.studio.snapshot()['accounts'][0].get('cursor'), 'later')
+
+    def test_new_mail_raises_one_corner_notice_while_its_reply_is_drafted(self):
+        service = self.service()
+        self.assertEqual(service.notifications()['items'], [])
+        self.adapter.messages.append(dict(source_id='notice-one', sender='Ada Lovelace <ada@example.test>',
+            subject='Quarterly numbers', body='Could you send them?',
+            browser_reference={'contract': 'browser-reply/v1', 'provider': 'browser_outlook',
+                               'source_hash': 'notice-one', 'row_id': 'notice-one', 'row_attr': 'data-convid'}))
+        service._poll_account(self.account['id'])
+        feed = service.notifications()
+        self.assertEqual(feed['contract'], 'email-notifications/v1')
+        self.assertEqual(len(feed['items']), 1)
+        notice = feed['items'][0]
+        draft = self.studio.snapshot()['drafts'][-1]
+        self.assertEqual((notice['kind'], notice['sender'], notice['subject']), ('drafting', 'Ada Lovelace', 'Quarterly numbers'))
+        self.assertEqual((notice['account_id'], notice['message_id'], notice['draft_id']),
+                         (self.account['id'], draft['message_id'], draft['id']))
+        self.assertFalse(notice['private'])
+        self.assertNotIn('raised', notice)
+        # A second scan finds nothing new, and a reader past the cursor sees nothing again.
+        service._poll_account(self.account['id'])
+        self.assertEqual(len(service.notifications()['items']), 1)
+        self.assertEqual(service.notifications(after=feed['seq'])['items'], [])
+
+    def test_notice_privacy_and_off_switch_persist_across_restart(self):
+        service = self.service()
+        self.assertEqual(service.notification_settings(), {'enabled': True, 'show_details': True})
+        with self.assertRaises(HarnessError):
+            service.dispatch('notification_settings', {'enabled': 'yes'})
+        service.dispatch('notification_settings', {'show_details': False})
+        self.studio = self.reopen()
+        service = self.service()
+        self.assertEqual(service.notification_settings(), {'enabled': True, 'show_details': False})
+        self.assertEqual(service.snapshot()['notifications'], {'enabled': True, 'show_details': False})
+        self.arrive('private-one')
+        service._poll_account(self.account['id'])
+        notice = service.notifications()['items'][-1]
+        self.assertTrue(notice['private'])
+        self.assertEqual((notice['sender'], notice['subject'], notice['account']), ('', '', ''))
+        service.dispatch('notification_settings', {'enabled': False})
+        self.arrive('silent-one')
+        service._poll_account(self.account['id'])
+        self.assertEqual(len(service.notifications()['items']), 1)
+        self.assertEqual(self.studio.snapshot()['drafts'][-1]['status'], 'review')
+
+    def test_a_broken_notice_never_stops_the_draft_it_announces(self):
+        service = self.service()
+        with patch.object(service, '_announce_drafting', side_effect=RuntimeError('display failed')):
+            self.arrive('still-drafted')
+            service._poll_account(self.account['id'])
+        self.assertEqual(self.studio.snapshot()['drafts'][-1]['status'], 'review')
+
+    def test_reading_notice_settings_never_creates_a_mail_store(self):
+        fresh = tempfile.TemporaryDirectory(prefix='mail-untouched-')
+        self.addCleanup(fresh.cleanup)
+        config = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), Path(fresh.name), [], {})
+        service = EmailService(SimpleNamespace(config=config), engine=Mock())
+        self.assertEqual(service.notification_settings(), {'enabled': True, 'show_details': True})
+        self.assertEqual(service.notifications()['items'], [])
+        self.assertFalse((Path(fresh.name) / '.harness' / 'email-studio').exists())

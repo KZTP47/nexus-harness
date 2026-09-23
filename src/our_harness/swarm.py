@@ -48,7 +48,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Any
 
-from .models import HarnessError
+from .models import HarnessError, ProviderOutcomeUnknown
 
 # The most of each, so a board stays something a person can look at and a file
 # stays something a machine can read quickly.
@@ -760,6 +760,16 @@ def load() -> Board:
         ) from exc
 
 
+def _folders_on_the_board_twice(board: Board) -> dict[str, int]:
+    """How many extra project boxes point at a folder, compared as the OS does."""
+
+    counted: dict[str, int] = {}
+    for project in board.projects:
+        key = os.path.normcase(project.path)
+        counted[key] = counted.get(key, -1) + 1
+    return {key: extra for key, extra in counted.items() if extra}
+
+
 @_requires_board_qa_access
 def save(
     said: Any,
@@ -822,6 +832,16 @@ def _save_while_board_authority_is_held(
     # something held around both of them the check below proves nothing.
     now = load()
     board = read_it(said, now.made_agents, now.made_projects)
+    # On Windows two spellings that differ only in letter case are one folder. A pair already written
+    # down before this check existed is left as it is, so the board still
+    # opens; only a newly added second copy of a folder is refused.
+    already_twice = _folders_on_the_board_twice(now)
+    newly_twice = {key for key, extra in _folders_on_the_board_twice(board).items()
+                   if extra > already_twice.get(key, 0)}
+    if newly_twice:
+        again = next(one.path for one in reversed(board.projects)
+                     if os.path.normcase(one.path) in newly_twice)
+        raise SwarmError(f"{again} is on the board twice")
     # Workspace identity is server-owned. A stale panel may omit it and a
     # hand-edited request may try to substitute it; neither may retarget saved
     # conversations. Opening a locally validated named board is the one
@@ -1282,6 +1302,9 @@ class OneTurn:
     # turned up while it was writing.
     part: int = 0
     after: int = 0
+    # The provider could not say whether this turn reached it. Recorded so
+    # the run can go on with everybody else, and so nothing sends it again.
+    outcome_unknown: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         # What the agent said is not in here. It is kept where somebody would
@@ -1302,6 +1325,7 @@ class OneTurn:
             "milliseconds": self.milliseconds,
             "shown": list(self.shown),
             "part": self.part,
+            "outcome_unknown": self.outcome_unknown,
         }
 
 
@@ -1337,7 +1361,22 @@ class Doing:
             "done": len([one for one in self.turns if one.state == "done"]),
             "of": len(self.turns),
             "went_wrong": len([one for one in self.turns if one.state == "went wrong"]),
+            "provider_failures": self.provider_failures(),
         }
+
+    def provider_failures(self) -> list[dict[str, Any]]:
+        """Turns whose delivery is in doubt, named so the rest can be saved.
+
+        The run journal refuses to save progress while a delivery is in doubt
+        unless the saved record says which turn it was. Naming it here lets
+        the other agents' answers be kept; the journal still never resends it.
+        """
+
+        return [
+            {"outcome_unknown": True, "id": one.agent, "name": one.name,
+             "project": one.project, "round": one.round, "provider_reason": one.why_not}
+            for one in self.turns if one.outcome_unknown
+        ]
 
 
 def what_to_ask(agent: dict[str, Any], project: dict[str, Any]) -> str:
@@ -2315,7 +2354,10 @@ class Running:
                                 doing.note = "Stopped after the in-flight provider turn."
                                 self._run_store.fail(run_id, doing.note, stopped=True)
                             elif durable_status == "running":
-                                self._run_store.finish(run_id, {"doing": doing.to_dict()})
+                                self._run_store.finish(run_id, {
+                                    "doing": doing.to_dict(),
+                                    "provider_failures": doing.provider_failures(),
+                                })
                     finally:
                         if run_scope is not None:
                             run_scope.__exit__(None, None, None)
@@ -2420,6 +2462,16 @@ class Running:
         board = said["board"]
         agents = {one["id"]: one for one in board["agents"]}
         projects = {one["id"]: one for one in board["projects"]}
+        # Mail still queued for a project's earlier jobs can never be
+        # delivered into its current goal. Settle it so it cannot fill the
+        # mailbox and refuse the handoffs this run is about to make. Not being
+        # able to tidy up is no reason to hold the agents back.
+        try:
+            mailbox.retire_superseded_goals(where_the_mailbox_lives(), {
+                str(one.get("id") or ""): shared_goal_id(one) for one in board["projects"]
+            })
+        except (OSError, HarnessError):
+            pass
         # What each agent said about each project, so the second round can be
         # shown only the notes that agent is allowed to see.
         heard: dict[tuple[str, str], str] = {}
@@ -2579,6 +2631,7 @@ class Running:
             except HarnessError as exc:
                 turn.state = "went wrong"
                 turn.why_not = str(exc)
+                turn.outcome_unknown = isinstance(exc, ProviderOutcomeUnknown)
                 if incoming and not self._stop_was_requested(doing):
                     try:
                         with self._post_provider_mutation(doing):

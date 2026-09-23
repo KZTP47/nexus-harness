@@ -2918,7 +2918,10 @@ class HarnessHTTPServer(ThreadingHTTPServer):
                 for project in (snapshot.get("board") or {}).get("projects", []):
                     if not isinstance(project, dict) or not str(project.get("path") or ""):
                         continue
-                    legacy_root = Path(str(project["path"])).resolve(strict=True)
+                    # Not strict: a folder moved or deleted since the run was
+                    # accepted still reserves its old place, and must not stop
+                    # every long-horizon start with a missing-file error.
+                    legacy_root = Path(str(project["path"])).resolve()
                     if self._project_paths_overlap(root, legacy_root):
                         conflicts.append(f"legacy-board-run:{active.get('run_id')}")
                 continue
@@ -2926,11 +2929,21 @@ class HarnessHTTPServer(ThreadingHTTPServer):
             conversation = snapshot.get("conversation") if isinstance(snapshot.get("conversation"), dict) else {}
             project_id = str(snapshot.get("project_id") or conversation.get("project") or "")
             if selected_mode in {"work", "auto"} and project_id:
-                legacy_root = self._board_project_path(snapshot.get("board") or {}, project_id)
-                if self._project_paths_overlap(root, legacy_root):
+                try:
+                    legacy_root = self._board_project_path(snapshot.get("board") or {}, project_id)
+                except OSError:
+                    legacy_root = next((
+                        Path(str(one["path"])).resolve()
+                        for one in (snapshot.get("board") or {}).get("projects", [])
+                        if isinstance(one, dict) and str(one.get("id") or "") == project_id
+                        and str(one.get("path") or "")
+                    ), None)
+                if legacy_root is not None and self._project_paths_overlap(root, legacy_root):
                     conflicts.append(f"legacy-run:{active.get('run_id')}")
         for path in self.swarm_goal_queue.active_project_paths():
-            legacy_root = Path(path).resolve(strict=True)
+            # A queued or paused project whose folder has since been moved or
+            # deleted is compared by its recorded place instead of raising.
+            legacy_root = Path(path).resolve()
             if self._project_paths_overlap(root, legacy_root):
                 conflicts.append("legacy-goal-queue:" + str(legacy_root))
         current_root = self.config.project_root.resolve()
@@ -3778,6 +3791,16 @@ class HarnessHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/email":
                 self._require_token()
                 self._json(self.server.email.snapshot())
+            elif parsed.path == "/api/email/notifications":
+                # Cheap in-memory read that every open page polls, whatever
+                # tab it shows; it never opens or creates the mail store.
+                self._require_token()
+                query = urllib.parse.parse_qs(parsed.query)
+                try:
+                    after = int(query["after"][0]) if "after" in query else None
+                except ValueError:
+                    after = None
+                self._json(self.server.email.notifications(after))
             elif parsed.path == "/api/bootstrap":
                 # This is the one call that hands out the session key, so it must
                 # come from the panel's own page. A browser always says where a

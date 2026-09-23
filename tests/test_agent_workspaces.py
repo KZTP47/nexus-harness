@@ -119,6 +119,21 @@ class AgentWorkspaces(unittest.TestCase):
             self.assertEqual(len(proposed["changes"]), 15)
         self.assertEqual(list(self.project.glob("[0-9]*.txt")), [])
 
+    def test_tool_caches_are_not_collected_or_counted_but_output_folders_are(self):
+        with self.open() as candidate:
+            (candidate.root / "app.txt").write_text("real agent change")
+            for cache in [".pytest_cache/v/cache", ".mypy_cache/3.13", ".ruff_cache/0.1",
+                          ".hypothesis/examples", ".tox/py", ".cache/tool", "pkg/.PYTEST_CACHE/v"]:
+                folder = candidate.root / cache
+                folder.mkdir(parents=True)
+                for index in range(10):
+                    (folder / f"entry-{index}").write_text("tool litter")
+            (candidate.root / ".coverage").write_bytes(b"SQLite format 3\x00")
+            (candidate.root / "dist").mkdir()
+            (candidate.root / "dist" / "bundle.js").write_text("deliverable")
+            proposed = candidate.collect_action({"action": "complete", "changes": []}, max_files=12, max_bytes=10000)
+            self.assertEqual(sorted(one["path"] for one in proposed["changes"]), ["app.txt", "dist/bundle.js"])
+
     def test_cancelled_task_preserves_draft_and_cancellation_stops_copying(self):
         from our_harness import cancellation
         with self.assertRaises(cancellation.ChatCancelled), self.open() as candidate:

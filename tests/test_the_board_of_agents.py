@@ -739,6 +739,32 @@ class WhoWorksOnWhat(BoardTestCase):
             self.a_board(projects=[{"path": where}, {"path": where}])
         self.assertIn("twice", str(caught.exception))
 
+    @unittest.skipUnless(os.name == "nt", "Windows folder names ignore letter case")
+    def test_one_folder_spelt_in_another_case_is_still_the_same_folder(self) -> None:
+        where = str(self.a_project("CaseProject"))
+        with self.assertRaisesRegex(swarm.SwarmError, "twice"):
+            self.a_board(projects=[{"path": where}, {"path": where.lower()}])
+        # A pair written down before this check existed still opens and can
+        # still be saved, so nobody's board stops working over it.
+        other = str(self.a_project("Unrelated"))
+        swarm.where_it_lives().parent.mkdir(parents=True, exist_ok=True)
+        swarm.where_it_lives().write_text(json.dumps({
+            "agents": [], "works_on": [], "talks_to": [],
+            "projects": [{"id": "project-1", "path": where, "tasks": []},
+                         {"id": "project-2", "path": where.upper(), "tasks": []}],
+        }), encoding="utf-8")
+        legacy = swarm.load()
+        self.assertEqual(len(legacy.projects), 2)
+        kept = swarm.save(legacy.to_dict(), self.config)
+        self.assertEqual(len(kept.projects), 2)
+        # But another copy on top of that is refused.
+        grown = kept.to_dict()
+        grown["projects"].append({"id": "project-3", "path": where.swapcase(), "tasks": []})
+        with self.assertRaisesRegex(swarm.SwarmError, "twice"):
+            swarm.save(grown, self.config)
+        grown["projects"][-1]["path"] = other
+        self.assertEqual(len(swarm.save(grown, self.config).projects), 3)
+
 
 class HowMuchFitsOnIt(BoardTestCase):
     def test_more_agents_than_fit_are_refused_not_left_off(self) -> None:

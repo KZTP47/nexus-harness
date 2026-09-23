@@ -581,7 +581,9 @@ def run_configured_goal_verification(
             return outcome("failed", "verification_containment_denied", "Project checks attempted an operation outside their permitted scope.")
         if payload.get("exit_code") == -1:
             return outcome("unavailable", "missing_runner", "The selected test runner could not start: " + str(payload.get("stderr") or ""))
-        if re.search(r"no module named|module not found|cannot find module|command not found|is not recognized", combined, re.I):
+        # Only a failing command is a missing dependency; a passing one may
+        # just report an optional module it replaced with a fallback.
+        if payload.get("exit_code") != 0 and re.search(r"no module named|module not found|cannot find module|command not found|is not recognized", combined, re.I):
             return outcome("failed", "missing_test_dependency", "A project test dependency is missing: " + combined.strip()[:2000])
         if payload.get("exit_code") != 0 or payload.get("timed_out") or work._EMPTY_TEST_OUTPUT.search(combined):
             return outcome("failed", source, "A project check failed, timed out, or ran zero tests.")

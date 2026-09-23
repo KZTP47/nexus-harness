@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from our_harness import chat, swarm, swarm_chats
+from our_harness.collaboration_ledger import CollaborationLedger
 from our_harness.config import DEFAULT_CONFIG, LoadedConfig
 from our_harness.models import HarnessError, ProviderOutcomeUnknown
 from our_harness.providers import base as provider_base
@@ -607,6 +608,127 @@ class BoardChatBindingTests(unittest.TestCase):
             swarm_chats.resolve(
                 self.config, board, "agent-1", conversation["id"]
             )
+
+    def test_explicit_project_reselect_rebinds_a_moved_folder_and_keeps_the_chat(self) -> None:
+        # "Use a different folder on this computer": same project id, new path.
+        board = self.board("workspace-dddddddddddddddddddddddddddddddd")
+        conversation = next(
+            one for one in swarm_chats.list_for_agent(
+                self.config, board, "agent-1"
+            )["chats"] if len(one["pair"]) == 2
+        )
+        chat.keep_exchange(
+            self.config, "route-a", "earlier request", "earlier answer",
+            filed_as=conversation["filed_as"],
+        )
+        stale = CollaborationLedger(
+            self.config, "route-a", conversation["filed_as"], session_id="old-folder",
+        ).begin("old folder work", board["agents"], mode="project_work")
+        rebound = self.board(board["workspace_id"], project_path=self.second)
+        protected = next(
+            one for one in swarm_chats.list_for_agent(
+                self.config, rebound, "agent-1"
+            )["chats"] if one["id"] == conversation["id"]
+        )
+        self.assertEqual(protected["binding_problem"]["reason"], "project_path_changed")
+        self.assertTrue(protected["binding_problem"]["can_rebind_project"])
+
+        chosen = swarm_chats.select_project(
+            self.config, rebound, "agent-1", conversation["id"], "project-1"
+        )
+        current = next(
+            one for one in chosen["chats"] if one["id"] == conversation["id"]
+        )
+        self.assertEqual(chosen["active"], conversation["id"])
+        self.assertIsNone(current["binding_problem"])
+        self.assertEqual(current["filed_as"], conversation["filed_as"])
+        self.assertEqual(current["project"], "project-1")
+        self.assertEqual(current["project_binding_strength"], "filesystem")
+        # Writers started against the old folder cannot land after the rebind.
+        with self.assertRaisesRegex(Exception, "no longer current"):
+            stale.record_state("late", {"status": "wrong"})
+
+        restarted = LoadedConfig(copy.deepcopy(self.config.data), self.root, [], {})
+        resolved = swarm_chats.resolve(
+            restarted, rebound, "agent-1", conversation["id"]
+        )
+        self.assertIsNone(resolved["binding_problem"])
+        self.assertEqual(chat.read_it(
+            restarted, "route-a", conversation["filed_as"]
+        )[-1].text, "earlier answer")
+        # The rebind is to the chosen folder only; the old path is now foreign.
+        with self.assertRaisesRegex(Exception, "different folder"):
+            swarm_chats.resolve(restarted, board, "agent-1", conversation["id"])
+
+    def test_explicit_project_reselect_rebinds_a_recloned_folder(self) -> None:
+        board = self.board("workspace-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+        conversation = swarm_chats.list_for_agent(
+            self.config, board, "agent-1"
+        )["chats"][0]
+        self.first.rename(self.root / "retired-before-reclone")
+        self.first.mkdir()
+        listed = swarm_chats.list_for_agent(self.config, board, "agent-1")
+        protected = next(
+            one for one in listed["chats"] if one["id"] == conversation["id"]
+        )
+        self.assertEqual(
+            protected["binding_problem"]["reason"], "directory_identity_changed"
+        )
+        # Listing and resolving never rebind on their own.
+        with self.assertRaisesRegex(Exception, "different local folder object"):
+            swarm_chats.resolve(self.config, board, "agent-1", conversation["id"])
+
+        chosen = swarm_chats.select_project(
+            self.config, board, "agent-1", conversation["id"], "project-1"
+        )
+        current = next(
+            one for one in chosen["chats"] if one["id"] == conversation["id"]
+        )
+        self.assertIsNone(current["binding_problem"])
+        self.assertEqual(
+            current["binding"]["project"]["directory_identity_sha256"],
+            swarm_chats._filesystem_project_identity(str(self.first))[
+                "directory_identity_sha256"
+            ],
+        )
+        self.assertEqual(
+            swarm_chats.resolve(
+                self.config, board, "agent-1", conversation["id"]
+            )["id"],
+            conversation["id"],
+        )
+
+    def test_project_reselect_never_clears_a_provider_binding_problem(self) -> None:
+        board = self.board("workspace-ffffffffffffffffffffffffffffffff")
+        conversation = next(
+            one for one in swarm_chats.list_for_agent(
+                self.config, board, "agent-1"
+            )["chats"] if len(one["pair"]) == 2
+        )
+        before = next(
+            one for one in swarm_chats._read(self.config)["chats"]
+            if one["id"] == conversation["id"]
+        )["binding"]
+        for changed in (
+            self.board(board["workspace_id"], route="route-b"),
+            self.board(
+                board["workspace_id"], route="route-b", project_path=self.second,
+            ),
+        ):
+            with self.subTest(project=changed["projects"][0]["path"]):
+                with self.assertRaisesRegex(Exception, "will not send that history"):
+                    swarm_chats.select_project(
+                        self.config, changed, "agent-1", conversation["id"],
+                        "project-1",
+                    )
+                held = next(
+                    one for one in swarm_chats._read(self.config)["chats"]
+                    if one["id"] == conversation["id"]
+                )
+                self.assertEqual(
+                    held["binding"]["agent_routes"]["agent-1"]["route"], "route-a"
+                )
+                self.assertEqual(held["binding"], before)
 
     def test_legacy_path_binding_is_visible_and_upgrades_only_on_explicit_rebind(self) -> None:
         board = self.board("workspace-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")

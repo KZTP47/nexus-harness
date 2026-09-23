@@ -9,11 +9,21 @@ import secrets
 import re
 import threading
 import time
+from collections import deque
 from datetime import datetime, timezone
+from email.utils import parseaddr
 from pathlib import Path
 from typing import Any
 
 from .models import HarnessError
+
+NOTICE_CONTRACT = 'email-notifications/v1'
+NOTICE_SETTINGS_ID = 'setting:notifications'
+NOTICE_DEFAULTS = {'enabled': True, 'show_details': True}
+# A page that opens (or reloads) shortly after a notice was raised still shows
+# it; mail found at startup is announced even if the panel took a moment.
+NOTICE_REPLAY_SECONDS = 120
+NOTICE_LIMIT = 50
 
 
 def bundled_runtime() -> Path:
@@ -52,6 +62,11 @@ class EmailService:
         self._poll_settings = {}
         self._scan_timing = {}
         self._onboarding = None
+        # In-memory only: a restart gets a new boot mark so pages reset their
+        # cursor instead of waiting for a sequence number that never comes.
+        self._notice_boot = secrets.token_hex(8)
+        self._notice_seq = 0
+        self._notices = deque(maxlen=NOTICE_LIMIT)
 
     @property
     def onboarding(self):
@@ -182,9 +197,61 @@ class EmailService:
                                            or self._jobs.get('sync:' + a['id'], {}).get('state') == 'running'
                                            else max(0, round(self._poll_due.get(a['id'], now) - now, 2))),
                  **self._scan_timing.get(a['id'], {})} for a in result['accounts']]}
+        result['notifications'] = self.notification_settings()
         result['captured_at'] = datetime.now(timezone.utc).isoformat()
         self._start_poller()
         return result
+
+    def notification_settings(self):
+        """The saved corner-notification choice, without creating a mail store."""
+        existing = self.server.config.project_root / ".harness" / "email-studio" / "mail.sqlite3"
+        if self._studio is None and not existing.is_file():
+            return dict(NOTICE_DEFAULTS)
+        try:
+            saved = self.studio._get('setting', NOTICE_SETTINGS_ID)
+        except HarnessError:
+            return dict(NOTICE_DEFAULTS)
+        return {key: bool(saved.get(key, value)) for key, value in NOTICE_DEFAULTS.items()}
+
+    def _save_notification_settings(self, payload):
+        chosen = self.notification_settings()
+        for key in NOTICE_DEFAULTS:
+            if key in payload:
+                if not isinstance(payload[key], bool):
+                    raise HarnessError('Notification settings must be on or off.')
+                chosen[key] = payload[key]
+        self.studio._put('setting', {'id': NOTICE_SETTINGS_ID, 'account_id': NOTICE_SETTINGS_ID,
+                                     'contract': NOTICE_CONTRACT, **chosen})
+        return {'notifications': chosen}
+
+    def _announce_drafting(self, account, message, draft):
+        """Queue a corner notification: new mail arrived and a reply is being drafted."""
+        settings = self.notification_settings()
+        if not settings['enabled']:
+            return
+        details = settings['show_details']
+        name, address = parseaddr(str(message.get('sender', '')))
+        with self._lock:
+            self._notice_seq += 1
+            self._notices.append({
+                'seq': self._notice_seq, 'id': f'{self._notice_boot}-{self._notice_seq}', 'kind': 'drafting',
+                'account_id': account['id'], 'message_id': message['id'], 'draft_id': draft['id'],
+                'account': str(account.get('name') or account.get('email') or '')[:120] if details else '',
+                'sender': (name or address or str(message.get('sender', '')))[:200] if details else '',
+                'subject': str(message.get('subject', ''))[:300] if details else '',
+                'private': not details,
+                'created_at': datetime.now(timezone.utc).isoformat(), 'raised': time.monotonic(),
+            })
+
+    def notifications(self, after=None):
+        """Bounded in-memory feed read by every open panel page, whatever tab it shows."""
+        with self._lock:
+            now = time.monotonic()
+            items = [{**{k: v for k, v in notice.items() if k != 'raised'},
+                      'age_seconds': round(max(0.0, now - notice['raised']), 1)}
+                     for notice in self._notices if after is None or notice['seq'] > after]
+            return {'contract': NOTICE_CONTRACT, 'boot': self._notice_boot, 'seq': self._notice_seq,
+                    'replay_seconds': NOTICE_REPLAY_SECONDS, 'items': items}
 
     def dispatch(self, action, payload):
         allowed = {"export_email", "engine_start", "refresh", "resume_draft", "sync",
@@ -192,9 +259,12 @@ class EmailService:
                    "local_open", "local_mode", "local_discover", "local_status", "local_connect", "local_disconnect", "revise_draft",
                    "account_save", "import", "create_draft", "retry_draft", "retry_learning", "retry_automatic_learning",
                    "emailengine_configure", "emailengine_accounts", "emailengine_connect", "emailengine_prepare", "emailengine_sign_in", "check_delivery",
-                   "save_draft", "approve_draft", "confirm_browser_delivery", "discard_draft", "memory_save", "memory_delete"}
+                   "save_draft", "approve_draft", "confirm_browser_delivery", "discard_draft", "memory_save", "memory_delete",
+                   "notification_settings"}
         if action not in allowed:
             raise HarnessError("Unknown email action.")
+        if action == 'notification_settings':
+            return self._save_notification_settings(payload)
         if action == 'emailengine_configure':
             return self.studio.mail_backend.configure(payload)
         if action == 'emailengine_prepare':
@@ -427,6 +497,11 @@ class EmailService:
                     and message.get('auto_draft_eligible', True)
                     and message.get('account_fingerprint') == owning.get('fingerprint')):
                 result = self.studio.dispatch('create_draft', {'account_id': account_id, 'message_id': message['id']})
+                if result['draft'].get('status') == 'queued' and not result['draft'].get('revision'):
+                    try:
+                        self._announce_drafting(owning, message, result['draft'])
+                    except Exception:
+                        pass  # A notification must never stop the draft it announces.
                 self._start_draft(result['draft'])
 
     def close(self):

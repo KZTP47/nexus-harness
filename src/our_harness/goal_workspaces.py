@@ -13,7 +13,9 @@ import json
 import os
 import re
 import secrets
+import shutil
 import stat
+import sys
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from pathlib import Path
@@ -219,6 +221,25 @@ def _loaded(document: dict[str, Any], runtime_root: Path) -> tuple[Path, Path, P
     return source, home, project, state
 
 
+def _remove_tree(path: Path) -> None:
+    """Remove an unused partial copy, including mode-preserved read-only files on Windows."""
+    def make_writable_and_retry(function: Any, target: str, _error: Any) -> None:
+        os.chmod(target, stat.S_IREAD | stat.S_IWRITE)
+        function(target)
+
+    target = filesystem_path(path)
+    if target.exists():
+        handler = {"onexc": make_writable_and_retry} if sys.version_info >= (3, 12) else {"onerror": make_writable_and_retry}
+        shutil.rmtree(target, **handler)
+
+
+def _same_directory(path: Path, identity: Any) -> bool:
+    try:
+        return path.is_dir() and _source_identity(path) == identity
+    except OSError:
+        return False
+
+
 def create(document: dict[str, Any], runtime_root: Path, *, publication_locked: bool = False) -> dict[str, Any]:
     """Copy current user files, including dirty/non-Git files, before providers run."""
     source, home, folder = _layout(document, runtime_root)
@@ -235,21 +256,28 @@ def create(document: dict[str, Any], runtime_root: Path, *, publication_locked: 
                         or descriptor.get("source_identity") != _source_identity(source)
                         or descriptor.get("project_authority_id") != str(document.get("project_authority_id") or "")):
                     raise HarnessError("Interrupted goal workspace belongs to a different selected project")
-                if _manifest(source) != state["baseline"]:
-                    raise WorkspaceConflict("Project changed during interrupted workspace creation", list(state["baseline"]))
                 project = confined_path(folder, "project", allow_control=True)
-                project.mkdir(exist_ok=True)
-                for relative, expected in state["baseline"].items():
-                    _copy_file(source, project, relative, expected)
-                if _contents(_manifest(project)) != _contents(state["baseline"]) or _manifest(source) != state["baseline"]:
-                    raise HarnessError("Interrupted goal workspace copy is not its exact baseline")
-                state["phase"] = "ready"
-                _write_state(home, folder, state)
-            candidate = {**document, "execution_workspace": state.get("descriptor")}
-            validate(candidate, runtime_root)
-            return dict(state["descriptor"])
+                if (_manifest(source) == state["baseline"]
+                        and _same_directory(project, descriptor.get("workspace_identity"))):
+                    for relative, expected in state["baseline"].items():
+                        _copy_file(source, project, relative, expected)
+                    if _contents(_manifest(project)) == _contents(state["baseline"]) and _manifest(source) == state["baseline"]:
+                        state["phase"] = "ready"
+                        _write_state(home, folder, state)
+                        candidate = {**document, "execution_workspace": state.get("descriptor")}
+                        validate(candidate, runtime_root)
+                        return dict(state["descriptor"])
+                # No agent has used this copy yet: the user edited the project
+                # while it was being made, or the interrupted copy is not exact.
+                # Throw the partial copy away and start again from the project
+                # as it is now, instead of refusing on every retry forever.
+                _remove_tree(project)
+            else:
+                candidate = {**document, "execution_workspace": state.get("descriptor")}
+                validate(candidate, runtime_root)
+                return dict(state["descriptor"])
         baseline = _manifest(source)
-        folder.mkdir()
+        folder.mkdir(exist_ok=True)
         project = confined_path(folder, "project", allow_control=True)
         project.mkdir()
         descriptor = {"schema_version": 1, "goal_id": document["goal_id"],

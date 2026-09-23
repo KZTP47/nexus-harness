@@ -16,6 +16,7 @@ const { WebChatManager } = require("./web-chats");
 const { DesktopSettingsStore } = require("./settings-store");
 const { DirectGoalOutbox } = require("./direct-goal-outbox");
 const { createShutdownCoordinator } = require("./shutdown");
+const { MailNotifier } = require("./mail-notifier");
 
 function readBuildInfo() {
   try {
@@ -43,6 +44,25 @@ let reviewedTrust = null;
 let desktopSettingsStore = null;
 let shutdownCoordinator = null;
 const pendingJsonExports = new Map();
+const mailToastPage = pageUrl("mail-toast.html");
+const mailNotifier = new MailNotifier({
+  electron,
+  page: mailToastPage,
+  preload: path.join(__dirname, "mail-toast-preload.js"),
+  // The pop-up shows one local page and nothing else: no navigation, no new
+  // windows, no permissions.
+  guard: (contents) => {
+    attachGuards(contents, { allowedTarget: (url) => url === mailToastPage, openExternally: () => {} });
+    contents.session.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
+  },
+  onActivate: (target) => {
+    if (!window || window.isDestroyed()) return;
+    if (window.isMinimized()) window.restore();
+    window.show();
+    window.focus();
+    window.webContents.send("harness:mailNotificationActivated", target);
+  },
+});
 const ownsApplicationInstance = app.requestSingleInstanceLock();
 
 if (!ownsApplicationInstance) {
@@ -361,7 +381,10 @@ function createWindow() {
   const createdWindow = window;
   window.on("closed", () => {
     abandonRendererExports();
-    if (window === createdWindow) window = null;
+    if (window === createdWindow) {
+      window = null;
+      mailNotifier.close();
+    }
   });
   window.on("enter-full-screen", () => {
     if (window && !window.isDestroyed()) {
@@ -789,6 +812,11 @@ ipcMain.handle("harness:appIconDataUrl", (event) => {
     return "";
   }
 });
+ipcMain.handle("harness:showMailNotification", (event, notice) => (
+  fromHarnessWindow(event) ? mailNotifier.show(notice) : false
+));
+ipcMain.on("mail-toast:resize", (event, height) => { mailNotifier.resize(event.sender, height); });
+ipcMain.on("mail-toast:activate", (event, id) => { mailNotifier.activate(event.sender, id); });
 ipcMain.handle("harness:focusHarness", (event) => {
   if (!fromHarnessWindow(event) || !window || window.isDestroyed()) return false;
   window.focus();
@@ -992,6 +1020,7 @@ app.on("window-all-closed", () => {
 });
 
 app.on("before-quit", (event) => {
+  mailNotifier.close();
   for (const identity of [...pendingJsonExports.keys()]) {
     try { closeLargeJsonExport(identity); } catch (_error) { /* target was never replaced */ }
   }

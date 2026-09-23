@@ -1005,3 +1005,54 @@ test('Automatic learning outcomes explain empty results per recipient and retry 
     assert.ok((await page.evaluate(() => window.calls)).every(call => call.url.endsWith('/retry_automatic_learning')));
   } finally {await browser.close();}
 });
+
+test('A draft the assistant starts after an email was opened appears in that open email', {skip: !executablePath, timeout: 45000}, async () => {
+  const browser = await chromium.launch({executablePath, headless: true});
+  try {
+    const page = await browser.newPage(); await page.setContent('<main id="emailView"></main>');
+    await page.evaluate(() => {
+      window.snapshot = {accounts: [{id: 'a', kind: 'browser_outlook'}], providers: [], memories: [], drafts: [], messages: [
+        {id: 'm1', account_id: 'a', sender: 'hans@example.test', subject: 'Budget', body: 'Numbers?', imported_at: '2026-01-01T10:00:00Z'}]};
+      window.request = async () => structuredClone(window.snapshot);
+    });
+    await page.addScriptTag({content: source}); await page.evaluate(() => window.nexusEmail.refresh());
+    await page.locator('#emailQueue button.email-message').click();
+    assert.match(await page.locator('#emailDraftStatus').textContent(), /No draft yet/);
+    await page.evaluate(() => { window.snapshot.drafts.push({id: 'd1', account_id: 'a', message_id: 'm1', status: 'review', original: 'Here they are.', edited: 'Here they are.', revision: 1}); return window.nexusEmail.refresh(); });
+    assert.equal(await page.locator('#emailReply').inputValue(), 'Here they are.');
+    assert.match(await page.locator('#emailDraftStatus').textContent(), /review/);
+  } finally { await browser.close(); }
+});
+
+test('New-mail notices become corner cards on any tab, group a burst, and are not replayed after a restart', {skip: !executablePath, timeout: 45000}, async () => {
+  const browser = await chromium.launch({executablePath, headless: true});
+  try {
+    const page = await browser.newPage(); await page.setContent('<main id="emailView" hidden></main>');
+    await page.evaluate(() => {
+      window.feed = {contract: 'email-notifications/v1', boot: 'b1', seq: 1, replay_seconds: 120, items: [
+        {seq: 1, id: 'b1-1', kind: 'drafting', account_id: 'a', message_id: 'm1', draft_id: 'd1', sender: 'Hans Müller', subject: 'Q3 budget', account: 'Work', private: false, age_seconds: 3}]};
+      window.asked = [];
+      window.request = async path => { window.asked.push(path); if (path.startsWith('/api/email/notifications')) { const after = Number(new URL(path, 'http://x').searchParams.get('after') ?? -1); return {...window.feed, items: window.feed.items.filter(i => i.seq > after)}; } return {accounts: [], messages: [], drafts: []}; };
+    });
+    await page.addScriptTag({content: source});
+    const watcher = await page.evaluateHandle(() => window.nexusEmail.watch());
+    await page.waitForSelector('.nexus-mail-toast');
+    assert.equal(await page.locator('.nexus-mail-toast-title').textContent(), 'Hans Müller');
+    assert.equal(await page.locator('.nexus-mail-toast-detail').textContent(), 'Q3 budget');
+    assert.match(await page.locator('.nexus-mail-toast-action').textContent(), /drafting a reply/);
+    // Four at once become one summary card instead of a wall of pop-ups.
+    await page.evaluate(() => { for (let n = 2; n <= 5; n++) window.feed.items.push({seq: n, id: 'b1-' + n, kind: 'drafting', account_id: 'a', message_id: 'm' + n, draft_id: 'd' + n, sender: 'S' + n, subject: 'x', account: 'Work', age_seconds: 1}); window.feed.seq = 5; });
+    await watcher.evaluate(w => w.tick());
+    assert.deepEqual(await page.locator('.nexus-mail-toast-title').allTextContents(), ['Hans Müller', '4 new emails']);
+    // A restarted server: old notices are not shown again, fresh ones are.
+    await page.evaluate(() => { window.feed = {contract: 'email-notifications/v1', boot: 'b2', seq: 2, replay_seconds: 120, items: [
+      {seq: 1, id: 'b2-1', kind: 'drafting', sender: 'Old', subject: 'old', age_seconds: 900},
+      {seq: 2, id: 'b2-2', kind: 'drafting', sender: '', subject: '', private: true, age_seconds: 2}]}; document.getElementById('nexusMailToasts').replaceChildren(); });
+    await watcher.evaluate(w => w.tick());
+    await page.waitForFunction(() => document.querySelectorAll('.nexus-mail-toast').length === 1);
+    assert.deepEqual(await page.locator('.nexus-mail-toast-title').allTextContents(), ['New email']);
+    assert.equal(await page.locator('.nexus-mail-toast-detail').textContent(), 'Open Nexus Harness to read it');
+    assert.equal(await page.evaluate(() => document.body.innerHTML.includes('<script')), false);
+    await watcher.evaluate(w => w.stop());
+  } finally { await browser.close(); }
+});

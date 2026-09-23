@@ -32,7 +32,7 @@ from typing import Any, Callable
 from . import chat as chat_lab
 from . import cancellation, collaboration_outcomes, swarm_runs, user_questions
 from .changes import FileTransaction, atomic_write, file_sha256, sha256_bytes
-from .agent_tools import AgentToolSession
+from .agent_tools import AgentToolCallLimitReached, AgentToolSession
 from .bounded_file_read import READ_FILE_INPUT_SCHEMA
 from .collaboration_ledger import CollaborationLedger
 from .config import LoadedConfig
@@ -1182,6 +1182,7 @@ _SEMANTIC_HISTORY_MARKER = re.compile(
 
 def _semantic_history_summary(
     contributions: list[dict[str, Any]], maximum: int,
+    turn_numbers: list[int] | None = None,
 ) -> str:
     """Keep deterministic semantic evidence from turns outside the recent tail.
 
@@ -1192,7 +1193,14 @@ def _semantic_history_summary(
     """
 
     candidates_by_turn: list[list[str]] = []
-    for index, one in enumerate(contributions, start=1):
+    for position, one in enumerate(contributions):
+        # Callers that summarize a non-prefix selection pass the real turn
+        # numbers so the quoted history still names the right turn.
+        index = (
+            turn_numbers[position]
+            if turn_numbers is not None and position < len(turn_numbers)
+            else position + 1
+        )
         turn_candidates: list[str] = []
         identity = (
             f"turn {index} · {one.get('speaker_name') or 'unknown'} · "
@@ -1213,6 +1221,9 @@ def _semantic_history_summary(
                     )
         text = re.sub(r"\s+", " ", str(one.get("text") or "")).strip()
         if not text:
+            # A turn with only structured progress (remaining work, needed
+            # files) still carries meaning; keep it even without prose.
+            candidates_by_turn.append(turn_candidates)
             continue
         matches = list(_SEMANTIC_HISTORY_MARKER.finditer(text))
         for match in matches[:8]:
@@ -1298,7 +1309,8 @@ def _prompt_conversation(contributions: list[dict[str, Any]]) -> str:
 
     Earlier turns remain in the collaboration ledger and its paged projections.
     Prompts receive an engine-owned rolling summary plus as many newest complete
-    turns as fit; no turn is silently clipped in the middle.
+    turns as fit; no turn is silently clipped in the middle. Only a newest turn
+    that alone exceeds the budget is clipped, and it says so explicitly.
     """
 
     full = _actual_conversation(contributions)
@@ -1325,23 +1337,48 @@ def _prompt_conversation(contributions: list[dict[str, Any]]) -> str:
     )
     kept: list[str] = []
     used = 0
-    for one in reversed(contributions):
+    newest_clipped = False
+    for position in range(len(contributions) - 1, -1, -1):
+        one = contributions[position]
         block = (
             f"{one.get('speaker_name') or 'An agent'} ({one.get('speaker_route') or 'unknown route'}):\n"
             f"{one.get('text') or ''}"
         )
-        if len(block) > remaining - used:
+        if len(block) <= remaining - used:
+            kept.append(block)
+            used += len(block) + 2
+            continue
+        if kept:
             break
-        kept.append(block)
-        used += len(block) + 2
+        # The newest turn alone is longer than the budget. Dropping it would
+        # also drop every recent complete turn behind it, so show its start
+        # with a clear marker and leave half the budget for earlier turns.
+        share = remaining // 2 if position else remaining
+        marker = (
+            f"\n[turn clipped to fit the prompt budget: {len(block)} characters "
+            "in full; the complete turn is in the canonical collaboration ledger "
+            "and its semantic evidence is summarized above]"
+        )
+        clipped = block[:max(0, share - len(marker))] + marker
+        kept.append(clipped)
+        used += len(clipped) + 2
+        newest_clipped = True
     omitted = max(0, len(contributions) - len(kept))
     older = contributions[:omitted]
+    turn_numbers = list(range(1, omitted + 1))
+    if newest_clipped:
+        # The clipped tail may hold decisions or structured progress, so the
+        # semantic summary keeps the whole newest turn as well.
+        older = older + [contributions[-1]]
+        turn_numbers.append(len(contributions))
     semantic_summary = _semantic_history_summary(
-        older, PROMPT_SEMANTIC_SUMMARY_CHARACTERS,
+        older, PROMPT_SEMANTIC_SUMMARY_CHARACTERS, turn_numbers,
     )
     return (
         header
-        + f"\n[older turns semantically summarized: {omitted}; newest complete turns below: {len(kept)}]\n\n"
+        + f"\n[older turns semantically summarized: {omitted}; newest complete turns below: {len(kept) - int(newest_clipped)}"
+        + ("; newest turn clipped to fit: 1" if newest_clipped else "")
+        + "]\n\n"
         + semantic_summary
         + "\n\nNEWEST COMPLETE TURNS\n"
         + "\n\n".join(reversed(kept))
@@ -1460,6 +1497,12 @@ class _MutationSaga:
         }
 
     def complete(self, verification_status: str) -> None:
+        # A compensated or conflicted saga already has its final outcome.
+        # Relabelling it "committed" would hide a half-rolled-back tree from
+        # recovery, so keep the compensation result exactly as recorded.
+        if self.value.get("phase") in {"compensated", "rollback_conflict"}:
+            _active_mutation_sagas.pop(str(self.value["saga_id"]), None)
+            return
         self.value["phase"] = "committed"
         self.value["verification_status"] = verification_status
         self.value["completed_at"] = int(time.time())
@@ -1496,12 +1539,21 @@ class _MutationSaga:
         if os.name == "nt":
             import ctypes
 
-            process = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+            from ctypes import wintypes
+
+            # Only a library loaded with use_last_error records the error code.
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            process = kernel32.OpenProcess(0x1000, False, pid)
             if not process:
-                return False
+                # Access denied means a live process (elevated, or another
+                # user) owns the PID. Treating it as dead would let crash
+                # recovery roll back a running run's edits.
+                return int(ctypes.get_last_error()) == 5
             try:
                 exit_code = ctypes.c_ulong()
-                if not ctypes.windll.kernel32.GetExitCodeProcess(
+                if not kernel32.GetExitCodeProcess(
                     process, ctypes.byref(exit_code)
                 ):
                     return False
@@ -1511,7 +1563,7 @@ class _MutationSaga:
                     or cls._owner_identity(pid) == str(expected_identity)
                 )
             finally:
-                ctypes.windll.kernel32.CloseHandle(process)
+                kernel32.CloseHandle(process)
         try:
             os.kill(pid, 0)
         except (OSError, ValueError):
@@ -2826,7 +2878,12 @@ def _safe_query_paths(root: Path, query: str) -> tuple[list[Path], str]:
         try:
             candidates = root.glob(pattern)
             for candidate in candidates:
-                confined_path(root, candidate.relative_to(root), allow_missing=False)
+                # One refused match (for example a file under .git) is left
+                # out; it must not fail the whole request for every other file.
+                try:
+                    confined_path(root, candidate.relative_to(root), allow_missing=False)
+                except (HarnessError, ValueError):
+                    continue
                 if candidate.is_file() and not candidate.is_symlink():
                     matches.append(candidate)
                 if len(matches) >= 100:
@@ -3087,6 +3144,30 @@ def _normalized_text_sha256(path: Path) -> str | None:
     return sha256_bytes(text.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8"))
 
 
+def _normalized_change_path(value: object) -> str:
+    """Spell an agent's relative path the way grants and write roots do.
+
+    "./src/a.py", "src//a.py" and "src/./a.py" all name src/a.py, and
+    "src/../a.py" names a.py, so protected-path and grant checks see the
+    same spelling the file system will. Absolute and drive-qualified paths
+    are returned unchanged, and a ".." that climbs above the project stays in
+    the path, so the confinement checks still refuse both.
+    """
+
+    text = str(value or "").replace("\\", "/").strip()
+    if not text or text.startswith("/") or re.match(r"^[A-Za-z]:", text):
+        return text
+    parts: list[str] = []
+    for one in text.split("/"):
+        if one in {"", "."}:
+            continue
+        if one == ".." and parts and parts[-1] != "..":
+            parts.pop()
+            continue
+        parts.append(one)
+    return "/".join(parts) if parts else text
+
+
 def _validated_changes(
     root: Path,
     raw_changes: object,
@@ -3101,7 +3182,7 @@ def _validated_changes(
     for raw in raw_changes:
         if not isinstance(raw, dict):
             raise HarnessError("A proposed file change is malformed")
-        relative = str(raw.get("path") or "").replace("\\", "/").strip()
+        relative = _normalized_change_path(raw.get("path"))
         if not relative or relative in seen:
             raise HarnessError("The proposed file changes contain a missing or duplicate path")
         if protected_paths and _path_is_under(relative, protected_paths):
@@ -3196,7 +3277,7 @@ def _with_test_companion_grants(
     for raw in raw_changes:
         if not isinstance(raw, dict) or raw.get("delete") is True:
             continue
-        relative = str(raw.get("path") or "").replace("\\", "/").strip()
+        relative = _normalized_change_path(raw.get("path"))
         content = str(raw.get("content") or "")
         filename = Path(relative).name.casefold()
         runnable_shape = bool(
@@ -6108,6 +6189,10 @@ def _normalize_goal_path(raw: str) -> str:
         or "://" in candidate
         or candidate.startswith("/")
         or re.match(r"^[A-Za-z]:", candidate)
+        # A colon is never part of a granted project path (it would name a
+        # Windows alternate data stream), even where the prose around it was
+        # only a port or line reference that validation let through.
+        or ":" in candidate
         or any(part in {"", ".", ".."} for part in candidate.split("/"))
         or any(ord(char) < 32 for char in candidate)
     ):
@@ -6140,18 +6225,48 @@ def _unsafe_goal_path(raw: str) -> bool:
     )
 
 
+def _unsafe_goal_path_token(token: str) -> bool:
+    """Whether one goal token is a path, and an unsafe one.
+
+    Ordinary prose is not a path: "localhost:3000", "std::vector", "10:30"
+    and a bare "//" name no project file, so they never stop a goal. A token
+    counts as a path only when it has a folder separator next to a name, a
+    ".." segment, a drive prefix, or a dotted file name. A leading host:port
+    (or file:line) is a reference and a leading code scope such as "std::" is
+    code; only what follows either one is checked as a path.
+    """
+
+    value = str(token or "").strip()
+    reference = re.match(r"[\w.-]+:\d{1,5}(?=$|[/?#])", value)
+    if reference:
+        value = value[reference.end():]
+    scope = re.match(r"(?:[A-Za-z_]\w*::)+", value)
+    if scope:
+        value = value[scope.end():]
+    if not value:
+        return False
+    path_shaped = bool(
+        re.search(r"(?:^|[\\/])\.\.(?:[\\/]|$)", value)
+        or re.search(r"\w[\\/]|[\\/]\w", value)
+        or re.match(r"[A-Za-z]:", value)
+        or re.search(r"[\w-]\.[^\W_][\w-]*", value)
+    )
+    return path_shaped and _unsafe_goal_path(value)
+
+
 def _validate_goal_path_syntax(goal: str) -> None:
     """Reject unsafe path-shaped tokens before semantic authority is compiled.
 
     Wrapping a path in quotes, backticks, or parentheses must not make it
     disappear and later fall back to a safe-looking basename.  External URLs,
     drive paths, and UNC references remain non-authoritative references rather
-    than being reinterpreted as project-relative paths.
+    than being reinterpreted as project-relative paths. Tokens that are not
+    paths at all (ports, times, code such as std::vector) are left alone.
     """
 
     for token in re.findall(r"[^\s\"'`()\[\]{}]+", str(goal or "")):
         candidate = token.rstrip(".,;!?)]}")
-        if candidate and _unsafe_goal_path(candidate):
+        if candidate and _unsafe_goal_path_token(candidate):
             raise HarnessError(f"Unsafe explicit project path in goal: {candidate[:160]}")
 
 
@@ -6187,16 +6302,14 @@ def _goal_named_paths(goal: str) -> list[str]:
         found.append(normalized)
 
     for quoted in re.finditer(r"[\"']([^\"'\r\n]+)[\"']", text):
-        if _unsafe_goal_path(quoted.group(1)):
-            raise HarnessError(f"Unsafe explicit project path in goal: {quoted.group(1)[:160]}")
+        _validate_goal_path_syntax(quoted.group(1))
         if _external_goal_path(quoted.group(1)):
             continue
         remember(quoted.group(1))
 
     for action in _PATH_ACTION.finditer(text):
         body = action.group(1).strip()
-        if _unsafe_goal_path(body):
-            raise HarnessError(f"Unsafe explicit project path in goal: {body[:160]}")
+        _validate_goal_path_syntax(body)
         if _external_goal_path(body) or body.startswith(("/", "\\")):
             continue
         raw_action_word = re.match(r"\w+", action.group(0)).group(0).casefold()
@@ -9285,7 +9398,9 @@ def _run_selected_project_verification(
                 "reason": "The selected test runner executable is missing or could not be started: "
                 + str(payload.get("stderr")),
             }
-        if re.search(
+        # A successful command may still print "No module named x, using
+        # fallback"; only a failing command is a missing test dependency.
+        if payload.get("exit_code") != 0 and re.search(
             r"(?:no module named|module not found|cannot find module|command not found|is not recognized)",
             combined, re.IGNORECASE,
         ):
@@ -10972,6 +11087,7 @@ def work_together(
             )
             current_files = _file_snapshot(root, all_changed + requested_paths)
             executor_tool_results: list[dict[str, Any]] = []
+            tool_limit_told = False
             try:
                 while True:
                     execution_answer = chat_lab.ask_once(
@@ -11036,17 +11152,52 @@ def work_together(
                         "pass": pass_number, "calls": calls,
                     })
                     tool_scope = "swarm-context-v1:" + str(tool_step["hash"])
+                    limit_reached = False
                     for call in calls:
                         if not isinstance(call, dict):
                             raise HarnessError("A context tool call is malformed")
-                        result = context_tools.execute(
-                            str(executor.get("id") or "agent"), call,
-                            execution_scope=tool_scope,
-                        )
+                        try:
+                            result = context_tools.execute(
+                                str(executor.get("id") or "agent"), call,
+                                execution_scope=tool_scope,
+                            )
+                        except AgentToolCallLimitReached as exc:
+                            # Running out of tool calls is not a failed run.
+                            # Tell the agent, keep every applied change, and
+                            # let it answer with what it already has.
+                            limit_reached = True
+                            result = {
+                                "call_id": call.get("call_id"),
+                                "name": call.get("name"),
+                                "status": "error",
+                                "content": json.dumps({
+                                    "error": str(exc),
+                                    "code": "tool_call_limit_reached",
+                                    "recovery": (
+                                        "No more context tool calls are available in this "
+                                        "exploration epoch. Answer now with what you have: "
+                                        "return your complete file changes, or no changes "
+                                        "and say plainly what is missing."
+                                    ),
+                                }),
+                            }
                         executor_tool_results.append({
                             "call_id": call.get("call_id"), "name": call.get("name"),
                             "result": result,
                         })
+                    if limit_reached:
+                        ledger.record_state("context_tool_call_limit_reached", {
+                            "stage": "execution", "pass": pass_number,
+                            "agent_id": str(executor.get("id") or ""),
+                            "told_agent_before": tool_limit_told,
+                        })
+                        if tool_limit_told:
+                            # The agent was already told and still only asked
+                            # for tools. End its turn with no changes instead
+                            # of asking forever; nothing is rolled back.
+                            execution = {**execution, "tool_calls": [], "changes": []}
+                            break
+                        tool_limit_told = True
             except cancellation.ChatCancelled:
                 if context_tools is not None:
                     context_tools.close()
