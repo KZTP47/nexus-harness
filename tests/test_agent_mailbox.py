@@ -18,7 +18,7 @@ class DurableAgentMailbox(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.where = Path(self.temporary.name) / "mailbox.json"
 
-    def queued(self, goal: str = "goal-one") -> mailbox.AgentMessage:
+    def queued(self, goal: str = "goal-one", workspace: str = "board-a") -> mailbox.AgentMessage:
         return mailbox.enqueue(
             self.where,
             shared_goal_id=goal,
@@ -29,6 +29,7 @@ class DurableAgentMailbox(unittest.TestCase):
             project="project-1",
             project_name="Nexus",
             body="Please check the provider boundary.",
+            workspace=workspace,
         )
 
     def test_a_failed_delivery_survives_for_the_next_run(self) -> None:
@@ -120,6 +121,7 @@ class DurableAgentMailbox(unittest.TestCase):
                     self.where, shared_goal_id="old-jobs", sender="agent-1",
                     sender_name="Reviewer", receiver="agent-2", receiver_name="Writer",
                     project="project-1", project_name="Nexus", body=f"old answer {number}",
+                    workspace="board-a",
                 )
             # The jobs changed, so the goal changed: the full mailbox of old
             # mail used to refuse every new handoff forever.
@@ -157,14 +159,16 @@ class DurableAgentMailbox(unittest.TestCase):
             self.where, shared_goal_id="their-goal", sender="agent-1",
             sender_name="Reviewer", receiver="agent-2", receiver_name="Writer",
             project="project-2", project_name="Other", body="other project",
+            workspace="board-a",
         )
         absent = mailbox.enqueue(
             self.where, shared_goal_id="absent-goal", sender="agent-1",
             sender_name="Reviewer", receiver="agent-2", receiver_name="Writer",
             project="project-3", project_name="Not on this board", body="kept",
+            workspace="board-a",
         )
         retired = mailbox.retire_superseded_goals(
-            self.where, {"project-1": "new-jobs", "project-2": "their-goal"},
+            self.where, {"project-1": "new-jobs", "project-2": "their-goal"}, workspace="board-a",
         )
         self.assertEqual(retired, 1)
         states = {one["message_id"]: one["state"]
@@ -175,8 +179,34 @@ class DurableAgentMailbox(unittest.TestCase):
             absent.message_id: "queued",
         })
         self.assertEqual(mailbox.retire_superseded_goals(
-            self.where, {"project-1": "new-jobs"},
+            self.where, {"project-1": "new-jobs"}, workspace="board-a",
         ), 0)
+
+    def test_another_saved_boards_project_one_keeps_its_queued_handoffs(self) -> None:
+        # "project-1" is on nearly every board. Board B's run, or a handoff on
+        # board B, must not settle board A's queued mail for its own project-1.
+        board_a = self.queued("board-a-jobs", workspace="board-a")
+        self.assertEqual(mailbox.retire_superseded_goals(
+            self.where, {"project-1": "board-b-jobs"}, workspace="board-b"), 0)
+        self.queued("board-b-jobs", workspace="board-b")
+        self.assertEqual([one.message_id for one in mailbox.pending(
+            self.where, shared_goal_id="board-a-jobs", receiver="agent-2",
+            allowed_senders=["agent-1"],
+        )], [board_a.message_id], "board A's handoff is still there when board A is opened again")
+        # Board A's own changed jobs still settle it.
+        self.assertEqual(mailbox.retire_superseded_goals(
+            self.where, {"project-1": "board-a-new-jobs"}, workspace="board-a"), 1)
+
+    def test_mail_that_does_not_name_its_board_is_never_settled(self) -> None:
+        legacy = self.queued("old-jobs", workspace="")
+        self.assertEqual(mailbox.retire_superseded_goals(
+            self.where, {"project-1": "new-jobs"}, workspace="board-a"), 0)
+        self.assertEqual(mailbox.retire_superseded_goals(self.where, {"project-1": "new-jobs"}), 0)
+        self.queued("new-jobs", workspace="board-a")
+        self.queued("newer-jobs", workspace="")
+        self.assertEqual([one.message_id for one in mailbox.pending(
+            self.where, shared_goal_id="old-jobs", receiver="agent-2", allowed_senders=["agent-1"],
+        )], [legacy.message_id])
 
     def test_pruning_at_exactly_the_limit_keeps_no_settled_history(self) -> None:
         settled = [{"message_id": "done", "state": "acknowledged"},

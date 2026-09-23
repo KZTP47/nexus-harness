@@ -61,6 +61,10 @@ class AgentMessage:
     last_attempt_at: str = ""
     acknowledged_at: str = ""
     last_error: str = ""
+    # The saved board the handoff was written on. Project ids such as
+    # "project-1" repeat on nearly every board, so a project id alone does not
+    # say whose mail this is.
+    workspace: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -251,7 +255,7 @@ def _remove_unreferenced(where: Path, messages: list[dict[str, Any]], payloads: 
 
 
 def _supersede(
-    where: Path, messages: list[dict[str, Any]], current_goals: dict[str, str],
+    where: Path, messages: list[dict[str, Any]], current_goals: dict[str, str], workspace: str,
 ) -> tuple[int, list[Path]]:
     """Settle queued mail whose project now has a different list of jobs.
 
@@ -259,12 +263,19 @@ def _supersede(
     the goal it was written for, so these can never be delivered or
     acknowledged. Left queued they would count toward the limit forever and
     eventually refuse every new handoff.
+
+    Only mail written on the same saved board is settled: another board's
+    "project-1" is a different project whose queued handoffs must survive
+    until that board is opened again. Mail that does not say which board it
+    came from is never settled here.
     """
 
     count = 0
     payloads: list[Path] = []
+    if not workspace:
+        return count, payloads
     for one in messages:
-        if one.get("state") != "queued":
+        if one.get("state") != "queued" or one.get("workspace") != workspace:
             continue
         project = str(one.get("project") or "")
         if project not in current_goals or one.get("shared_goal_id") == current_goals[project]:
@@ -279,20 +290,22 @@ def _supersede(
     return count, payloads
 
 
-def retire_superseded_goals(where: Path, current_goals: dict[str, str]) -> int:
+def retire_superseded_goals(where: Path, current_goals: dict[str, str], *, workspace: str = "") -> int:
     """Settle queued mail written for a project's earlier jobs; return how many.
 
-    Only projects named in ``current_goals`` are touched, so mail for a
-    project that is simply not on this board right now is left alone.
+    Only projects named in ``current_goals`` on the saved board ``workspace``
+    are touched, so mail for a project that is simply not on this board right
+    now, or that belongs to another board, is left alone.
     """
 
     wanted = {_clean(project): _clean(goal, 100) for project, goal in current_goals.items()
               if _clean(project) and _clean(goal, 100)}
-    if not wanted:
+    board = _clean(workspace, 100)
+    if not wanted or not board:
         return 0
     with _lock:
         messages = _read(where)
-        count, payloads = _supersede(where, messages, wanted)
+        count, payloads = _supersede(where, messages, wanted, board)
         if count:
             _write(where, _pruned(messages))
             _remove_unreferenced(where, messages, payloads)
@@ -312,6 +325,7 @@ def enqueue(
     body: str,
     expects_reply: bool = True,
     thread_id: str = "",
+    workspace: str = "",
 ) -> AgentMessage:
     """Queue one handoff and return its durable identity."""
 
@@ -350,13 +364,15 @@ def enqueue(
         body=text,
         created_at=_now(),
         expects_reply=bool(expects_reply),
+        workspace=_clean(workspace, 100),
     )
     with _lock:
         messages = _read(where)
         # This message says which jobs its project has now. Mail still queued
         # for the project's earlier jobs can never be delivered, so it must
         # not take up room this one needs.
-        _count, payloads = _supersede(where, messages, {message.project: message.shared_goal_id})
+        _count, payloads = _supersede(
+            where, messages, {message.project: message.shared_goal_id}, message.workspace)
         messages.append(message.to_dict())
         _write(where, _pruned(messages))
         _remove_unreferenced(where, messages, payloads)
@@ -416,6 +432,7 @@ def pending(
                 last_attempt_at=_clean(one.get("last_attempt_at"), 100),
                 acknowledged_at=_clean(one.get("acknowledged_at"), 100),
                 last_error=_clean(one.get("last_error"), LONGEST_ERROR),
+                workspace=_clean(one.get("workspace"), 100),
             ))
             delivered_characters += len(message_body)
         except (TypeError, ValueError) as exc:

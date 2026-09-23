@@ -32,12 +32,12 @@ function fixture() {
   const dom = new Map();
   const context = vm.createContext({
     console, state,
-    swarmGoalQueue: null, swarmGoalQueueWatching: 0, swarmGoalQueueContinuing: false,
+    swarmGoalQueue: null, swarmGoalQueueWatching: 0, swarmGoalQueueContinuing: false, swarmGoalQueueMissed: 0,
     swarmGoalWorkRunning: false, SWARM_GOAL_QUEUE_REQUEST_KEY: "portable.goal-queue-request",
     longGoal: null,
     localStorage: {removeItem() {}, getItem() { return null; }, setItem() {}},
     window: {
-      setTimeout(callback) { const id = state.nextTimer++; state.timers.set(id, callback); return id; },
+      setTimeout(callback, wait) { const id = state.nextTimer++; state.timers.set(id, callback); state.lastWait = wait; return id; },
       clearTimeout(id) { state.timers.delete(id); },
       confirm(words) { state.confirms.push(words); return true; },
     },
@@ -124,6 +124,29 @@ test("a watch tick whose read fails does not leave the watch marked as taken", a
   await f.fireTimers();
   assert.equal(f.context.swarmGoalQueueWatching, 0);
   assert.equal(f.dom.get("swarmGoalWorkSaid").textContent, "The harness is restarting.");
+});
+
+test("a failed read while the queue is running keeps watching, backing off, until it moves on", async () => {
+  const f = fixture();
+  f.queues = [f.queue("running")];
+  f.context.watchBoardGoalQueue();
+  await f.fireTimers();
+  assert.equal(f.context.swarmGoalQueue.status, "running");
+  const working = f.context.request;
+  f.context.request = async () => { throw new Error("The harness is restarting."); };
+  await f.fireTimers();
+  assert.equal(f.timers.size, 1, "the watch is not lost after one failed read");
+  assert.equal(f.lastWait, 2400);
+  await f.fireTimers();
+  assert.equal(f.timers.size, 1);
+  assert.equal(f.lastWait, 4800, "and it waits longer after each failure");
+  f.context.request = working;
+  f.queues = [f.queue("running", {cursor: 1}), f.queue("complete")];
+  await f.fireTimers();
+  assert.equal(f.lastWait, 1200, "a good read returns to the ordinary pace");
+  await f.fireTimers();
+  assert.equal(f.timers.size, 0, "and the watch ends when the queue finishes");
+  assert.equal(f.context.swarmGoalQueueMissed, 0);
 });
 
 test("Cancel remaining goals cancels a waiting legacy queue, not the long-horizon goal", async () => {

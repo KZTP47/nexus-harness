@@ -16503,6 +16503,8 @@ let swarmGoing = false;      // a run is on
 let swarmGoalWorkRunning = false; // this renderer is dispatching the server's exact cursor
 let swarmGoalQueue = null;   // durable server-owned board-wide goal cursor
 let swarmGoalQueueWatching = 0;
+// Reads of the queue that failed in a row; the watch backs off by this.
+let swarmGoalQueueMissed = 0;
 let swarmGoalQueueContinuing = false;
 const SWARM_GOAL_QUEUE_REQUEST_KEY = "nexus.swarm.goal-queue-request.v1";
 const LONG_GOAL_SELECTED_KEY = "nexus.long-horizon.selected.v1";
@@ -16663,6 +16665,7 @@ function showBoardGoalQueue(queue) {
 async function refreshBoardGoalQueue(autoContinue = false) {
   try {
     const said = await request("/api/swarm/goal-queue");
+    swarmGoalQueueMissed = 0;
     showBoardGoalQueue(said.queue);
     if (said.queue?.status === "running") watchBoardGoalQueue();
     if (autoContinue && said.queue?.status === "queued") {
@@ -16670,6 +16673,7 @@ async function refreshBoardGoalQueue(autoContinue = false) {
     }
     return said.queue;
   } catch (error) {
+    swarmGoalQueueMissed += 1;
     $("swarmGoalWorkSaid").textContent = String(error.message || error);
     return null;
   }
@@ -16679,7 +16683,7 @@ async function refreshBoardGoalQueue(autoContinue = false) {
 // calls back here when the queue is still running, so the watch stays marked
 // as taken until that read has come back; cleared first, every tick started a
 // second timer beside its own and the asking doubled up on every tick.
-function watchBoardGoalQueue() {
+function watchBoardGoalQueue(wait = 1200) {
   if (swarmGoalQueueWatching) return;
   const poll = async () => {
     let queue = null;
@@ -16692,9 +16696,14 @@ function watchBoardGoalQueue() {
       watchBoardGoalQueue();
     } else if (queue?.status === "queued") {
       void continueBoardGoalQueue();
+    } else if (!queue && swarmGoalQueueMissed && swarmGoalQueue?.status === "running") {
+      // One failed read (a restart, a dropped connection) must not end the
+      // watch for good while the queue it last saw is still running: nothing
+      // else would notice it finish or move on to its next goal.
+      watchBoardGoalQueue(Math.min(30000, 1200 * (2 ** swarmGoalQueueMissed)));
     }
   };
-  swarmGoalQueueWatching = window.setTimeout(poll, 1200);
+  swarmGoalQueueWatching = window.setTimeout(poll, wait);
 }
 
 async function continueBoardGoalQueue({retryPaused = false} = {}) {
