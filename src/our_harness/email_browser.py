@@ -22,6 +22,7 @@ class EmailBrowser:
         self._process = None
         self._reader = None
         self._lock = threading.RLock()
+        self._metadata_lock = threading.RLock()
         self._replies = queue.Queue()
 
     def _command(self):
@@ -74,6 +75,10 @@ class EmailBrowser:
             return result['result']
 
     def _binding(self, connection_id):
+        with self._metadata_lock:
+            return self._binding_locked(connection_id)
+
+    def _binding_locked(self, connection_id):
         if not re.fullmatch(r'[a-f0-9]{32}', connection_id or ''):
             raise HarnessError('Choose a valid browser mail connection.')
         path = self.root / connection_id / 'connection.json'
@@ -150,10 +155,11 @@ class EmailBrowser:
                     'message': 'Browser mode saved. The next mailbox check uses this mode; sign-in opens visibly.'}
 
     def _save(self, data):
-        path = self.root / data['id'] / 'connection.json'
-        temporary = path.with_suffix('.tmp')
-        temporary.write_text(json.dumps(data), encoding='utf-8')
-        temporary.replace(path)
+        with self._metadata_lock:
+            path = self.root / data['id'] / 'connection.json'
+            temporary = path.with_suffix('.tmp')
+            temporary.write_text(json.dumps(data), encoding='utf-8')
+            temporary.replace(path)
 
     def _call(self, command, data, **extra):
         result = self._request(command, connection=data, profile=str(self.root / data['id'] / 'profile'), **extra)
@@ -164,7 +170,7 @@ class EmailBrowser:
             raise HarnessError('Browser mail returned an invalid mailbox identity.')
         if data.get('email') and email and data['email'].lower() != email.lower():
             raise HarnessError('The browser is signed into a different mailbox. Create a new connection for that account.')
-        if command not in ('sync', 'send'):
+        if command not in ('sync', 'send', 'prepare'):
             if result.get('state') == 'connected' and not email:
                 raise HarnessError('Browser mail could not verify the signed-in mailbox identity.')
             if email:
@@ -179,7 +185,10 @@ class EmailBrowser:
 
     def connections(self):
         """Read only this product-owned metadata; never launch browsers on listing."""
-        with self._lock:
+        # Snapshot rendering must not wait for a browser operation, which may
+        # legitimately spend a minute traversing the inbox. Migrations and
+        # atomic metadata writes have their own short, shared lock.
+        with self._metadata_lock:
             result = []
             for path in sorted(self.root.glob('*/connection.json')):
                 data = self._binding(path.parent.name)
@@ -194,6 +203,17 @@ class EmailBrowser:
             if status.get('state') != 'connected':
                 raise HarnessError('Sign into your mail in the Nexus browser, then check the connection again.')
             return self._call('sync', data, cursor=cursor)
+
+    def prepare_reply(self, connection_id, incoming, body, submission_id):
+        """Verify/recover mailbox readiness without opening a composer or sending."""
+        with self._lock:
+            data = self._binding(connection_id)
+            if not data.get('email'):
+                raise HarnessError('Verify this mailbox identity before preparing a reply.')
+            permitted = ('source_id', 'sender', 'subject', 'body', 'browser_reference',
+                         'reply_to', 'internet_message_id', 'message_id', 'thread_id', 'references')
+            source = {key: incoming[key] for key in permitted if key in incoming}
+            return self._call('prepare', data, incoming=source, body=body, submission_id=submission_id)
 
     def submit_reply(self, connection_id, incoming, body, submission_id):
         """Transport an already-approved reply; never infer approval or retry send.
@@ -219,9 +239,9 @@ class EmailBrowser:
                 data = self._binding(connection_id)
                 if not data.get('email'):
                     raise HarnessError('Verify the browser mailbox identity before sending a reply.')
-                status = self._call('status', data)
-                if status.get('state') != 'connected':
-                    raise HarnessError('Sign into the saved mailbox visibly before sending a browser reply.')
+                # The send worker restores the saved session and verifies its
+                # identity before locating or composing the approved reply.
+                # A separate status request would reject recoverable sessions.
             except HarnessError as exc:
                 return {'status': 'not_sent', 'error': str(exc)}
             result = self._call('send', data, incoming=source, body=body, submission_id=submission_id)

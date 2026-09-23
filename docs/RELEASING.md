@@ -6,6 +6,17 @@ from `requirements-runtime.lock` into it, builds NSIS, exercises a genuinely
 fresh first run with `--project`, silently installs the package, and exercises
 that installed executable too.
 
+Every desktop build first runs the engine-owned LangGraph distribution gate.
+It rejects hardcoded machine paths, missing engine source, and private or linked
+files in shipped Python source before runtime preparation or packaging begins.
+Private project bindings and vaults are not distributable product configuration.
+The packaged source privacy check independently rejects memory databases and
+vault markers in the resulting artifact.
+
+The local post-work closeout reserves at least thirty minutes for a cold runtime
+build, installer compression, and artifact verification. A timeout still blocks
+completion; it does not accept an existing installer as evidence of a new build.
+
 ## Execution budget and verification ownership
 
 CI and release runs target ten minutes and have a fifteen-minute total budget.

@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT))
 
 from scripts import prepare_windows_runtime as runtime  # noqa: E402
 from scripts import prepare_kestra_runtime as kestra_runtime  # noqa: E402
+from our_harness.distribution_gate import PRIVATE_NAMES, enforce_distribution_gate  # noqa: E402
 
 
 def verify_product_source_privacy(resources: Path) -> None:
@@ -21,10 +22,10 @@ def verify_product_source_privacy(resources: Path) -> None:
     source = resources / "harness"
     if not source.is_dir():
         raise RuntimeError("Packaged product source is missing")
-    forbidden = {"__pycache__", ".harness", "email-studio", "config.local.json"}
+    forbidden = {name.casefold() for name in {"__pycache__", "email-studio", *PRIVATE_NAMES}}
     for item in source.rglob("*"):
         relative = item.relative_to(source)
-        if forbidden.intersection(relative.parts) or item.suffix.lower() in {".pyc", ".pyo"}:
+        if forbidden.intersection(part.casefold() for part in relative.parts) or item.suffix.lower() in {".pyc", ".pyo"}:
             raise RuntimeError(f"Private build or runtime state in package: {relative}")
 
 
@@ -43,6 +44,9 @@ def build(arguments: list[str] | None = None) -> Path:
     node = shutil.which("node")
     if not node:
         raise RuntimeError("Node.js is required to build the Nexus desktop application")
+    # Every build, including post-work deployment, must pass the engine-owned
+    # LangGraph gate before downloading, packaging, or replacing artifacts.
+    enforce_distribution_gate(ROOT)
     with runtime.runtime_build_lock():
         kestra_runtime.prepare()
         selected = runtime._prepare_locked(DESKTOP / "runtime")

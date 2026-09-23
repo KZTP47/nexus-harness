@@ -231,16 +231,162 @@ test('late quoted-thread hydration settles before keyboard entry of the approved
   try{
     await f.value.context.route('**/*',async route=>{
       if(new URL(route.request().url()).pathname==='/__nexus_test_send__')return f.fixture.route(route);
-      const script=`<script>const initialOpenReply=openReply;openReply=()=>{initialOpenReply();const editor=document.querySelector('[contenteditable]');window.entryBeforeReady=false;window.keyCount=0;editor.addEventListener('input',()=>{if(!window.quoteReady)window.entryBeforeReady=true;});editor.addEventListener('keydown',()=>window.keyCount++);setTimeout(()=>{editor.innerHTML='<hr><div>Quoted original</div><table><tr><td>From: synthetic sender</td></tr></table>';window.quoteReady=true;},600);};</script>`;
+      const script=`<script>const initialOpenReply=openReply;openReply=()=>{initialOpenReply();const editor=document.querySelector('[contenteditable]');window.entryBeforeReady=false;window.keyCount=0;editor.addEventListener('input',()=>{if(!window.quoteReady)window.entryBeforeReady=true;window.keyCount++;});setTimeout(()=>{editor.innerHTML='<hr><div>Quoted original</div><table><tr><td>From: synthetic sender</td></tr></table>';window.quoteReady=true;},600);};</script>`;
       return route.fulfill({contentType:'text/html',body:f.fixture.html()+script});
     });
     await f.value.page.reload();
     const body='Reviewed greeting.\n\n1. First\n2. Second\nClosing.';
     const result=await worker.operate(f.value,{...f.request,command:'send',incoming:f.incoming,body,submission_id:submissionId});
     assert.equal(result.status,'sent',JSON.stringify(result));
-    assert.equal(await f.value.page.evaluate(()=>window.quoteReady&&!window.entryBeforeReady&&window.keyCount>20),true);
+    assert.equal(await f.value.page.evaluate(()=>window.quoteReady&&!window.entryBeforeReady&&window.keyCount>0),true);
     assert.equal(f.fixture.state.lastSent.body,body);assert.equal(f.fixture.state.sendCount,1);
   }finally{await f.close();}
+});
+
+test('a new exact Sent Items message confirms sending without a toast while another draft stays open',{timeout:45000},async()=>{
+  const f=await fixtureSession('browser_outlook','headless',{sentFolder:true,acknowledge:false,leaveComposer:true});
+  try {
+    const request={...f.request,command:'send',incoming:f.incoming,body:'Exact approved text\n\n  spaces and <markup>',submission_id:submissionId};
+    const result=await worker.operate(f.value,request);
+    assert.equal(result.status,'sent',JSON.stringify(result));
+    assert.equal(result.evidence,'sent_folder_new_message');
+    assert.equal(f.fixture.state.sendCount,1);
+    assert.equal(f.value.context.pages().length,1,'verification tab always closes');
+    assert.equal((await worker.operate(f.value,request)).status,'sent');
+    assert.equal(f.fixture.state.sendCount,1);
+  }finally{await f.close();}
+});
+
+test('an older identical sent reply never confirms a dropped Send click',{timeout:50000},async()=>{
+  const body='Previously sent identical reply';
+  const f=await fixtureSession('browser_outlook','headless',{sentFolder:true,acknowledge:false,dropSend:true,sendCount:1,lastSent:{body,recipient:'sender@example.test'}});
+  try {
+    const result=await worker.operate(f.value,{...f.request,command:'send',incoming:f.incoming,body,submission_id:submissionId});
+    assert.equal(result.status,'unknown');assert.equal(f.fixture.state.sendCount,1);
+    const receipt=JSON.parse(fs.readFileSync(path.join(f.value.profile,'nexus-reviewed-submissions',submissionId+'.json')));
+    assert.equal(receipt.failure_stage,'confirming the sent reply');
+    assert.equal(f.value.context.pages().length,1);
+  }finally{await f.close();}
+});
+
+test('a disabled Send button leaves no dispatch receipt and remains retryable',{timeout:40000},async()=>{
+  const f=await fixtureSession('browser_outlook');
+  try {
+    await f.value.page.evaluate(()=>{const open=window.openReply;window.openReply=()=>{open();document.querySelector('button[aria-label="Send"]').disabled=true;};});
+    const request={...f.request,command:'send',incoming:f.incoming,body:'Approved',submission_id:submissionId};
+    const result=await worker.operate(f.value,request);
+    assert.equal(result.status,'not_sent');assert.match(result.error,/checking the Send button/);
+    assert.equal(fs.existsSync(path.join(f.value.profile,'nexus-reviewed-submissions',submissionId+'.json')),false);
+    assert.equal(f.fixture.state.sendCount,0);
+    await f.value.page.locator('button[aria-label="Send"]').evaluate(e=>e.disabled=false);
+    assert.equal((await worker.operate(f.value,request)).status,'sent');assert.equal(f.fixture.state.sendCount,1);
+  }finally{await f.close();}
+});
+
+test('Sent Items evidence rejects stale dates, wrong recipients, drafts and quoted copies',{timeout:15000},async()=>{
+  const f=await fixtureSession('browser_outlook');
+  try {
+    const body='Exact approved reply';
+    await f.value.page.setContent('<article><span id="MSG_new_FROM">Owner</span><div id="MSG_new_TO">To: sender@example.test</div><div id="MSG_new_DATETIME">Today 14:16</div><div role="document"><pre>Exact approved reply</pre><div>Company classification</div></div></article>');
+    const options={body,recipient:'sender@example.test',before:{ids:['old'],stamps:['Yesterday']}};
+    assert.ok(await f.value.page.evaluate(worker.sentBodyWitness,options));
+    for(const changed of [{body:'Different'}, {recipient:'other@example.test'}, {before:{ids:['new'],stamps:[]}}, {before:{ids:[],stamps:['Today 14:16']}}])assert.equal(await f.value.page.evaluate(worker.sentBodyWitness,{...options,...changed}),null);
+    await f.value.page.locator('[role="document"]').evaluate(e=>e.insertAdjacentHTML('afterbegin','Unapproved introductory prose'));
+    assert.equal(await f.value.page.evaluate(worker.sentBodyWitness,options),null);
+    await f.value.page.locator('[role="document"]').evaluate(e=>e.innerHTML='<blockquote><pre>Exact approved reply</pre></blockquote>');
+    assert.equal(await f.value.page.evaluate(worker.sentBodyWitness,options),null);
+    await f.value.page.locator('[role="document"]').evaluate(e=>e.innerHTML='<pre>Exact approved reply</pre>');
+    await f.value.page.locator('article').evaluate(e=>e.insertAdjacentHTML('afterbegin',"<p>This message hasn't been sent.</p>"));
+    assert.equal(await f.value.page.evaluate(worker.sentBodyWitness,options),null);
+  }finally{await f.close();}
+});
+
+test('long replies preserve literal markup and whitespace in a slow proofing editor',{timeout:45000},async()=>{
+  for(const provider of ['browser_outlook','browser_gmail']) {
+    const f=await fixtureSession(provider);
+    try {
+      await f.value.context.route('**/*',async route=>{
+        if(new URL(route.request().url()).pathname==='/__nexus_test_send__')return f.fixture.route(route);
+        const script=`<script>const previousOpenReply=openReply;openReply=()=>{previousOpenReply();window.textInputs=0;const editor=document.querySelector('[contenteditable]');editor.style.whiteSpace='normal';editor.addEventListener('input',()=>{window.textInputs++;editor.querySelectorAll('*').forEach(e=>e.removeAttribute('style'));const until=performance.now()+30;while(performance.now()<until){}});};</script>`;
+        return route.fulfill({contentType:'text/html',body:f.fixture.html()+script});
+      });
+      await f.value.page.reload();
+      f.value.page.setDefaultTimeout(8000);
+      const body='Reviewed opening.\n\n'+('A long paragraph with Unicode åäö and exact spacing. ').repeat(20)+'\n\n  | (o) (o) |\n  \\_______/\nLiteral <img src=x onerror=alert(1)> & text.';
+      const started=Date.now();
+      const result=await worker.operate(f.value,{...f.request,command:'send',incoming:f.incoming,body,submission_id:submissionId});
+      assert.equal(result.status,'sent',JSON.stringify(result));
+      assert.equal(f.fixture.state.lastSent.body,body);
+      assert.equal(await f.value.page.evaluate(()=>window.textInputs),1,'one native editing transaction');
+      assert.ok(Date.now()-started<15000);
+    }finally{await f.close();}
+  }
+});
+
+test('interrupted owned composer resumes after restart while external edits and recipients stay protected',{timeout:90000},async()=>{
+  for(const tamper of ['none','body','recipient','original','replaced']) {
+    const f=await fixtureSession('browser_outlook');
+    try {
+      await f.value.context.route('**/*',async route=>{
+        if(new URL(route.request().url()).pathname==='/__nexus_test_send__')return f.fixture.route(route);
+        const script=`<script>const initialOpenReply=openReply,initialOpenMessage=openMessage;openMessage=()=>{initialOpenMessage();if(window.changedOriginal)document.querySelector('#pane [role=document]').textContent='Original changed since failure';};openReply=()=>{initialOpenReply();document.querySelector('#pane').style.display='none';const tabs=document.createElement('div');tabs.setAttribute('role','tablist');for(const editing of [false,true]){const tab=document.createElement('button');tab.setAttribute('role','tab');tab.setAttribute('aria-label',editing?'Editing Re: Question':'Question');tab.textContent=editing?'Editing Re: Question':'Question';tab.onclick=()=>{document.querySelector('#pane').style.display=editing?'none':'block';document.querySelector('#compose').style.display=editing?'block':'none';};tabs.append(tab);}document.body.append(tabs);};</script>`;
+        return route.fulfill({contentType:'text/html',body:f.fixture.html()+script});
+      });
+      await f.value.page.reload();
+      const body='Reviewed opening.\n\n'+('Long paragraph. ').repeat(40);
+      const send={...f.request,command:'send',incoming:f.incoming,body,submission_id:submissionId};
+      const evaluate=f.value.page.evaluate.bind(f.value.page);
+      f.value.page.evaluate=async(fn,arg)=>{if(fn.name==='insertReviewedBody'){await evaluate(fn,{...arg,body:'Reviewed opening.'});throw new Error('page.evaluate: Editor interrupted during entry.');}return evaluate(fn,arg);};
+      const failed=await worker.operate(f.value,send);
+      assert.equal(failed.status,'not_sent');assert.match(failed.error,/entering the reviewed reply/);assert.doesNotMatch(failed.error,/next scan/);
+      assert.equal(await f.value.page.locator('[role=tablist]').count(),1);
+      assert.equal(await f.value.page.locator('#pane').isVisible(),false);
+      assert.equal(f.fixture.state.sendCount,0);
+      const recovery=path.join(f.value.profile,'nexus-reviewed-composers',submissionId+'.json');
+      const saved=fs.readFileSync(recovery,'utf8');
+      assert.ok(!saved.includes('Reviewed opening')&&!saved.includes('sender@example.test'));
+      assert.equal(fs.existsSync(path.join(f.value.profile,'nexus-reviewed-submissions',submissionId+'.json')),false);
+      f.value.page.evaluate=evaluate;
+      // Simulate worker restart: only the durable proof and the mailbox's
+      // restored composer survive, not any in-memory ownership flag.
+      const restarted={context:f.value.context,page:f.value.page,profile:f.value.profile,provider:f.value.provider,mode:f.value.mode};
+      if(tamper==='body')await f.value.page.locator('[contenteditable]').fill('User changed this in Outlook');
+      if(tamper==='recipient')await f.value.page.locator('#reply-compose>span').evaluate(e=>e.setAttribute('data-email','other@example.test'));
+      if(tamper==='original')await f.value.page.evaluate(()=>window.changedOriginal=true);
+      if(tamper==='replaced')await f.value.page.locator('[data-nexus-reply-owner]').evaluateAll(es=>es.forEach(e=>e.removeAttribute('data-nexus-reply-owner')));
+      const ready=await worker.operate(restarted,{...send,command:'prepare'});
+      assert.equal(ready.status,tamper==='none'?'ready':'not_sent',JSON.stringify(ready));
+      assert.equal(f.fixture.state.sendCount,0,'preparation never dispatches');
+      if(tamper==='none'){
+        const result=await worker.operate(restarted,send);
+        assert.equal(result.status,'sent',JSON.stringify(result));
+        assert.equal(f.fixture.state.lastSent.body,body);assert.equal(f.fixture.state.sendCount,1);
+        assert.equal(fs.existsSync(recovery),false);
+      }else assert.match(ready.error,tamper==='original'?/original message content changed/:/existing reply composer/);
+      if(tamper==='original')assert.equal(await f.value.page.locator('#compose').isVisible(),true,'failed proof restores the interrupted editor');
+    }finally{await f.close();}
+  }
+});
+
+test('Outlook rendered message IDs can change only with unique content and positive conversation proof',{timeout:90000},async()=>{
+  for(const change of ['id','duplicate','content','conversation']) {
+    const f=await fixtureSession('browser_outlook');
+    try {
+      f.fixture.state.messageId='new-rendered-id';
+      if(change==='content')f.fixture.state.body='Changed source body';
+      if(['duplicate','conversation'].includes(change))await f.value.context.route('**/*',async route=>{
+        if(new URL(route.request().url()).pathname==='/__nexus_test_send__')return f.fixture.route(route);
+        const script=change==='duplicate'
+          ? `<script>const initialOpen=openMessage;openMessage=()=>{initialOpen();const original=document.querySelector('#pane article');const copy=original.cloneNode(true);copy.setAttribute('data-message-id','another-new-id');copy.querySelector('[id$="_FROM"]').id='MSG_another-new-id_FROM';original.after(copy);};</script>`
+          : `<script>const initialOpen=openMessage;openMessage=()=>{initialOpen();document.querySelector('#pane article').setAttribute('data-convid','different-conversation');};</script>`;
+        return route.fulfill({contentType:'text/html',body:f.fixture.html()+script});
+      });
+      await f.value.page.reload();
+      const result=await worker.operate(f.value,{...f.request,command:'send',incoming:f.incoming,body:'Reviewed reply',submission_id:submissionId});
+      assert.equal(result.status,change==='id'?'sent':'not_sent',JSON.stringify({change,result}));
+      assert.equal(f.fixture.state.sendCount,change==='id'?1:0);
+    }finally{await f.close();}
+  }
 });
 
 test('mode changes reuse private profile, open forces visible, and operations serialize before relaunch',{timeout:90000},async()=>{
@@ -313,4 +459,140 @@ test('explicit sign-in survives background headless preference until mailbox aut
     assert.equal(hiddenFailure.mode,'headless');
     assert.deepEqual(modes,[false,true],'authentication failure must not open a visible window automatically');
   }finally{chromium.launchPersistentContext=original;await worker.close();fs.rmSync(profile,{recursive:true,force:true});}
+});
+
+test('an Outlook self-reload during a send keeps the conversation the send opened, and clears it again afterwards',{timeout:45000},async()=>{
+  const f=await fixtureSession('browser_outlook');
+  try{
+    worker.watchReloads(f.value);
+    let duringSend;
+    const sent=f.fixture.route;
+    // The load event is raised directly because a real reload would abort the send this scoping exists for.
+    f.value.context.route('**/*',async route=>{
+      if(new URL(route.request().url()).pathname==='/__nexus_test_send__'){
+        f.value.paneDirty=true;f.value.lastOpenedRow='thread-one';f.value.lastInboxRefresh=Date.now()-60000;f.value.ownLoadPending=false;
+        f.value.page.emit('load');
+        duringSend={replying:f.value.replying,lastOpenedRow:f.value.lastOpenedRow,paneDirty:f.value.paneDirty};
+      }
+      return sent(route);
+    });
+    const result=await worker.operate(f.value,{...f.request,command:'send',incoming:f.incoming,body:'Reviewed reply.',submission_id:submissionId});
+    assert.equal(result.status,'sent');
+    assert.deepEqual(duringSend,{replying:true,lastOpenedRow:'thread-one',paneDirty:false},'a reload mid-send discards the pane but keeps the row the send stamped');
+    f.value.paneDirty=true;f.value.lastOpenedRow='thread-one';f.value.lastInboxRefresh=Date.now()-60000;f.value.ownLoadPending=false;
+    f.value.page.emit('load');
+    assert.equal(f.value.lastOpenedRow,'','outside a send the reload clears the open conversation as well');
+  }finally{await f.close();}
+});
+
+test('send locates a virtualized original outside the current viewport before composing', {timeout:60000}, async()=>{
+  for(const provider of ['browser_outlook','browser_gmail']) {
+    const f=await fixtureSession(provider);
+    try {
+      await f.value.page.evaluate(provider=>{
+        const row=document.querySelector(provider==='browser_gmail'?'tr[data-legacy-thread-id]':'[role=option][data-convid]');
+        const container=document.createElement('div');container.style.cssText='height:120px;overflow-y:auto';
+        const spacer=document.createElement('div');spacer.style.height='1200px';
+        const table=provider==='browser_gmail'?row.closest('table'):row;
+        table.before(container);container.append(spacer,table);
+        const attr=provider==='browser_gmail'?'data-legacy-thread-id':'data-convid';
+        const original=row.getAttribute(attr);row.setAttribute(attr,'another-thread');
+        container.addEventListener('scroll',()=>row.setAttribute(attr,container.scrollTop>800?original:'another-thread'));
+      },provider);
+      const result=await worker.operate(f.value,{...f.request,command:'send',incoming:f.incoming,body:'Reviewed after locating original.',submission_id:submissionId});
+      assert.equal(result.status,'sent',JSON.stringify(result));assert.equal(f.fixture.state.sendCount,1);
+      await f.value.page.evaluate(provider=>{
+        const row=document.querySelector(provider==='browser_gmail'?'tr[data-legacy-thread-id]':'[role=option][data-convid]');
+        row.after(row.cloneNode(true));
+      },provider);
+      const duplicate=await worker.operate(f.value,{...f.request,command:'send',incoming:f.incoming,body:'Do not send an ambiguous reply.',submission_id:'d'.repeat(32)});
+      assert.equal(duplicate.status,'not_sent');assert.match(duplicate.error,/ambiguous/);assert.equal(f.fixture.state.sendCount,1);
+    }finally{await f.close();}
+  }
+});
+
+test('send refreshes a stale identity before dispatch and refuses a different recovered mailbox', {timeout:60000}, async()=>{
+  const f=await fixtureSession('browser_gmail');
+  const prior=worker.budgets.browser_gmail.identity;worker.budgets.browser_gmail.identity=100;
+  try {
+    await f.value.page.locator('[aria-label^="Google Account"]').evaluate(e=>e.removeAttribute('aria-label'));
+    const request={...f.request,command:'send',incoming:f.incoming,body:'Recovered session reply.',submission_id:submissionId};
+    const recovered=await worker.operate(f.value,request);assert.equal(recovered.status,'sent',JSON.stringify(recovered));assert.equal(f.fixture.state.sendCount,1);
+    await f.value.page.reload();
+    await f.value.page.locator('[aria-label^="Google Account"]').evaluate(e=>e.removeAttribute('aria-label'));
+    f.fixture.state.email='different@example.test';
+    const result=await worker.operate(f.value,{...request,submission_id:'c'.repeat(32)});
+    assert.equal(result.status,'not_sent');assert.match(result.error,/different mailbox/);assert.equal(f.fixture.state.sendCount,1);
+  }finally{worker.budgets.browser_gmail.identity=prior;await f.close();}
+});
+
+test('Outlook Reply uses the reader scope for unlabelled envelopes and multiple message-local Reply buttons', {timeout:45000}, async()=>{
+  const f=await fixtureSession('browser_outlook');
+  try {
+    await f.value.context.route('**/*',async route=>{
+      if(new URL(route.request().url()).pathname==='/__nexus_test_send__')return f.fixture.route(route);
+      return route.fulfill({contentType:'text/html',body:f.fixture.html()+`<script>
+        const originalOpen=openMessage;openMessage=()=>{originalOpen();const article=document.querySelector('#pane article');article.removeAttribute('aria-label');article.removeAttribute('data-message-id');article.append(article.querySelector('button').cloneNode(true));
+          const decoy=document.createElement('button');decoy.setAttribute('aria-label','Reply');decoy.textContent='Reply';decoy.onclick=()=>window.decoyClicked=true;article.querySelector('[role=document]').append(decoy);
+        };
+      </script>`});
+    });
+    await f.value.page.reload();
+    // The source includes the synthetic body button's visible text too.
+    const incoming=(await worker.operate(f.value,{...f.request,cursor:''})).messages[0];
+    const result=await worker.operate(f.value,{...f.request,command:'send',incoming,body:'Selected reviewed version.',submission_id:submissionId});
+    assert.equal(result.status,'sent',JSON.stringify(result));assert.equal(f.fixture.state.sendCount,1);
+    assert.equal(await f.value.page.evaluate(()=>!!window.decoyClicked),false);
+  }finally{await f.close();}
+});
+
+test('missing Reply refreshes and retries preparation once before sending', {timeout:45000}, async()=>{
+  const f=await fixtureSession('browser_outlook');
+  let documents=0;
+  try {
+    await f.value.context.route('**/*',async route=>{
+      if(new URL(route.request().url()).pathname==='/__nexus_test_send__')return f.fixture.route(route);
+      documents++;
+      const script=documents===1?`<script>const oldOpen=openMessage;openMessage=()=>{oldOpen();document.querySelector('#pane button').remove();};</script>`:'';
+      return route.fulfill({contentType:'text/html',body:f.fixture.html()+script});
+    });
+    await f.value.page.reload();
+    const result=await worker.operate(f.value,{...f.request,command:'send',incoming:f.incoming,body:'Recovered before sending.',submission_id:submissionId});
+    assert.equal(result.status,'sent',JSON.stringify(result));assert.equal(documents,2);assert.equal(f.fixture.state.sendCount,1);
+  }finally{await f.close();}
+});
+
+test('failed Reply recovery is bounded and changed originals never send', {timeout:60000}, async()=>{
+  for(const changed of [false,true]) {
+    const f=await fixtureSession('browser_outlook');let documents=0;
+    try {
+      await f.value.context.route('**/*',async route=>{
+        if(new URL(route.request().url()).pathname==='/__nexus_test_send__')return f.fixture.route(route);
+        documents++;
+        if(changed&&documents>1)f.fixture.state.body='Different incoming message';
+        const script=!changed||documents===1?`<script>const oldOpen=openMessage;openMessage=()=>{oldOpen();document.querySelector('#pane button').remove();};</script>`:'';
+        return route.fulfill({contentType:'text/html',body:f.fixture.html()+script});
+      });
+      await f.value.page.reload();
+      const result=await worker.operate(f.value,{...f.request,command:'send',incoming:f.incoming,body:'Must not send.',submission_id:submissionId});
+      assert.equal(result.status,'not_sent',JSON.stringify(result));assert.equal(documents,2);assert.equal(f.fixture.state.sendCount,0);
+      assert.match(result.error,changed?/content changed/:/Reply is not ready/);
+    }finally{await f.close();}
+  }
+});
+
+test('mailbox readiness refreshes the original but never opens a composer or dispatches', {timeout:45000}, async()=>{
+  for(const provider of ['browser_outlook','browser_gmail']) {
+    const f=await fixtureSession(provider);
+    try {
+      const request={...f.request,command:'prepare',incoming:f.incoming,body:'Review only',submission_id:submissionId};
+      const result=await worker.operate(f.value,request);
+      assert.equal(result.status,'ready',JSON.stringify(result));
+      assert.equal(f.fixture.state.sendCount,0);
+      assert.equal(await f.value.page.locator('[contenteditable=true]').count(),0);
+      assert.equal(fs.existsSync(path.join(f.value.profile,'nexus-reviewed-submissions',submissionId+'.json')),false);
+      const sent=await worker.operate(f.value,{...request,command:'send',body:'Explicitly approved after readiness.'});
+      assert.equal(sent.status,'sent',JSON.stringify(sent));assert.equal(f.fixture.state.sendCount,1);
+    }finally{await f.close();}
+  }
 });

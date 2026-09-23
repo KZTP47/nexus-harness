@@ -622,6 +622,18 @@ class PersistentMemoryHookTests(unittest.TestCase):
             hooks._deploy_desktop(self.project)
         self.assertEqual(observed, [DESKTOP_CLOSEOUT_MIN_TIMEOUT_SECONDS])
 
+    def test_timed_out_closeout_reports_unverified_deployment(self) -> None:
+        hooks = PersistentMemoryHooks(self.config)
+        for name in ("desktop/package.json", "desktop/nexus-harness.ico", "scripts/put_it_on_your_desktop.py"):
+            target = self.project / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("synthetic build input", encoding="utf-8")
+        with mock.patch("our_harness.persistent_memory.shutil.which", return_value="npm"), \
+                mock.patch("our_harness.persistent_memory.subprocess.run", side_effect=subprocess.TimeoutExpired("build", 1800)):
+            with self.assertRaisesRegex(HarnessError, "exceeded its 1800-second budget; deployment is not verified"):
+                hooks._deploy_desktop_while_locked(self.project, 1800)
+        self.assertEqual(list((self.vault / "Sessions").glob("*.md")), [])
+
     def test_closeout_retries_all_windows_owned_artifact_lock_wordings(self) -> None:
         owned = r"C:\project\desktop\build-output\win-unpacked\resources\runtime\locked.pyc"
         self.assertTrue(
@@ -630,11 +642,32 @@ class PersistentMemoryHookTests(unittest.TestCase):
             )
         )
         self.assertTrue(_is_owned_build_lock_failure(f"remove {owned}: Access is denied."))
+        self.assertTrue(_is_owned_build_lock_failure("EPERM: operation not permitted, rename 'win-unpacked.tmp' -> 'win-unpacked'"))
+        self.assertFalse(_is_owned_build_lock_failure("EPERM: operation not permitted, rename 'unrelated.tmp' -> 'unrelated'"))
         self.assertFalse(
             _is_owned_build_lock_failure(
                 r"remove C:\some-other-app\locked.pyc: being used by another process"
             )
         )
+
+    def test_closeout_retries_owned_directory_rename_when_executable_is_absent(self) -> None:
+        hooks = PersistentMemoryHooks(self.config)
+        for name in ("desktop/package.json", "desktop/nexus-harness.ico", "scripts/put_it_on_your_desktop.py"):
+            target = self.project / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("synthetic build input", encoding="utf-8")
+        answers = [
+            SimpleNamespace(returncode=1, stdout="", stderr="EPERM: operation not permitted, rename 'win-unpacked.tmp' -> 'win-unpacked'"),
+            SimpleNamespace(returncode=0, stdout="", stderr=""),
+            SimpleNamespace(returncode=7, stdout="", stderr="synthetic build failure"),
+        ]
+        with mock.patch("our_harness.persistent_memory.shutil.which", side_effect=lambda name: name), \
+                mock.patch("our_harness.persistent_memory.subprocess.run", side_effect=answers) as run:
+            with self.assertRaisesRegex(HarnessError, "exit code 7"):
+                hooks._deploy_desktop_while_locked(self.project, 1800)
+        self.assertEqual([call.args[0][0] for call in run.call_args_list], ["npm.cmd", "powershell.exe", "npm.cmd"])
+        self.assertIn("NEXUS_CLOSEOUT_OWNED_EXE", run.call_args_list[1].kwargs["env"])
+        self.assertEqual(list((self.vault / "Sessions").glob("*.md")), [])
 
     def test_checkout_deployment_lock_serializes_processes_and_recovers_dead_owner(self) -> None:
         marker = self.project / "deployment-order.txt"

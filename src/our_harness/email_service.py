@@ -254,7 +254,7 @@ class EmailService:
                     'replay_seconds': NOTICE_REPLAY_SECONDS, 'items': items}
 
     def dispatch(self, action, payload):
-        allowed = {"export_email", "engine_start", "refresh", "resume_draft", "sync",
+        allowed = {"export_email", "engine_start", "refresh", "resume_draft", "prepare_draft", "sync",
                    "oauth_start", "oauth_auto_connect", "oauth_configure", "oauth_disconnect", "refresh_models",
                    "local_open", "local_mode", "local_discover", "local_status", "local_connect", "local_disconnect", "revise_draft",
                    "account_save", "import", "create_draft", "retry_draft", "retry_learning", "retry_automatic_learning",
@@ -338,6 +338,16 @@ class EmailService:
             return {"started": True}
         if action == "refresh":
             return self.snapshot()
+        if action == "prepare_draft":
+            result = self.studio.prepare_draft(payload)
+            # A successful readiness check supersedes terminal errors from a
+            # previous attempt, without touching any active worker ownership.
+            with self._lock:
+                for prefix in ('approve:', 'finalize:', 'revise:'):
+                    key = prefix + result['draft']['id']
+                    if self._jobs.get(key, {}).get('state') == 'failed':
+                        self._jobs.pop(key, None)
+            return result
         if action == "resume_draft":
             draft = next((d for d in self.studio.snapshot()["drafts"]
                           if d["id"] == payload.get("draft_id")
@@ -485,6 +495,12 @@ class EmailService:
             result = self.studio.dispatch('sync', {'account_id': account_id})
             if not result.get('has_more'):
                 break
+        # Import backlog takes priority over preparing replies. A slow or failed
+        # draft workflow must not hold the next batch of inbox messages behind
+        # every already-imported message. The scheduler resumes this cursor on
+        # its next tick; draft preparation starts after the backlog is drained.
+        if result.get('has_more'):
+            return
         current = self.studio.snapshot()
         owning = next(a for a in current['accounts'] if a['id'] == account_id)
         if not owning.get('poll_enabled') or owning.get('connection_state') == 'disconnected':

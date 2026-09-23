@@ -40,6 +40,38 @@ class BrowserMailTests(unittest.TestCase):
             request.assert_not_called()
         with patch.object(other,'_request',side_effect=self.request):
             self.assertEqual(other.status(result['id'])['email'],'person@example.test')
+
+    def test_connection_snapshot_does_not_wait_for_a_browser_scan(self):
+        with patch.object(self.browser, '_request', side_effect=self.request):
+            connection = self.browser.open('outlook')
+        entered, release, listed = threading.Event(), threading.Event(), threading.Event()
+        result = []
+
+        def scan(command, **payload):
+            if command == 'sync':
+                entered.set()
+                release.wait(5)
+                return {'messages': [], 'cursor': ''}
+            return self.request(command, **payload)
+
+        def snapshot():
+            result.extend(self.browser.connections())
+            listed.set()
+
+        with patch.object(self.browser, '_request', side_effect=scan):
+            scanning = threading.Thread(target=self.browser.sync, args=(connection['id'],))
+            scanning.start()
+            reader = threading.Thread(target=snapshot)
+            try:
+                self.assertTrue(entered.wait(2))
+                reader.start()
+                self.assertTrue(listed.wait(1), 'inbox progress must remain readable during a long scan')
+                self.assertEqual(result[0]['id'], connection['id'])
+            finally:
+                release.set()
+                scanning.join(5)
+                if reader.ident is not None:
+                    reader.join(5)
     def test_cross_project_binding_rejected(self):
         with patch.object(self.browser,'_request',side_effect=self.request):
             result=self.browser.open('outlook')
@@ -128,29 +160,34 @@ class BrowserMailTests(unittest.TestCase):
                 'body':'Original question', 'browser_reference':{'contract':'browser-reply/v1'},
                 'private_local_path':'not-forwarded'}
 
+    def test_prepare_uses_non_sending_command_and_only_mail_reference_fields(self):
+        with patch.object(self.browser, '_request', side_effect=self.request):
+            result = self.browser.open('gmail', browser_mode='headless')
+        with patch.object(self.browser, '_request', return_value={'status': 'ready'}) as request:
+            self.assertEqual(self.browser.prepare_reply(result['id'], self.incoming(), 'Preview', 'a' * 32), {'status': 'ready'})
+            self.assertEqual(request.call_args.args[0], 'prepare')
+            self.assertNotIn('private_local_path', request.call_args.kwargs['incoming'])
+
     def test_browser_send_forwards_exact_body_and_raw_outcome_once(self):
         with patch.object(self.browser, '_request', side_effect=self.request):
             result = self.browser.open('gmail', browser_mode='headless')
         outcome = {'status':'sent', 'evidence':'provider-toast', 'email':result['email'], 'actual_browser_mode':'headless'}
-        with patch.object(self.browser, '_request', side_effect=[self.request('status'), outcome]) as request:
+        with patch.object(self.browser, '_request', return_value=outcome) as request:
             self.assertEqual(self.browser.submit_reply(result['id'], self.incoming(), 'Exact approved\nreply', 'approval-1'), outcome)
-            self.assertEqual([call.args[0] for call in request.call_args_list], ['status', 'send'])
+            self.assertEqual([call.args[0] for call in request.call_args_list], ['send'])
             sent = request.call_args.kwargs
             self.assertEqual(sent['body'], 'Exact approved\nreply')
             self.assertEqual(sent['submission_id'], 'approval-1')
             self.assertEqual(sent['connection']['browser_mode'], 'headless')
             self.assertNotIn('private_local_path', sent['incoming'])
 
-    def test_send_preflight_rejects_expiry_missing_identity_and_switch(self):
+    def test_send_worker_owns_recovery_and_returns_definite_failure(self):
         with patch.object(self.browser, '_request', side_effect=self.request):
             result = self.browser.open('outlook')
-        for status in ({'state':'sign_in_required'}, {'state':'connected'},
-                       {'state':'connected', 'email':'other@example.test'}):
-            with self.subTest(status=status), patch.object(self.browser, '_request', return_value=status) as request:
-                outcome = self.browser.submit_reply(result['id'], self.incoming(), 'Approved', 'approval-2')
-                self.assertEqual(outcome['status'], 'not_sent')
-                self.assertTrue(outcome['error'])
-                self.assertEqual(request.call_count, 1)
+        outcome = {'status': 'not_sent', 'error': 'Sign in to the saved mailbox'}
+        with patch.object(self.browser, '_request', return_value=outcome) as request:
+            self.assertEqual(self.browser.submit_reply(result['id'], self.incoming(), 'Approved', 'approval-2'), outcome)
+            self.assertEqual([call.args[0] for call in request.call_args_list], ['send'])
 
     def test_send_input_validation_and_unrecognized_outcome(self):
         with patch.object(self.browser, '_request', side_effect=self.request):
@@ -160,9 +197,9 @@ class BrowserMailTests(unittest.TestCase):
             with patch.object(self.browser, '_request') as request:
                 self.assertEqual(self.browser.submit_reply(result['id'], incoming, body, identity)['status'], 'not_sent')
             request.assert_not_called()
-        with patch.object(self.browser, '_request', side_effect=[self.request('status'), {'status':'clicked'}]) as request:
+        with patch.object(self.browser, '_request', return_value={'status':'clicked'}) as request:
             self.assertEqual(self.browser.submit_reply(result['id'], self.incoming(), 'reply', 'id')['status'], 'unknown')
-            self.assertEqual(request.call_count, 2)
+            self.assertEqual(request.call_count, 1)
 
     def test_local_mode_public_metadata_avoids_private_paths_and_snapshot_launch(self):
         local = LocalMail(Path(self.temp.name) / 'local')
@@ -187,13 +224,9 @@ class BrowserMailTests(unittest.TestCase):
     def test_transport_failure_after_send_is_not_reclassified_definitely_not_sent(self):
         with patch.object(self.browser, '_request', side_effect=self.request):
             opened = self.browser.open('gmail')
-        with patch.object(self.browser, '_request', side_effect=[self.request('status'), HarnessError('worker stopped')]) as request:
+        with patch.object(self.browser, '_request', side_effect=HarnessError('worker stopped')) as request:
             with self.assertRaises(HarnessError):
                 self.browser.submit_reply(opened['id'], self.incoming(), 'approved', 'submission-1')
-            self.assertEqual(request.call_count, 2)
-        with patch.object(self.browser, '_request', side_effect=HarnessError('status stopped')) as request:
-            outcome = self.browser.submit_reply(opened['id'], self.incoming(), 'approved', 'submission-1')
-            self.assertEqual(outcome['status'], 'not_sent')
             self.assertEqual(request.call_count, 1)
 
     def test_concurrent_mode_change_cannot_be_overwritten_by_stale_mail_operation(self):

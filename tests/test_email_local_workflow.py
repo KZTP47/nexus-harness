@@ -35,6 +35,10 @@ class LocalAdapter:
     def snapshot(self):
         return [dict(self.connection)]
 
+    def prepare_reply(self, identity, incoming, body, submission_id):
+        self.prepared = (identity, incoming, body, submission_id)
+        return {'status': 'ready'}
+
     def submit_reply(self, identity, incoming, body, submission_id):
         self.sent.append((identity, incoming, body, submission_id))
         if isinstance(self.send_result, Exception):
@@ -73,6 +77,16 @@ class LocalWorkflowTests(unittest.TestCase):
         service = EmailService(SimpleNamespace(config=self.config), studio=self.studio, engine=Mock())
         service._start_draft = lambda draft: self.studio.process_draft(draft['id'])
         return service
+
+    def test_empty_browser_message_is_visible_without_automatic_draft(self):
+        self.arrive('empty-body', body='')
+        self.service()._poll_account(self.account['id'])
+        snapshot = self.studio.snapshot()
+        self.assertEqual(len(snapshot['messages']), 1)
+        self.assertEqual(snapshot['messages'][0]['body'], '')
+        self.assertFalse(snapshot['messages'][0]['auto_draft_eligible'])
+        self.assertEqual(snapshot['drafts'], [])
+        self.assertEqual(self.adapter.sent, [])
 
     def test_all_three_choices_automatically_draft_and_remember_after_restart(self):
         for kind in ('browser_outlook', 'browser_gmail', 'classic_outlook'):
@@ -309,9 +323,81 @@ class LocalWorkflowTests(unittest.TestCase):
         self.assertEqual(self.studio.finalize_draft(draft['id'])['draft']['status'], 'sent')
         self.assertEqual(self.adapter.sent[0][3], self.adapter.sent[1][3])
 
+    def test_browser_unknown_preserves_safe_worker_failure_stage(self):
+        draft = self.approve(self.draft())
+        reason = 'The browser stopped while confirming the sent reply. Check Sent mail; Nexus will not resend this approval automatically.'
+        self.adapter.send_result = {'status': 'unknown', 'error': reason}
+        with self.assertRaisesRegex(HarnessError, 'confirming the sent reply'):
+            self.studio.finalize_draft(draft['id'])
+        current = self.studio._get('draft', draft['id'])
+        self.assertEqual(current['status'], 'delivery_unknown')
+        self.assertEqual(current['error'], reason)
+
+    def test_definitely_unsent_browser_reply_can_reapprove_another_version(self):
+        draft = self.approve(self.draft())
+        self.adapter.send_result = {'status': 'not_sent', 'error': 'Reply not ready'}
+        with self.assertRaisesRegex(HarnessError, 'Reply not ready'):
+            self.studio.finalize_draft(draft['id'])
+        failed = self.studio._get('draft', draft['id'])
+        payload = dict(account_id=self.account['id'], draft_id=draft['id'], revision=failed['revision'],
+                       text=failed['original'], learn=False, approval_contract='browser-send/v1')
+        approved = self.studio.dispatch('approve_draft', payload)['draft']
+        self.assertEqual(approved['edited'], failed['original'])
+        self.assertFalse(approved['error'])
+        with self.assertRaises(HarnessError):
+            self.studio.dispatch('approve_draft', payload)
+        self.adapter.send_result = {'status': 'sent'}
+        self.assertEqual(self.studio.finalize_draft(draft['id'])['draft']['status'], 'sent')
+        self.assertEqual(self.adapter.sent[-1][2], failed['original'])
+        self.assertEqual(self.adapter.sent[0][3], self.adapter.sent[-1][3])
+
+    def test_unknown_delivery_cannot_be_edited_or_reapproved_even_with_error(self):
+        draft = self.approve(self.draft())
+        self.adapter.send_result = {'status': 'unknown'}
+        with self.assertRaises(HarnessError):
+            self.studio.finalize_draft(draft['id'])
+        for action in ('save_draft', 'approve_draft'):
+            with self.subTest(action=action), self.assertRaises(HarnessError):
+                self.studio.dispatch(action, dict(account_id=self.account['id'], draft_id=draft['id'],
+                    revision=draft['revision'], text='Different reply', approval_contract='browser-send/v1'))
+        self.assertEqual(len(self.adapter.sent), 1)
+
+    def test_preflight_recovers_failed_approval_without_sending_and_clears_old_jobs(self):
+        draft = self.approve(self.draft())
+        self.adapter.send_result = {'status': 'not_sent', 'error': 'Old Reply control failure'}
+        with self.assertRaises(HarnessError):
+            self.studio.finalize_draft(draft['id'])
+        service = self.service()
+        service._jobs['finalize:' + draft['id']] = {'state': 'failed', 'error': 'Old Reply control failure'}
+        prepared = service.dispatch('prepare_draft', dict(account_id=self.account['id'], draft_id=draft['id'],
+            revision=draft['revision'], intent='send', text='Visible reply'))['draft']
+        self.assertEqual(len(self.adapter.sent), 1)
+        self.assertEqual(self.adapter.prepared[2], 'Visible reply')
+        self.assertEqual(prepared['status'], 'review')
+        self.assertNotIn('approved_at', prepared)
+        self.assertFalse(prepared['error'])
+        self.assertNotIn('finalize:' + draft['id'], service._jobs)
+
+    def test_revision_preflight_and_direct_revision_reopen_definitely_unsent_approval(self):
+        for preflight in (False, True):
+            with self.subTest(preflight=preflight):
+                draft = self.approve(self.draft())
+                self.adapter.send_result = {'status': 'not_sent', 'error': 'Reply unavailable'}
+                with self.assertRaises(HarnessError):
+                    self.studio.finalize_draft(draft['id'])
+                payload = dict(account_id=self.account['id'], draft_id=draft['id'], revision=draft['revision'],
+                               intent='revise', text='Keep this text', instruction='Make it concise')
+                if preflight:
+                    self.studio.prepare_draft(payload)
+                result = self.studio.revise_draft(payload)['draft']
+                self.assertEqual(result['status'], 'review')
+                self.assertNotIn('approved_at', result)
+                self.assertFalse(result['error'])
+                self.assertEqual(next(context for _, context in reversed(self.calls) if 'current_reply' in context)['current_reply'], 'Keep this text')
+
     def test_browser_identity_changes_and_disconnect_block_approved_send(self):
         draft = self.approve(self.draft())
-        for field, changed in [('email', 'someone@example.test'), ('state', 'sign_in_required'),
+        for field, changed in [('email', 'someone@example.test'), ('state', 'unsupported'),
                                ('provider', 'browser_gmail'), ('config_fingerprint', 'new')]:
             old = self.adapter.connection[field]
             self.adapter.connection[field] = changed
@@ -322,6 +408,18 @@ class LocalWorkflowTests(unittest.TestCase):
         with self.assertRaises(HarnessError):
             self.studio.finalize_draft(draft['id'])
         self.assertFalse(self.adapter.sent)
+
+    def test_browser_expired_session_reaches_recovering_send_worker(self):
+        draft = self.approve(self.draft())
+        self.adapter.connection['state'] = 'sign_in_required'
+        self.adapter.send_result = {'status': 'not_sent', 'error': 'Sign in required after recovery'}
+        with self.assertRaisesRegex(HarnessError, 'after recovery'):
+            self.studio.finalize_draft(draft['id'])
+        self.assertEqual(len(self.adapter.sent), 1)
+        self.assertEqual(self.studio._get('draft', draft['id'])['status'], 'approved')
+        self.adapter.send_result = {'status': 'sent'}
+        self.assertEqual(self.studio.finalize_draft(draft['id'])['draft']['status'], 'sent')
+        self.assertEqual(self.adapter.sent[0][3], self.adapter.sent[1][3])
 
     def test_browser_reference_upgrade_preserves_original_and_draft(self):
         draft = self.draft()
@@ -590,3 +688,128 @@ class LocalWorkflowTests(unittest.TestCase):
         self.assertEqual(service.notification_settings(), {'enabled': True, 'show_details': True})
         self.assertEqual(service.notifications()['items'], [])
         self.assertFalse((Path(fresh.name) / '.harness' / 'email-studio').exists())
+
+class LocalSyncReportingTests(unittest.TestCase):
+    """A local mailbox must report its backlog, its skipped mail and its dates."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='mail-reporting-')
+        self.addCleanup(self.temp.cleanup)
+        self.config = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), Path(self.temp.name), [], {})
+        self.adapter = LocalAdapter('browser_outlook')
+        self.studio = EmailStudio(self.config, provider_call=lambda *a, **k: 'Draft.', local_mail=self.adapter)
+        self.account = self.studio.connect_local('browser_outlook', 'local-id', {'provider_route': 'fixture-route'})['account']
+
+    def service(self):
+        service = EmailService(SimpleNamespace(config=self.config), studio=self.studio, engine=Mock())
+        service._start_draft = lambda draft: None
+        return service
+
+    def reference(self, source):
+        return {'contract': 'browser-reply/v1', 'provider': 'browser_outlook',
+                'source_hash': source, 'row_id': source, 'row_attr': 'data-convid'}
+
+    def message(self, source, **extra):
+        return dict(source_id=source, sender='colleague@example.test', subject=source,
+                    body='Can you help?', browser_reference=self.reference(source), **extra)
+
+    def test_a_reported_backlog_drains_within_one_check_instead_of_one_batch_per_interval(self):
+        batches = [dict(messages=[self.message('one')], cursor='c1', warnings=[], has_more=True),
+                   dict(messages=[self.message('two')], cursor='c2', warnings=[], has_more=True),
+                   dict(messages=[self.message('three')], cursor='c3', warnings=[], has_more=False)]
+        calls = []
+
+        def sync(identity, cursor):
+            calls.append(cursor)
+            return batches[min(len(calls) - 1, len(batches) - 1)]
+
+        self.adapter.sync = sync
+        self.service()._poll_account(self.account['id'])
+        self.assertEqual(len(calls), 3, 'the poller must keep draining while the mailbox reports more')
+        stored = {m['source_id'] for m in self.studio.snapshot()['messages']}
+        self.assertEqual(stored, {'one', 'two', 'three'})
+
+    def test_a_backlog_that_is_not_reported_still_stops_after_one_batch(self):
+        calls = []
+
+        def sync(identity, cursor):
+            calls.append(cursor)
+            return dict(messages=[], cursor='only', warnings=[], has_more=False)
+
+        self.adapter.sync = sync
+        self.service()._poll_account(self.account['id'])
+        self.assertEqual(len(calls), 1, 'a finished mailbox must not be polled in a loop')
+
+    def test_large_backlog_resumes_before_slow_draft_preparation(self):
+        calls = []
+
+        def sync(identity, cursor):
+            calls.append(cursor)
+            number = len(calls)
+            return dict(messages=[self.message(str(number))], cursor=str(number),
+                        warnings=[], has_more=number < 10)
+
+        self.adapter.sync = sync
+        service = self.service()
+        with patch.object(service, '_start_draft') as start:
+            service._poll_account(self.account['id'])
+            self.assertEqual(len(self.studio.snapshot()['messages']), 8)
+            self.assertEqual(self.studio.snapshot()['drafts'], [])
+            start.assert_not_called()
+            service._poll_account(self.account['id'])
+            self.assertEqual(calls[-2:], ['8', '9'])
+            self.assertEqual(len(self.studio.snapshot()['messages']), 10)
+            self.assertEqual(start.call_count, 10)
+
+    def test_mail_a_scan_could_not_read_is_visible_instead_of_silently_dropped(self):
+        failure = {'source_id': 'row-9', 'error': 'The selected message did not finish loading.'}
+        self.adapter.sync = lambda identity, cursor: dict(messages=[], cursor='c1', warnings=[], failed_messages=[failure])
+        self.studio.dispatch('sync', {'account_id': self.account['id']})
+        reported = self.studio.snapshot()['failed_imports']
+        self.assertEqual([f['source_id'] for f in reported], ['row-9'])
+        self.assertEqual(reported[0]['error'], failure['error'])
+        self.assertEqual(reported[0]['account_id'], self.account['id'])
+
+    def test_a_previously_unreadable_conversation_stops_being_reported_once_it_imports(self):
+        # The browser scan keys a failure by its inbox row, which never equals the
+        # content hash an imported message carries, so the scan names what it resolved.
+        row_key = 'a1b2c3d4' * 8
+        failure = {'source_id': row_key, 'error': 'The selected message did not finish loading.'}
+        self.adapter.sync = lambda identity, cursor: dict(messages=[], cursor='c1', warnings=[], failed_messages=[failure])
+        self.studio.dispatch('sync', {'account_id': self.account['id']})
+        self.assertEqual([f['source_id'] for f in self.studio.snapshot()['failed_imports']], [row_key])
+        self.adapter.sync = lambda identity, cursor: dict(
+            messages=[self.message('unrelated-content-hash')], cursor='c2', warnings=[],
+            failed_messages=[], resolved_failures=[row_key])
+        self.studio.dispatch('sync', {'account_id': self.account['id']})
+        self.assertEqual(self.studio.snapshot()['failed_imports'], [],
+                         'a conversation that finally imported must stop being reported as skipped')
+
+    def test_a_conversation_that_keeps_failing_stays_reported(self):
+        row_key = 'f0f0f0f0' * 8
+        failure = {'source_id': row_key, 'error': 'The selected message did not finish loading.'}
+        self.adapter.sync = lambda identity, cursor: dict(messages=[], cursor='c1', warnings=[], failed_messages=[failure])
+        self.studio.dispatch('sync', {'account_id': self.account['id']})
+        self.adapter.sync = lambda identity, cursor: dict(
+            messages=[self.message('another-message')], cursor='c2', warnings=[],
+            failed_messages=[failure], resolved_failures=[])
+        self.studio.dispatch('sync', {'account_id': self.account['id']})
+        self.assertEqual([f['source_id'] for f in self.studio.snapshot()['failed_imports']], [row_key],
+                         'importing other mail must not hide a conversation that still cannot be read')
+
+    def test_a_browser_message_keeps_the_date_its_mailbox_showed(self):
+        received = '2026-09-17T08:30:00+00:00'
+        self.adapter.sync = lambda identity, cursor: dict(
+            messages=[self.message('dated', received_at=received)], cursor='c1', warnings=[])
+        self.studio.dispatch('sync', {'account_id': self.account['id']})
+        stored = self.studio.snapshot()['messages'][-1]
+        self.assertEqual(stored['received_at'], received,
+                         'without a real date the newest mail cannot sort first')
+
+    def test_a_message_with_no_usable_date_is_still_imported(self):
+        self.adapter.sync = lambda identity, cursor: dict(
+            messages=[self.message('undated')], cursor='c1', warnings=[])
+        self.studio.dispatch('sync', {'account_id': self.account['id']})
+        stored = self.studio.snapshot()['messages'][-1]
+        self.assertEqual(stored['source_id'], 'undated')
+        self.assertEqual(stored['received_at'], '')

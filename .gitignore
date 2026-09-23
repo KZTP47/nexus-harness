@@ -11,6 +11,7 @@
 .harness/swarm-mutation-sagas/
 .harness/qa/runs/
 .harness/qa/tmp/
+.harness/qa/mail-live/
 .harness/qa/pipeline-preservation.lock
 .harness/qa/pipelines-before-checks/
 .harness/bundles/
@@ -23,6 +24,8 @@
 # paths and must never be staged with the product source.
 .harness/vault/
 AGENTS.md
+CLAUDE.md
+.ai-project.json
 # The report from a run of the checks. Written every time anybody runs them,
 # and about that machine at that moment, so it is nobody else's business.
 .harness/qa/full-report.json
@@ -57,6 +60,8 @@ build/
 dist/
 *.egg-info/
 __pycache__/
+.pytest_cache/
+pytest-cache-files-*/
 *.py[cod]
 
 # Developer-local environment, package-manager, editor, and assistant state.
