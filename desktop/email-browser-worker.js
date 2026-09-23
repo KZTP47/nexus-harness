@@ -38,6 +38,8 @@ const ROW_STEPS = 40;
 const COLLECT_MS = 8000;
 const SCROLL_SETTLE_MS = 150;
 const REVEAL_MS = 6000;
+// Latest Send click after the request started; the bridge stops waiting at 150 s.
+const DISPATCH_BY_MS = 100000;
 // outlook.cloud.microsoft rewrites /mail/inbox to /mail/, outlook.live.com uses /mail/0/inbox and an opened conversation appends /id/<item>.
 const INBOX_PATH = /^\/mail(?:\/\d+)?\/inbox(?:\/id\/[^/]+)?\/?$/i;
 const BARE_PATH = /^\/mail(?:\/\d+)?(?:\/id\/[^/]+)?\/?$/i;
@@ -544,6 +546,7 @@ async function handle(request) {
 async function operate(value,request) {
   // A send stamps the conversation it re-opens itself; an Outlook self-reload during it must not erase that row.
   if (['send','prepare'].includes(request.command)) {
+    request={_startedAt:Date.now(),...request}; // The preparation retry shares one dispatch deadline.
     value.replying=true;
     try {
       let result=await sendReviewed(value,request);
@@ -1112,6 +1115,9 @@ async function openSentWitness(value,request) {
     // Let the folder list settle before recording absence or existing headers.
     await sleep(1200);
     view.before=await sentViewSnapshot(view,request.incoming.browser_reference);
+    // An unrendered/virtualized conversation or unhydrated pane is no baseline:
+    // an older identical reply would later look new. No evidence, stays unknown.
+    if(view.before.absent||!view.before.ids.length||!view.before.stamps.length)throw new Error('Sent baseline unavailable.');
     return view;
   }catch{await page.close().catch(()=>{});return null;}
 }
@@ -1183,14 +1189,16 @@ function insertReviewedBody({provider,body}) {
   // One native editing transaction notifies the provider editor. textContent
   // escapes all markup; PRE preserves spaces/newlines even when Outlook strips
   // white-space styles, and avoids per-character timeouts and cursor relocation.
-  const text=document.createElement('pre');text.textContent=body;
+  // HTML parsing drops one newline directly after <pre>; supply it so a leading blank line survives.
+  const text=document.createElement('pre');text.textContent=(/^\r?\n/.test(body)?'\n':'')+body;
   if(!document.execCommand('insertHTML',false,text.outerHTML))throw new Error('The mailbox editor did not accept the reviewed text.');
 }
 function composerOwner(token) {
   const visible=e=>e.getClientRects().length&&getComputedStyle(e).visibility!=='hidden';
-  const tabs=[...document.querySelectorAll('[role="tab"]')].filter(e=>visible(e)&&/^Editing\s/.test(e.getAttribute('aria-label')||''));
+  // Only the one visible editor readComposer verifies carries the marker. A lone
+  // "Editing" tab can belong to an unrelated draft of another conversation.
   const editors=[...document.querySelectorAll('[contenteditable="true"][aria-label="Message body"],[contenteditable="true"][aria-label="Message Body"],.Am.Al.editable[contenteditable="true"][role="textbox"]')].filter(visible);
-  const owner=tabs.length===1?tabs[0]:editors.length===1?editors[0]:null;
+  const owner=editors.length===1?editors[0]:null;
   if(!owner)return '';
   if(token)owner.setAttribute('data-nexus-reply-owner',token);
   return owner.getAttribute('data-nexus-reply-owner')||'';
@@ -1212,7 +1220,9 @@ function replyReviewTab({editing}) {
     const tabs=[...group.querySelectorAll('[role="tab"]')].filter(visible);
     const editors=tabs.filter(t=>/^Editing\s/.test(t.getAttribute('aria-label')||''));
     const originals=tabs.filter(t=>!editors.includes(t));
-    return editors.length===1&&originals.length===1?{editor:editors[0],original:originals[0]}:null;
+    // The editor tab must be the one showing the verified composer; an unselected
+    // editing tab is another draft and is never switched to.
+    return editors.length===1&&originals.length===1&&editors[0].getAttribute('aria-selected')==='true'?{editor:editors[0],original:originals[0]}:null;
   }).filter(Boolean);
   return groups.length===1?(editing?groups[0].editor:groups[0].original):null;
 }
@@ -1262,7 +1272,9 @@ async function rebindReplyOriginal(value,incoming) {
 }
 async function sendReviewed(value,request) {
   let dispatched=false,record,file,recoveryFile,recoveryBinding,ownedComposer=false,sentView,stage='checking the mailbox';
-  const dispatchDeadline=Date.now()+120000;
+  // Measured from the request (browser start and the preparation retry included):
+  // Send click, toast and Sent Items checks need ~50 s under the 150 s bridge wait.
+  const dispatchDeadline=(request._startedAt||Date.now())+DISPATCH_BY_MS;
   try {
     const incoming=request.incoming,ref=incoming?.browser_reference;
     if(!/^[a-f0-9]{32}$/.test(request.submission_id || '') || typeof request.body!=='string' || !request.body.trim() || request.body.length>200000) throw new Error('A valid approved reply and submission identity are required.');
@@ -1431,6 +1443,9 @@ async function sendReviewed(value,request) {
     const finalIdentity=await status(value,request.connection);if(finalIdentity.state!=='connected')throw new Error('Mailbox identity changed before sending.');
     composer=await value.page.evaluate(readComposer,value.provider);
     if(composer.recipient!==recipient || composer.body!==request.body.replace(/\r\n/g,'\n'))throw new Error('Reply contents or recipient changed before sending.');
+    // The slow witness tab opens first: a Send handle resolved before it could be
+    // re-rendered meanwhile and fail to click only after the no-resend barrier.
+    sentView=await openSentWitness(value,request);
     stage='checking the Send button';
     const send=await value.page.evaluateHandle(provider=>{
       const selector=provider==='browser_gmail'?'[contenteditable="true"][role="textbox"][aria-label="Message Body"],.Am.Al.editable[contenteditable="true"][role="textbox"]':'[contenteditable="true"][aria-label="Message body"]';
@@ -1443,11 +1458,11 @@ async function sendReviewed(value,request) {
     // A blocked/disabled button has not dispatched anything. Check actionability
     // before writing the durable no-resend barrier, without bypassing overlays.
     await send.asElement().click({trial:true,timeout:8000});
-    sentView=await openSentWitness(value,request);
-    if(Date.now()>dispatchDeadline)throw new Error('Mailbox preparation took too long. Nothing was sent; use Review & send reply to retry.');
     composer=await value.page.evaluate(readComposer,value.provider);
     if(composer.recipient!==recipient || composer.body!==request.body.replace(/\r\n/g,'\n'))throw new Error('Reply contents or recipient changed at dispatch.');
     const before=await value.page.evaluate(acknowledgement);
+    if(!await send.evaluate(e=>e.isConnected))throw new Error('Send control changed after approval.');
+    if(Date.now()>dispatchDeadline)throw new Error('Mailbox preparation took too long. Nothing was sent; use Review & send reply to retry.');
     fs.mkdirSync(directory,{recursive:true,mode:0o700});
     record={contract:REPLY_CONTRACT,binding,status:'unknown',stage:'dispatch',created_at:new Date().toISOString()};
     saveSubmission(file,record,true);

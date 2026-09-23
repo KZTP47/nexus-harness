@@ -244,16 +244,17 @@ test('late quoted-thread hydration settles before keyboard entry of the approved
 });
 
 test('a new exact Sent Items message confirms sending without a toast while another draft stays open',{timeout:45000},async()=>{
-  const f=await fixtureSession('browser_outlook','headless',{sentFolder:true,acknowledge:false,leaveComposer:true});
+  // An earlier reply gives the conversation a rendered Sent Items baseline.
+  const f=await fixtureSession('browser_outlook','headless',{sentFolder:true,acknowledge:false,leaveComposer:true,sendCount:1,lastSent:{body:'An earlier different reply',recipient:'sender@example.test'}});
   try {
     const request={...f.request,command:'send',incoming:f.incoming,body:'Exact approved text\n\n  spaces and <markup>',submission_id:submissionId};
     const result=await worker.operate(f.value,request);
     assert.equal(result.status,'sent',JSON.stringify(result));
     assert.equal(result.evidence,'sent_folder_new_message');
-    assert.equal(f.fixture.state.sendCount,1);
+    assert.equal(f.fixture.state.sendCount,2);
     assert.equal(f.value.context.pages().length,1,'verification tab always closes');
     assert.equal((await worker.operate(f.value,request)).status,'sent');
-    assert.equal(f.fixture.state.sendCount,1);
+    assert.equal(f.fixture.state.sendCount,2);
   }finally{await f.close();}
 });
 
@@ -329,7 +330,7 @@ test('interrupted owned composer resumes after restart while external edits and 
     try {
       await f.value.context.route('**/*',async route=>{
         if(new URL(route.request().url()).pathname==='/__nexus_test_send__')return f.fixture.route(route);
-        const script=`<script>const initialOpenReply=openReply,initialOpenMessage=openMessage;openMessage=()=>{initialOpenMessage();if(window.changedOriginal)document.querySelector('#pane [role=document]').textContent='Original changed since failure';};openReply=()=>{initialOpenReply();document.querySelector('#pane').style.display='none';const tabs=document.createElement('div');tabs.setAttribute('role','tablist');for(const editing of [false,true]){const tab=document.createElement('button');tab.setAttribute('role','tab');tab.setAttribute('aria-label',editing?'Editing Re: Question':'Question');tab.textContent=editing?'Editing Re: Question':'Question';tab.onclick=()=>{document.querySelector('#pane').style.display=editing?'none':'block';document.querySelector('#compose').style.display=editing?'block':'none';};tabs.append(tab);}document.body.append(tabs);};</script>`;
+        const script=`<script>const initialOpenReply=openReply,initialOpenMessage=openMessage;openMessage=()=>{initialOpenMessage();if(window.changedOriginal)document.querySelector('#pane [role=document]').textContent='Original changed since failure';};openReply=()=>{initialOpenReply();document.querySelector('#pane').style.display='none';const tabs=document.createElement('div');tabs.setAttribute('role','tablist');for(const editing of [false,true]){const tab=document.createElement('button');tab.setAttribute('role','tab');tab.setAttribute('aria-label',editing?'Editing Re: Question':'Question');tab.textContent=editing?'Editing Re: Question':'Question';tab.setAttribute('aria-selected',String(editing));tab.onclick=()=>{tabs.querySelectorAll('[role=tab]').forEach(t=>t.setAttribute('aria-selected',String(t===tab)));document.querySelector('#pane').style.display=editing?'none':'block';document.querySelector('#compose').style.display=editing?'block':'none';};tabs.append(tab);}document.body.append(tabs);};</script>`;
         return route.fulfill({contentType:'text/html',body:f.fixture.html()+script});
       });
       await f.value.page.reload();
@@ -595,4 +596,105 @@ test('mailbox readiness refreshes the original but never opens a composer or dis
       assert.equal(sent.status,'sent',JSON.stringify(sent));assert.equal(f.fixture.state.sendCount,1);
     }finally{await f.close();}
   }
+});
+
+// Serves the fixture with extra page script; Sent Items keeps its own document.
+const scripted=(f,extra)=>async route=>{
+  const pathname=new URL(route.request().url()).pathname;
+  if(pathname.startsWith('/__nexus_test_'))return f.fixture.route(route);
+  const sent=f.fixture.state.sentFolder&&pathname==='/mail/sentitems';
+  return route.fulfill({contentType:'text/html',body:extra(f.fixture.html(sent),sent)});
+};
+test('recovery marker stays on the verified editor and an unselected draft tab never receives the reply',{timeout:90000},async()=>{
+  for(const flagged of [true,false]) {
+    const f=await fixtureSession('browser_outlook');
+    try {
+      // An unrelated popped-out draft (another conversation, same correspondent) owns the only Editing tab.
+      const tabs=flagged?['aria-selected="true"','aria-selected="false"']:['',''];
+      await f.value.context.route('**/*',scripted(f,html=>html+`<script>
+        const list=document.createElement('div');list.setAttribute('role','tablist');
+        list.innerHTML='<button role="tab" aria-label="Inbox" ${tabs[0]}>Inbox</button><button role="tab" aria-label="Editing Re: Other topic" ${tabs[1]}>Editing Re: Other topic</button>';
+        document.body.prepend(list);
+        const other=document.createElement('section');other.style.display='none';
+        other.innerHTML='<span data-email="sender@example.test">sender@example.test</span><div role="textbox" aria-label="Message body" contenteditable="true"></div><button aria-label="Send">Send</button>';
+        document.body.append(other);
+        other.querySelector('button').onclick=()=>fetch('/__nexus_test_send__',{method:'POST',body:JSON.stringify({body:other.querySelector('[contenteditable]').innerText,recipient:'sender@example.test',conversation:'other'})});
+        const [inbox,editing]=list.querySelectorAll('button');
+        inbox.onclick=()=>{other.style.display='none';document.querySelector('main').style.display='block';};
+        editing.onclick=()=>{other.style.display='block';document.querySelector('main').style.display='none';};
+      </script>`));
+      await f.value.page.reload();
+      const send={...f.request,command:'send',incoming:f.incoming,body:'Approved reply for the Question thread',submission_id:submissionId};
+      const evaluate=f.value.page.evaluate.bind(f.value.page);
+      f.value.page.evaluate=async(fn,arg)=>{if(fn.name==='insertReviewedBody')throw new Error('page.evaluate: Editor interrupted during entry.');return evaluate(fn,arg);};
+      assert.equal((await worker.operate(f.value,send)).status,'not_sent');
+      f.value.page.evaluate=evaluate;
+      assert.deepEqual(await f.value.page.evaluate(()=>[...document.querySelectorAll('[data-nexus-reply-owner]')].map(e=>e.getAttribute('role'))),['textbox']);
+      const result=await worker.operate({context:f.value.context,page:f.value.page,profile:f.value.profile,provider:f.value.provider,mode:f.value.mode},send);
+      assert.equal(result.status,'sent',JSON.stringify(result));
+      assert.deepEqual(f.fixture.state.lastSent,{body:send.body,recipient:'sender@example.test'},'sent from the owned composer, never the other draft');
+      assert.equal(f.fixture.state.sendCount,1);
+    }finally{await f.close();}
+  }
+});
+test('an absent or unhydrated Sent Items baseline never confirms a send',{timeout:90000},async()=>{
+  const body='Thanks, received.';
+  // Slow list: the conversation renders only after the baseline; the Send click is dropped
+  // and an older identical reply appears. First reply: no baseline exists at all.
+  for(const [state,extra,sends] of [
+    [{dropSend:true,sendCount:1,lastSent:{body,recipient:'sender@example.test'}},(html,sent)=>sent?html.replace('refresh();setInterval(refresh,100);','setTimeout(()=>{refresh();setInterval(refresh,100);},2500);'):html,1],
+    [{leaveComposer:true},html=>html,1]]) {
+    const f=await fixtureSession('browser_outlook','headless',{sentFolder:true,acknowledge:false,...state});
+    try {
+      await f.value.context.route('**/*',scripted(f,extra));
+      await f.value.page.reload();
+      const result=await worker.operate(f.value,{...f.request,command:'send',incoming:f.incoming,body,submission_id:submissionId});
+      assert.equal(result.status,'unknown',JSON.stringify(result));
+      assert.equal(f.fixture.state.sendCount,sends);
+      assert.equal(f.value.context.pages().length,1);
+    }finally{await f.close();}
+  }
+});
+test('a Send control re-rendered while Sent Items opens or before the receipt never becomes an uncertain send',{timeout:90000},async()=>{
+  // Cross-tab re-render as the witness tab loads: the handle is resolved afterwards.
+  const f=await fixtureSession('browser_outlook','headless',{sentFolder:true});
+  try {
+    await f.value.context.route('**/*',scripted(f,(html,sent)=>html+(sent?`<script>new BroadcastChannel('owa').postMessage('opened');</script>`:`<script>new BroadcastChannel('owa').onmessage=()=>{const b=document.querySelector('button[aria-label="Send"]');if(b)b.replaceWith(b.cloneNode(true));};</script>`)));
+    await f.value.page.reload();
+    const result=await worker.operate(f.value,{...f.request,command:'send',incoming:f.incoming,body:'Approved reply',submission_id:submissionId});
+    assert.equal(result.status,'sent',JSON.stringify(result));assert.equal(f.fixture.state.sendCount,1);
+  }finally{await f.close();}
+  // Re-render after the trial click: the detached handle is caught before the receipt.
+  const g=await fixtureSession('browser_outlook');
+  try {
+    const request={...g.request,command:'send',incoming:g.incoming,body:'Approved reply',submission_id:submissionId};
+    const evaluate=g.value.page.evaluate.bind(g.value.page);
+    g.value.page.evaluate=async(fn,arg)=>{if(fn.name==='acknowledgement')await evaluate(()=>{const b=document.querySelector('button[aria-label="Send"]');b.replaceWith(b.cloneNode(true));});return evaluate(fn,arg);};
+    const result=await worker.operate(g.value,request);
+    g.value.page.evaluate=evaluate;
+    assert.equal(result.status,'not_sent',JSON.stringify(result));assert.equal(g.fixture.state.sendCount,0);
+    assert.equal(fs.existsSync(path.join(g.value.profile,'nexus-reviewed-submissions',submissionId+'.json')),false);
+    assert.equal((await worker.operate(g.value,request)).status,'sent');assert.equal(g.fixture.state.sendCount,1);
+  }finally{await g.close();}
+});
+test('an approved reply beginning with blank lines is entered exactly',{timeout:60000},async()=>{
+  for(const provider of ['browser_outlook','browser_gmail']) for(const body of ['\n\nReply after two blank lines.','\r\nReply after a Windows blank line.']) {
+    const f=await fixtureSession(provider);
+    try {
+      const result=await worker.operate(f.value,{...f.request,command:'send',incoming:f.incoming,body,submission_id:submissionId});
+      assert.equal(result.status,'sent',JSON.stringify(result));
+      assert.equal(f.fixture.state.lastSent.body,body.replace(/\r\n/g,'\n'));
+    }finally{await f.close();}
+  }
+});
+test('the dispatch deadline counts from the request, not from a late preparation',{timeout:45000},async()=>{
+  const f=await fixtureSession('browser_outlook');
+  try {
+    // 101 s after the request the bridge (150 s) could not await Send confirmation.
+    const request={...f.request,command:'send',incoming:f.incoming,body:'Too late to dispatch',submission_id:submissionId};
+    const result=await worker.operate(f.value,{...request,_startedAt:Date.now()-101000});
+    assert.equal(result.status,'not_sent',JSON.stringify(result));assert.match(result.error,/took too long/);
+    assert.equal(f.fixture.state.sendCount,0);
+    assert.equal(fs.existsSync(path.join(f.value.profile,'nexus-reviewed-submissions',submissionId+'.json')),false);
+  }finally{await f.close();}
 });
