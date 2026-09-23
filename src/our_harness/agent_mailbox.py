@@ -256,18 +256,26 @@ def _remove_unreferenced(where: Path, messages: list[dict[str, Any]], payloads: 
 
 def _supersede(
     where: Path, messages: list[dict[str, Any]], current_goals: dict[str, str], workspace: str,
+    known_workspaces: set[str] | None = None,
 ) -> tuple[int, list[Path]]:
-    """Settle queued mail whose project now has a different list of jobs.
+    """Settle queued mail that can never be delivered.
 
     A changed job list is a changed goal, and mail is only ever delivered into
-    the goal it was written for, so these can never be delivered or
-    acknowledged. Left queued they would count toward the limit forever and
-    eventually refuse every new handoff.
+    the goal it was written for, so mail for a project's earlier jobs can
+    never be delivered or acknowledged. Left queued it would count toward the
+    limit forever and eventually refuse every new handoff.
 
-    Only mail written on the same saved board is settled: another board's
-    "project-1" is a different project whose queued handoffs must survive
-    until that board is opened again. Mail that does not say which board it
-    came from is never settled here.
+    Which board wrote the mail decides whose earlier jobs they were:
+
+    - mail from this board (``workspace``) is settled when its project's jobs
+      changed;
+    - mail that names no board was written before mail named one, so the
+      project id is all there is to go on, as it was then;
+    - mail from a board that no longer exists (not in ``known_workspaces``,
+      when that is given) can never be opened again and is settled whatever
+      its project;
+    - mail from another saved board is left alone: its "project-1" is a
+      different project whose handoffs must survive until it is opened again.
     """
 
     count = 0
@@ -275,10 +283,15 @@ def _supersede(
     if not workspace:
         return count, payloads
     for one in messages:
-        if one.get("state") != "queued" or one.get("workspace") != workspace:
+        if one.get("state") != "queued":
             continue
+        written_on = str(one.get("workspace") or "")
         project = str(one.get("project") or "")
-        if project not in current_goals or one.get("shared_goal_id") == current_goals[project]:
+        changed = project in current_goals and one.get("shared_goal_id") != current_goals[project]
+        if written_on == workspace or not written_on:
+            if not changed:
+                continue
+        elif known_workspaces is None or written_on in known_workspaces:
             continue
         payload = _release_body(where, one)
         if payload is not None:
@@ -290,22 +303,28 @@ def _supersede(
     return count, payloads
 
 
-def retire_superseded_goals(where: Path, current_goals: dict[str, str], *, workspace: str = "") -> int:
-    """Settle queued mail written for a project's earlier jobs; return how many.
+def retire_superseded_goals(
+    where: Path, current_goals: dict[str, str], *, workspace: str = "",
+    known_workspaces: Iterable[str] | None = None,
+) -> int:
+    """Settle queued mail that can never be delivered; return how many.
 
-    Only projects named in ``current_goals`` on the saved board ``workspace``
-    are touched, so mail for a project that is simply not on this board right
-    now, or that belongs to another board, is left alone.
+    ``workspace`` is the board being run and ``current_goals`` its projects'
+    goals. Mail for a project that is simply not on this board right now, or
+    that belongs to another saved board, is left alone. Hand in
+    ``known_workspaces`` (every board that can still be opened, this one
+    included) to also settle mail from boards that are gone.
     """
 
     wanted = {_clean(project): _clean(goal, 100) for project, goal in current_goals.items()
               if _clean(project) and _clean(goal, 100)}
     board = _clean(workspace, 100)
-    if not wanted or not board:
+    known = None if known_workspaces is None else {_clean(one, 100) for one in known_workspaces} | {board}
+    if not board or (not wanted and known is None):
         return 0
     with _lock:
         messages = _read(where)
-        count, payloads = _supersede(where, messages, wanted, board)
+        count, payloads = _supersede(where, messages, wanted, board, known)
         if count:
             _write(where, _pruned(messages))
             _remove_unreferenced(where, messages, payloads)

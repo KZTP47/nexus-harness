@@ -16714,7 +16714,15 @@ async function continueBoardGoalQueue({retryPaused = false} = {}) {
   try {
     while (true) {
       const queue = await refreshBoardGoalQueue(false);
-      if (!queue || ["complete", "cancelled"].includes(queue.status)) return;
+      if (!queue) {
+        // A failed read must not strand a waiting or running queue: nothing
+        // else would ask again. A missing queue simply ends here.
+        if (swarmGoalQueueMissed && ["queued", "running"].includes(swarmGoalQueue?.status)) {
+          watchBoardGoalQueue(Math.min(30000, 1200 * (2 ** swarmGoalQueueMissed)));
+        }
+        return;
+      }
+      if (["complete", "cancelled"].includes(queue.status)) return;
       const item = queue.current;
       if (!item) return;
       if (queue.status === "running") {

@@ -149,6 +149,26 @@ test("a failed read while the queue is running keeps watching, backing off, unti
   assert.equal(f.context.swarmGoalQueueMissed, 0);
 });
 
+test("a failed read while continuing a waiting queue watches again instead of stranding it", async () => {
+  const f = fixture();
+  f.context.swarmGoalQueue = f.queue("queued");
+  const working = f.context.request;
+  f.context.request = async () => { throw new Error("The harness is restarting."); };
+  await f.context.continueBoardGoalQueue();
+  assert.equal(f.timers.size, 1, "one retry is scheduled");
+  assert.equal(f.lastWait, 2400);
+  assert.equal(f.sends.length, 0);
+  f.context.request = working;
+  f.queues = [f.queue("complete")];
+  await f.fireTimers();
+  assert.equal(f.timers.size, 0, "it stops once the queue reads back");
+  // A read that fails when no queue was ever seen schedules nothing.
+  const g = fixture();
+  g.context.request = async () => { throw new Error("offline"); };
+  await g.context.continueBoardGoalQueue();
+  assert.equal(g.timers.size, 0);
+});
+
 test("Cancel remaining goals cancels a waiting legacy queue, not the long-horizon goal", async () => {
   for (const status of ["queued", "paused"]) {
     const f = fixture();

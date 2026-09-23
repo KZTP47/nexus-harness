@@ -197,16 +197,39 @@ class DurableAgentMailbox(unittest.TestCase):
         self.assertEqual(mailbox.retire_superseded_goals(
             self.where, {"project-1": "board-a-new-jobs"}, workspace="board-a"), 1)
 
-    def test_mail_that_does_not_name_its_board_is_never_settled(self) -> None:
-        legacy = self.queued("old-jobs", workspace="")
+    def test_mail_that_names_no_board_is_settled_by_its_project_as_before(self) -> None:
+        # Mail written before handoffs named their board must still drain, or a
+        # mailbox already full of it would refuse every new handoff for ever.
+        with mock.patch.object(mailbox, "MOST_MESSAGES", 3):
+            for _ in range(2):
+                self.queued("old-jobs", workspace="")
+            current = self.queued("current-jobs", workspace="")
+            self.assertEqual(mailbox.retire_superseded_goals(
+                self.where, {"project-1": "current-jobs"}, workspace="board-a"), 2)
+            self.assertEqual([one.message_id for one in mailbox.pending(
+                self.where, shared_goal_id="current-jobs", receiver="agent-2", allowed_senders=["agent-1"],
+            )], [current.message_id], "board-less mail still matching its project's goal stays deliverable")
+            # The full mailbox takes a new handoff: the jobs changed again.
+            self.queued("old-jobs", workspace="")
+            self.queued("new-jobs", workspace="board-a")
+        states = {one["message_id"]: one["state"]
+                  for one in json.loads(self.where.read_text(encoding="utf-8"))["messages"]}
+        self.assertEqual(states[current.message_id], "superseded")
+        self.assertEqual(sorted(states.values()).count("queued"), 1)
+
+    def test_mail_from_a_board_that_is_gone_is_settled_but_a_saved_boards_is_kept(self) -> None:
+        gone = self.queued("their-jobs", workspace="board-deleted")
+        saved = self.queued("their-jobs", workspace="board-saved")
+        mine = self.queued("my-jobs", workspace="board-a")
+        # Without the list of boards nothing from another board is touched.
         self.assertEqual(mailbox.retire_superseded_goals(
-            self.where, {"project-1": "new-jobs"}, workspace="board-a"), 0)
-        self.assertEqual(mailbox.retire_superseded_goals(self.where, {"project-1": "new-jobs"}), 0)
-        self.queued("new-jobs", workspace="board-a")
-        self.queued("newer-jobs", workspace="")
-        self.assertEqual([one.message_id for one in mailbox.pending(
-            self.where, shared_goal_id="old-jobs", receiver="agent-2", allowed_senders=["agent-1"],
-        )], [legacy.message_id])
+            self.where, {"project-1": "my-jobs"}, workspace="board-a"), 0)
+        self.assertEqual(mailbox.retire_superseded_goals(
+            self.where, {}, workspace="board-a", known_workspaces=["board-saved"]), 1)
+        states = {one["message_id"]: one["state"]
+                  for one in json.loads(self.where.read_text(encoding="utf-8"))["messages"]}
+        self.assertEqual(states, {gone.message_id: "superseded", saved.message_id: "queued",
+                                  mine.message_id: "queued"})
 
     def test_pruning_at_exactly_the_limit_keeps_no_settled_history(self) -> None:
         settled = [{"message_id": "done", "state": "acknowledged"},
