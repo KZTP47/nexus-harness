@@ -40,6 +40,8 @@ const SCROLL_SETTLE_MS = 150;
 const REVEAL_MS = 6000;
 // Latest Send click after the request started; the bridge stops waiting at 150 s.
 const DISPATCH_BY_MS = 100000;
+// A missing, malformed or future request start never stretches a deadline.
+const requestStart = value => Number.isFinite(value)&&value<=Date.now() ? value : Date.now();
 // outlook.cloud.microsoft rewrites /mail/inbox to /mail/, outlook.live.com uses /mail/0/inbox and an opened conversation appends /id/<item>.
 const INBOX_PATH = /^\/mail(?:\/\d+)?\/inbox(?:\/id\/[^/]+)?\/?$/i;
 const BARE_PATH = /^\/mail(?:\/\d+)?(?:\/id\/[^/]+)?\/?$/i;
@@ -546,7 +548,7 @@ async function handle(request) {
 async function operate(value,request) {
   // A send stamps the conversation it re-opens itself; an Outlook self-reload during it must not erase that row.
   if (['send','prepare'].includes(request.command)) {
-    request={_startedAt:Date.now(),...request}; // The preparation retry shares one dispatch deadline.
+    request={...request,_startedAt:requestStart(request._startedAt)}; // The preparation retry shares one dispatch deadline.
     value.replying=true;
     try {
       let result=await sendReviewed(value,request);
@@ -1174,7 +1176,12 @@ function readComposer(provider) {
 }
 function saveSubmission(file,record,exclusive=false) {
   const data=JSON.stringify(record);
-  if(exclusive) { const fd=fs.openSync(file,'wx',0o600); try {fs.writeFileSync(fd,data);fs.fsyncSync(fd);} finally{fs.closeSync(fd);} }
+  if(exclusive) {
+    // A receipt that never became durable is removed: nothing is clicked before
+    // it exists, and an unreadable one would block every retry as uncertain.
+    const fd=fs.openSync(file,'wx',0o600); let durable=false;
+    try {fs.writeFileSync(fd,data);fs.fsyncSync(fd);durable=true;} finally{fs.closeSync(fd);if(!durable)fs.rmSync(file,{force:true});}
+  }
   else { const temp=file+'.tmp'; const fd=fs.openSync(temp,'w',0o600); try{fs.writeFileSync(fd,data);fs.fsyncSync(fd);}finally{fs.closeSync(fd);}fs.renameSync(temp,file); }
 }
 function insertReviewedBody({provider,body}) {
@@ -1274,7 +1281,7 @@ async function sendReviewed(value,request) {
   let dispatched=false,record,file,recoveryFile,recoveryBinding,ownedComposer=false,sentView,stage='checking the mailbox';
   // Measured from the request (browser start and the preparation retry included):
   // Send click, toast and Sent Items checks need ~50 s under the 150 s bridge wait.
-  const dispatchDeadline=(request._startedAt||Date.now())+DISPATCH_BY_MS;
+  const dispatchDeadline=requestStart(request._startedAt)+DISPATCH_BY_MS;
   try {
     const incoming=request.incoming,ref=incoming?.browser_reference;
     if(!/^[a-f0-9]{32}$/.test(request.submission_id || '') || typeof request.body!=='string' || !request.body.trim() || request.body.length>200000) throw new Error('A valid approved reply and submission identity are required.');
@@ -1293,12 +1300,13 @@ async function sendReviewed(value,request) {
     if(!/^[^\s@<>;,]+@[^\s@<>;,]+$/.test(recipient))throw new Error('The approved reply recipient is not a single mailbox.');
     recoveryFile=path.join(value.profile,'nexus-reviewed-composers',request.submission_id+'.json');
     recoveryBinding=digest([REPLY_CONTRACT,value.provider,request.connection.email.toLowerCase(),incoming.source_id,ref.content_hash,recipient]);
-    let resume=false;
+    let resume=false,savedOwner='';
     if(await hasComposer(value.page)) {
       try {
         const saved=JSON.parse(fs.readFileSync(recoveryFile,'utf8'));
         const current=await value.page.evaluate(readComposer,value.provider);
         resume=saved.contract==='browser-composer/v1'&&saved.binding===recoveryBinding&&current.recipient===recipient&&saved.body_hash===digest(current.body)&&!!saved.owner&&saved.owner===await value.page.evaluate(composerOwner);
+        if(resume)savedOwner=saved.owner;
       }catch{}
       if(!resume)throw new Error('An existing reply composer is open or has been edited outside Nexus. Finish or close it before sending this reviewed reply.');
     }
@@ -1330,11 +1338,14 @@ async function sendReviewed(value,request) {
       value.lastOpenedRow=ref.row_id;
     }
     stage='verifying the original message';
-    let original,senderOverride,cardAttempted=false,returnTab,rebound=false,rebindAttempted=false;
+    let original,senderOverride,cardAttempted=false,returnTab,returned=false,rebound=false,rebindAttempted=false;
     if(resume) {
       const target=await value.page.evaluateHandle(replyReviewTab,{subject:incoming.subject,editing:false});
       if(target.asElement()) {
         returnTab=await value.page.evaluateHandle(replyReviewTab,{subject:incoming.subject,editing:true});
+        // The selected tab showing the verified, owned editor carries the token
+        // across the switch: re-selecting it may re-mount that editor unmarked.
+        await returnTab.evaluate((tab,token)=>tab.setAttribute('data-nexus-reply-owner',token),savedOwner);
         await target.asElement().click();
       }
       await target.dispose();
@@ -1380,13 +1391,22 @@ async function sendReviewed(value,request) {
         await new Promise(resolve=>setTimeout(resolve,150));
     }
     } finally {
-      if(returnTab) { try{await returnTab.asElement().click();}finally{await returnTab.dispose();} }
+      if(returnTab) {
+        try{
+          await returnTab.asElement().click();
+          returned=await returnTab.evaluate((tab,token)=>tab.isConnected&&tab.getAttribute('aria-selected')==='true'&&tab.getAttribute('data-nexus-reply-owner')===token,savedOwner).catch(()=>false);
+        }finally{await returnTab.dispose();}
+      }
     }
     if(!matchesOriginal(rebound?{...original,message_id:ref.message_id}:original)) throw new Error('The original message content changed or a different message is open. Rescan and review before sending.');
     if(resume) {
       const saved=JSON.parse(fs.readFileSync(recoveryFile,'utf8'));
       const current=await value.page.evaluate(readComposer,value.provider);
-      if(current.recipient!==recipient||saved.body_hash!==digest(current.body)||saved.owner!==await value.page.evaluate(composerOwner))throw new Error('The interrupted reply changed during recovery. It will not be overwritten.');
+      if(current.recipient!==recipient||saved.body_hash!==digest(current.body))throw new Error('The interrupted reply changed during recovery. It will not be overwritten.');
+      // Only an unmarked editor behind the same stamped, still selected tab
+      // inherits ownership; readComposer has just proved it is the only one.
+      const owner=await value.page.evaluate(composerOwner);
+      if(owner!==saved.owner&&!(returned&&!owner&&await value.page.evaluate(composerOwner,saved.owner)===saved.owner))throw new Error('The interrupted reply changed during recovery. It will not be overwritten.');
     }
     if(!resume&&await hasComposer(value.page)) throw new Error('An existing reply composer is open. It will not be overwritten.');
     if(!resume) {

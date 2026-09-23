@@ -698,3 +698,58 @@ test('the dispatch deadline counts from the request, not from a late preparation
     assert.equal(fs.existsSync(path.join(f.value.profile,'nexus-reviewed-submissions',submissionId+'.json')),false);
   }finally{await f.close();}
 });
+
+test('a resumed tabbed composer whose editor re-mounts keeps ownership only through its stamped, selected tab',{timeout:90000},async()=>{
+  // remount: re-selecting Editing replaces the editor element. unselected: it also fails to report selection.
+  for(const mode of ['remount','unselected']) {
+    const f=await fixtureSession('browser_outlook');
+    try {
+      await f.value.context.route('**/*',scripted(f,html=>html+`<script>const initialOpenReply=openReply;openReply=()=>{initialOpenReply();document.querySelector('#pane').style.display='none';const tabs=document.createElement('div');tabs.setAttribute('role','tablist');for(const editing of [false,true]){const tab=document.createElement('button');tab.setAttribute('role','tab');tab.setAttribute('aria-label',editing?'Editing Re: Question':'Question');tab.textContent=tab.getAttribute('aria-label');tab.setAttribute('aria-selected',String(editing));tab.onclick=()=>{tabs.querySelectorAll('[role=tab]').forEach(t=>t.setAttribute('aria-selected',String(t===tab&&!(editing&&${mode==='unselected'}))));document.querySelector('#pane').style.display=editing?'none':'block';document.querySelector('#compose').style.display=editing?'block':'none';
+        if(editing){const old=document.querySelector('#compose [contenteditable]');const fresh=document.createElement('div');for(const a of ['style','role','aria-label','contenteditable'])fresh.setAttribute(a,old.getAttribute(a));fresh.innerHTML=old.innerHTML;old.replaceWith(fresh);}};tabs.append(tab);}document.body.append(tabs);};</script>`));
+      await f.value.page.reload();
+      const send={...f.request,command:'send',incoming:f.incoming,body:'Reviewed opening.\n\nRest of reply.',submission_id:submissionId};
+      const evaluate=f.value.page.evaluate.bind(f.value.page);
+      f.value.page.evaluate=async(fn,arg)=>{if(fn.name==='insertReviewedBody'){await evaluate(fn,{...arg,body:'Reviewed opening.'});throw new Error('page.evaluate: Editor interrupted during entry.');}return evaluate(fn,arg);};
+      assert.equal((await worker.operate(f.value,send)).status,'not_sent');
+      f.value.page.evaluate=evaluate;
+      const restarted={context:f.value.context,page:f.value.page,profile:f.value.profile,provider:f.value.provider,mode:f.value.mode};
+      const result=await worker.operate(restarted,send);
+      if(mode==='remount') {
+        assert.equal(result.status,'sent',JSON.stringify(result));
+        assert.deepEqual(f.fixture.state.lastSent,{body:send.body,recipient:'sender@example.test'});assert.equal(f.fixture.state.sendCount,1);
+      } else {
+        assert.equal(result.status,'not_sent',JSON.stringify(result));assert.match(result.error,/changed during recovery/);assert.equal(f.fixture.state.sendCount,0);
+      }
+    }finally{await f.close();}
+  }
+});
+test('a receipt that fails before it is durable is removed and the approval stays retryable',{timeout:60000},async()=>{
+  const f=await fixtureSession('browser_outlook');
+  const {openSync,fsyncSync}=fs;let receipt=null,injected=false;
+  try {
+    // Only the exclusive dispatch receipt fails, once, after its file was created.
+    fs.openSync=(file,flags,...rest)=>{const fd=openSync(file,flags,...rest);if(!injected&&flags==='wx'&&String(file).includes('nexus-reviewed-submissions'))receipt=fd;return fd;};
+    fs.fsyncSync=fd=>{if(fd===receipt){receipt=null;injected=true;throw Object.assign(new Error('EIO: i/o error, fsync'),{code:'EIO'});}return fsyncSync(fd);};
+    const request={...f.request,command:'send',incoming:f.incoming,body:'Approved after a disk hiccup.',submission_id:submissionId};
+    const failed=await worker.operate(f.value,request);
+    assert.equal(failed.status,'not_sent',JSON.stringify(failed));assert.equal(f.fixture.state.sendCount,0);
+    assert.equal(fs.existsSync(path.join(f.value.profile,'nexus-reviewed-submissions',submissionId+'.json')),false);
+    const retry=await worker.operate(f.value,request);
+    assert.equal(retry.status,'sent',JSON.stringify(retry));assert.equal(f.fixture.state.sendCount,1);
+  }finally{fs.openSync=openSync;fs.fsyncSync=fsyncSync;await f.close();}
+});
+test('a future or non-finite request start never extends the dispatch deadline',{timeout:60000},async()=>{
+  for(const start of [Date.now()+3600000,Infinity]) {
+    const f=await fixtureSession('browser_outlook');
+    const now=Date.now;
+    try {
+      // Preparation "takes" 101 s: the clock jumps once the approved text is entered.
+      const evaluate=f.value.page.evaluate.bind(f.value.page);
+      f.value.page.evaluate=async(fn,arg)=>{const result=await evaluate(fn,arg);if(fn.name==='insertReviewedBody'){const base=now();Date.now=()=>base+101000+(now()-base);}return result;};
+      const result=await worker.operate(f.value,{...f.request,command:'send',incoming:f.incoming,body:'Too late to dispatch',submission_id:submissionId,_startedAt:start});
+      Date.now=now;
+      assert.equal(result.status,'not_sent',JSON.stringify({start,result}));assert.match(result.error,/took too long/);
+      assert.equal(f.fixture.state.sendCount,0);
+    }finally{Date.now=now;await f.close();}
+  }
+});
