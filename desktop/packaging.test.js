@@ -152,6 +152,12 @@ test("the private Python runtime and harness source are packaged together", () =
   const resources = PACKAGE.build.extraResources;
   assert.ok(resources.some((item) => item.from === "runtime" && item.to === "runtime"));
   assert.ok(resources.some((item) => item.from === "../src" && item.to === "harness/src"));
+  // The source tree is copied from the working tree, so per-machine build
+  // leftovers there must be filtered out, as the zipapp build does.
+  const sourceFilter = resources.find((item) => item.from === "../src").filter;
+  for (const excluded of ["!**/__pycache__/**", "!**/*.pyc", "!**/*.pyo", "!**/*.egg-info/**"]) {
+    assert.ok(sourceFilter.includes(excluded), `harness/src must exclude ${excluded}`);
+  }
   assert.ok(shipped("build-info.json"), "the exact commit/build label must ship with the app");
   assert.match(PACKAGE.scripts.prebuild, /prepare_build_info\.py/);
   assert.match(PACKAGE.scripts.build, /build_windows_desktop\.py/);

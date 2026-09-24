@@ -32,6 +32,17 @@ class AttachmentInputFidelityTests(unittest.TestCase):
         return chat.keep_attachments(self.config, "", [{"name": name, "type": mime,
             "data": base64.b64encode(self.original).decode()}], "isolated-chat")
 
+    def codex_provider(self):
+        # The provider binds a successful preflight to the command, model, auth
+        # mode, executable revision and environment, so marking it complete is
+        # not enough. Stub the preflight itself: the real one executes a Codex
+        # binary and reads this machine's sign-in, which a test must not need.
+        provider = codex_cli.CodexCLIProvider(self.config)
+        patcher = mock.patch.object(codex_cli, "codex_cli_preflight", return_value=("", ""))
+        self.preflight = patcher.start()
+        self.addCleanup(patcher.stop)
+        return provider
+
     def ask(self, provider, files, context):
         selected = self.root / "PLOQQIZ – exact (destination)"
         working = self.root / "independent copy"
@@ -101,8 +112,7 @@ class AttachmentInputFidelityTests(unittest.TestCase):
 
     def test_ingested_original_reaches_actual_native_codex_image_operand(self):
         _public, files, context = self.ingest()
-        provider = codex_cli.CodexCLIProvider(self.config)
-        provider._preflight_complete = True
+        provider = self.codex_provider()
         observed = {}
 
         def execute(argv, **kwargs):
@@ -117,6 +127,7 @@ class AttachmentInputFidelityTests(unittest.TestCase):
                 mock.patch.object(codex_cli, "_run_bounded", side_effect=execute):
             answer = self.ask(provider, files, context)
         self.assertEqual(answer["text"], "received")
+        self.assertEqual(self.preflight.call_args.args[0], ["synthetic-codex"])
         self.assertEqual(observed["data"], self.original)
         self.assertIn('"width": 1600', observed["prompt"])
         self.assertIn("PLOQQIZ", observed["prompt"])
@@ -158,8 +169,7 @@ class AttachmentInputFidelityTests(unittest.TestCase):
             with mock.patch.object(provider, "_post", return_value=response) as posted:
                 self.ask(provider, files, context)
             self.assertIn(marker, json.dumps(posted.call_args.args[1], ensure_ascii=False))
-        provider = codex_cli.CodexCLIProvider(self.config)
-        provider._preflight_complete = True
+        provider = self.codex_provider()
         observed = {}
 
         def execute(argv, **kwargs):
@@ -172,6 +182,7 @@ class AttachmentInputFidelityTests(unittest.TestCase):
                 mock.patch.object(codex_cli, "_bundled_model_catalog", return_value=catalog), \
                 mock.patch.object(codex_cli, "_run_bounded", side_effect=execute):
             self.ask(provider, files, context)
+        self.assertEqual(self.preflight.call_args.args[0], ["synthetic-codex"])
         self.assertIn(marker, observed["prompt"])
 
 

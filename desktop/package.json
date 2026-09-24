@@ -81,7 +81,7 @@
       {
         "from": "../src",
         "to": "harness/src",
-        "filter": ["**/*", "!**/__pycache__/**", "!**/*.pyc", "!**/*.pyo"]
+        "filter": ["**/*", "!**/__pycache__/**", "!**/*.pyc", "!**/*.pyo", "!**/*.egg-info/**"]
       },
       {
         "from": "../scripts/harness.py",

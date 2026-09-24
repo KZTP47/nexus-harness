@@ -24,7 +24,7 @@ reply", and the subject. Clicking it opens Nexus on that email. The card never t
 - Every panel page watches the feed from boot (`nexusEmail.watch()`), whatever tab is open. A burst
   of more than three becomes one summary card ("5 new emails").
 
-## Fixed in this pass
+## Fixed on 2026-09-23 (first pass)
 
 ### Email assistant
 | Severity | Problem | Fix |
@@ -67,58 +67,80 @@ reply", and the subject. Clicking it opens Nexus on that email. The card never t
 | Medium (UI) | Errors were invisible on the Swarm tab; one failed poll froze the board as "running"; a slow refresh redrew the old board over a newly opened saved board; a stalled queue when a chat card was closed mid-answer; unhandled queue errors. | All fixed with tests. |
 | Low | The same folder could be added twice in a different letter case on Windows. | Newly added duplicates are refused (existing boards still load). |
 
-## Open: needs an owner decision (the harness second-guesses the agents)
+## 2026-09-24: "Agents lead" policy (approved by the owner) and rounds 2-5
 
-These are policy, not typos, so they were not changed silently. Each one makes the harness overrule
-work the agents were asked to do. Recommended direction in brackets.
+The owner approved flipping the defaults: agents may read, write, create, delete and run in the
+projects they were given unless the user explicitly says "read-only", "don't touch X" or "only X", or
+sets a restriction in the UI. The rule now opens `AGENTS.md` ("Agents lead; Nexus only supports").
+Each change below was then reviewed again by an independent session with reproducers, over several
+rounds, until no high or medium finding remained.
 
-1. **File named without an edit verb becomes write-protected.** "The bug is in src/parser.py; please
-   fix it" rejects edits to `src/parser.py`. (Protect only on explicit "don't touch / read-only".)
-2. **Naming one file blocks every other file.** "Fix the failing test in tests/test_parser.py" rejects
-   the real fix in `src/parser.py`. (Named files add to what may be written; restrict only on "only".)
-3. **Ordinary goals are classified read-only and all changes are dropped:** "Can you make the app
-   faster?", "Why is login broken? Fix it.", "Show a spinner while loading". (Default to changes
-   allowed; read-only only on explicit wording.)
-4. **Garbage paths from the goal parser become grants and completion requirements** ("Rename the Save
-   button to Submit in index.html" requires a file called `Submit in index.html`).
-5. **Agents' own plans become mandatory**: a planned file the agent later leaves alone fails
-   verification. (Treat plans as hints.)
-6. **The words "test", "unit" or "integration" anywhere turn on test requirements** ("Add Stripe
-   integration" fails because the project has no tests).
-7. **Any pause rolls back every applied edit** (schema slip, one malformed reply, context budget),
-   and one extra JSON key or a missing optional tool argument throws away a whole reply after one
-   repair attempt. (Keep applied edits and resume; accept extra keys; default optional arguments.)
-8. **Progress guard stops agents that are working** after 14 rounds without a strict shrink of
-   `remaining`; the first-round failure of one agent ends a whole collaboration.
-9. **Completion vetoes**: docs-only work never completes (no test command → `unavailable`); only
-   Python and Node have verification containment; any behaviour requirement needs a full causal
-   receipt; "no change needed" always fails.
-10. **Limits**: 48 tool calls per epoch shared by all agents, 12 changes and 8 tool calls per reply,
-    `run_command` 60 s / 10 KB, 180 s verification timeout, 1,000-call lifetime cap on adaptive goals.
-11. Editing any setting of a provider profile (even the model), or a CLI auto-update / slow
-    `--version`, permanently pauses that agent's chats with only "Start fresh".
+### What no longer gets in the agents' way
+- **Wording is never a restriction.** Mentioned files are not protected; named files add to what may
+  be written; questions, "show/list/check", "without breaking X" and bug reports phrased as
+  prohibitions no longer make a run read-only. Plans, file names and wording are hints (`mandatory`
+  flag, `advisory_unmet`), never requirements.
+- **Completion.** Tests are required only when the user asks for them (one shared classifier,
+  `goal_verification.explicit_test_requests`). "No change needed" is a valid result. When no check can
+  run, agent agreement completes the goal as `agent_verified`; the UI says "Agents agreed it is done; no
+  automatic check was available" and never claims a machine check. A check that ran and failed still
+  blocks. Closeout judges are matched tolerantly, but only a recognised approve verdict approves.
+- **Applied work is kept.** Pauses, incomplete runs, schema slips, tool budgets and single failed
+  transactions never roll back other applied edits. Only an explicit user undo does.
+- **Lenient with agents.** Extra keys, omitted optional arguments and prose around JSON are accepted on
+  the received side (the sent schema stays strict-compatible); one bad change entry is refused on its
+  own; one agent's format slip or outage never stops the team.
+- **Generous machine limits.** `run_command` up to 60 minutes and 200 KB shown output; `write_file` 10M
+  characters; 500 files per proposal; 200 changes and 64 tool calls per reply; 24 participants (anyone
+  left out is named). Lease and provider-slot waits queue in order instead of failing.
+- **Settings changes don't freeze chats or goals.** A model, effort, flag or CLI version change continues
+  (route-identity v5 allow-list); only a real identity change (another program, bridge, host, account,
+  endpoint or profile) pauses with a reviewed reconnect.
+- **Default access.** New goals default to Full (`chosen_by: default`). Goals created before this
+  default keep Ask, with a one-time note offering Full: no silent privilege increase.
+- **Loops still stop.** No round cap was added. A run stops (keeping all work, resumable) only on a
+  genuine loop: 200 rounds with no new outcome, or project state returning to one it already left
+  twice; 200 identical tool results pause a goal.
 
-## Open: known, not fixed in this pass
+### Protections that still hold (and were tightened)
+- No writes outside the selected projects; `.git`/`.harness` in any spelling; junctions/links pointing
+  outside are refused or skipped; hard links are separated before rewriting.
+- Explicit user restrictions: absolute, relative, glob, list, dash, label and header forms of "don't
+  touch", every "only" wording (an unusable "only" stops and asks instead of widening), explicit
+  read-only, UI write roots.
+- A denied command is enforced by Nexus's own tools (normalised argv) and passed to Claude Code as exact
+  `--disallowedTools` rules; for CLIs that can't enforce it the UI says it is advisory.
+- A reply is never delivered twice; an uncertain web turn is never resent.
+- Git history in agent working copies is **off by default** (`NEXUS_AGENT_GIT_HISTORY=1` to opt in).
+  When on: isolated clone with no remote, all `GIT_*` stripped, hooks/fsmonitor/filters neutralised,
+  accepted baseline committed, ignored files like `.env` never deleted from the real project.
+  By design, an opted-in agent can see all history (including secrets that were committed then deleted)
+  and could add its own remote and push.
 
-- Email: IMAP sync runs inside the studio mutation lock and API syncs hold the connector lock for a
-  whole page, freezing editing and the UI during a check; first-connect Gmail/Outlook API accounts do
-  not see new mail until the whole inbox listing finishes; the email snapshot is unbounded (every body,
-  every 1–6 s); editing an old sender-specific preference makes it mailbox-wide.
-- Swarm: board saves hold one SQLite write transaction on the user-wide journal (other runs time out
-  with raw `database is locked`); board/registry reads are not retried on Windows sharing violations;
-  "Full project access" silently becomes read-only after the Codex strict-schema auto-repair;
-  whole-goal judge snapshots are never deleted; the advice second round sends each answer twice;
-  interrupted work after a crash has no Resume.
-- Tests that already fail on the untouched code (checked against a clean checkout with its own
-  source on the path):
-  - `test_every_built_button_is_pressed_by_a_check`: the swarm chat "Check status" button has no check.
-  - `test_the_board_of_agents`: `test_lone_agent_chat_disables_team_actions_but_keeps_direct_controls`,
-    `test_send_is_direct_and_explicit_collaboration_and_code_copy_remain_available`,
-    `test_browser_work_together_executes_both_real_composer_handlers` (source-text contracts that no
-    longer match app.js).
-  - `test_goal_repair_context...test_saved_timeout_can_be_verified_through_endpoint_and_stays_cleared_after_restart`.
-  - `test_release_installer...test_public_version_surfaces_cannot_drift`.
-  - `test_attachment_input_fidelity` (2 tests) read this machine's real Codex login ("auth_mode must be
-    chatgpt"), against the portability rule in AGENTS.md.
-  - `test_packaging_checkpoint_ui...test_distribution_audit` fails on this machine only because of a
-    local, untracked `.codex_tmp/` folder (dated 2026-09-14) that contains absolute paths.
+### Email assistant, rounds 2-5
+- Connecting any mailbox treats the existing inbox as history (browser and classic Outlook via a first
+  scan baseline plus the browser's `first_seen_at`; IMAP newest-first with INTERNALDATE and UID-based
+  "new"); mail that arrived while disconnected or while checks were off is not announced.
+- One message never blocks a mailbox (charset fallback, per-message failure records the user can
+  dismiss). UIDVALIDITY changes are resumable and deduplicated.
+- Senders: one quoted form; `ceo@corp <attacker@evil>` style headers are refused; per-sender learning
+  works for "Lastname, Firstname".
+- HTML: a browser-like reader checked against Chromium on a 190-case corpus
+  (`tests/fixtures/email_html_corpus.json`); text is hidden only on literal, unambiguous signals;
+  hidden text reaches the AI only as a labelled, untrusted block and never the page; parsing is linear
+  with a 2 MB cap and a 2 s budget. Class-based `<style>` hiding is a documented residual.
+- Notifications: deduplicated across reloads and tabs, settings applied to notices already in the feed,
+  a crashed or never-loaded pop-up is replaced, clicks are tied to the project that raised them.
+- Drafting UI: the text shown is exactly the text sent; unsaved edits are never overwritten.
+
+## Open: known, not fixed
+
+- A protection that names no path ("don't touch the CI workflow") protects nothing; name the folder
+  (`.github/workflows`).
+- Email: IMAP sync still runs inside the studio mutation lock and API syncs hold the connector lock for
+  a page; first-connect Gmail/Outlook API accounts list the whole inbox before new mail; the email
+  snapshot is unbounded.
+- Swarm: board saves hold one SQLite write transaction on the user-wide journal; board/registry reads
+  are not retried on Windows sharing violations; whole-goal judge snapshots are never deleted.
+- Mission control offers only "Cancel old goal and prepare a new one" for a changed provider setup; the
+  Reconnect button is in the chat team panel.

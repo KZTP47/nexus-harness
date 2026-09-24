@@ -34,7 +34,9 @@ EIGHT_PART_ASSIGNMENTS = {"test_swarm_work": 3, "test_the_board_of_agents": 4}
 # Keep the measured pre-toolbox deal stable. In run 34468734077 inserting these
 # modules into the sorted deck shifted existing owners and timed out part 4.
 # These short additions fit in part 5 without moving any existing module.
-EIGHT_PART_ADDITIONS = {"test_full_access_tool_runtime": 5, "test_harness_tools": 5}
+EIGHT_PART_ADDITIONS = {"test_full_access_tool_runtime": 5, "test_harness_tools": 5,
+                        "test_goal_messages": 6, "test_agents_lead_policy": 6,
+                        "test_agent_support_limits": 8, "test_user_restrictions": 6}
 
 
 def every_test_file() -> list[str]:

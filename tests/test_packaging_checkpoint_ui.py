@@ -11,6 +11,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 import zipfile
 from html.parser import HTMLParser
 from http import HTTPStatus
@@ -239,6 +240,131 @@ class PackagingTests(unittest.TestCase):
 
             result = audit_distribution(root)
             self.assertTrue(result["passed"], result["findings"])
+
+    @staticmethod
+    def _checkout_with_ignored_files(root: Path) -> Path:
+        package = root / "src" / "our_harness"
+        package.mkdir(parents=True)
+        (package / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
+        scratch = root / "scratch area" / "someone-elses-repo"
+        scratch.mkdir(parents=True)
+        (scratch / "install.sh").write_text('cd "/home/somebody/app"\n', encoding="utf-8")
+        (root / "scratch area" / ".gitignore").write_text("*\n", encoding="utf-8")
+        (root / "notes-ignored.md").write_text("See /opt/company/private\n", encoding="utf-8")
+        (root / ".gitignore").write_text("notes-ignored.md\n.env\n*.dump.json\n", encoding="utf-8")
+        subprocess.run(["git", "init", "-q", str(root)], check=True, capture_output=True)
+        return package
+
+    def test_distribution_audit_skips_ignored_scratch_outside_the_shipped_trees(self) -> None:
+        # A scratch clone a person keeps at the checkout root is not copied by
+        # any packager, so Git ignoring it takes it out of the audit. A new
+        # file nobody ignored may be committed next and stays audited.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "any checkout"
+            package = self._checkout_with_ignored_files(root)
+
+            result = audit_distribution(root)
+            self.assertTrue(result["passed"], result["findings"])
+
+            (package / "added.py").write_text('LOCATION = "/srv/somebody/data"\n', encoding="utf-8")
+            result = audit_distribution(root)
+            self.assertFalse(result["passed"])
+            self.assertEqual([item["path"] for item in result["findings"]], ["src/our_harness/added.py"])
+
+    def test_distribution_audit_still_scans_and_flags_ignored_files_that_would_ship(self) -> None:
+        # The zipapp and the desktop build copy ``src`` from the working tree,
+        # ignored files included, so ignoring a file there hides nothing.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "any checkout"
+            package = self._checkout_with_ignored_files(root)
+            (package / ".env").write_text("TOKEN=local-secret\n", encoding="utf-8")
+            (package / "state.dump.json").write_text('{"home": "/home/somebody/app"}\n', encoding="utf-8")
+
+            result = audit_distribution(root)
+
+            self.assertFalse(result["passed"])
+            self.assertEqual(sorted((item["path"], item["message"]) for item in result["findings"]), [
+                ("src/our_harness/.env", "ignored file would ship"),
+                ("src/our_harness/state.dump.json", "ignored file would ship"),
+                ("src/our_harness/state.dump.json", "machine-specific absolute path"),
+            ])
+
+    def test_distribution_audit_reads_the_desktop_build_manifest_for_what_ships(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "any checkout"
+            self._checkout_with_ignored_files(root)
+            desktop = root / "desktop"
+            (desktop / "pages").mkdir(parents=True)
+            (root / "tools").mkdir()
+            (root / "tools" / "launch.py").write_text("VALUE = 1\n", encoding="utf-8")
+            (desktop / "package.json").write_text(json.dumps({"build": {
+                "files": ["main.js", "pages/**", "!**/*.test.js"],
+                "extraResources": [{"from": "../src", "to": "harness/src"},
+                                   {"from": "../tools/launch.py", "to": "launch.py"}],
+            }}), encoding="utf-8")
+            for name in ("main.js", "pages/local.html", "main.test.js", "local-notes.md"):
+                (desktop / name).write_text("// kept locally\n", encoding="utf-8")
+            (desktop / ".gitignore").write_text(
+                "main.js\npages/local.html\nmain.test.js\nlocal-notes.md\n", encoding="utf-8")
+            (root / "tools" / ".gitignore").write_text("launch.py\n", encoding="utf-8")
+
+            result = audit_distribution(root)
+
+            self.assertEqual(sorted(item["path"] for item in result["findings"]), [
+                "desktop/main.js", "desktop/pages/local.html", "tools/launch.py",
+            ])
+            self.assertTrue(all(item["message"] == "ignored file would ship" for item in result["findings"]))
+
+    def test_distribution_audit_follows_each_packagers_filter_for_ignored_egg_info(self) -> None:
+        # ``pip install -e`` leaves per-machine, ignored metadata under src.
+        # The zipapp always leaves it out; the desktop build does only when its
+        # ``../src`` filter says so, and the audit must agree with each.
+        for rules, flagged in (
+            (["**/*", "!**/__pycache__/**", "!**/*.pyc", "!**/*.pyo", "!**/*.egg-info/**"], []),
+            (["**/*", "!**/__pycache__/**"], ["src/some_cli.egg-info/PKG-INFO"]),
+        ):
+            with self.subTest(rules=rules), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary) / "any checkout"
+                self._checkout_with_ignored_files(root)
+                with (root / ".gitignore").open("a", encoding="utf-8") as ignore:
+                    ignore.write("*.egg-info/\n")
+                metadata = root / "src" / "some_cli.egg-info"
+                metadata.mkdir()
+                (metadata / "PKG-INFO").write_text("Version: 0.0.1\n", encoding="utf-8")
+                (root / "desktop").mkdir()
+                (root / "desktop" / "package.json").write_text(json.dumps({"build": {
+                    "files": ["main.js"],
+                    "extraResources": [{"from": "../src", "to": "harness/src", "filter": rules}],
+                }}), encoding="utf-8")
+
+                result = audit_distribution(root)
+
+                self.assertEqual([item["path"] for item in result["findings"]], flagged)
+                self.assertTrue(all(item["message"] == "ignored file would ship"
+                                    for item in result["findings"]))
+
+    def test_repository_desktop_build_leaves_out_per_machine_python_metadata(self) -> None:
+        package = json.loads((ROOT / "desktop" / "package.json").read_text(encoding="utf-8"))
+        source = next(item for item in package["build"]["extraResources"] if item["from"] == "../src")
+        self.assertIn("!**/*.egg-info/**", source["filter"])
+
+    def test_distribution_audit_without_git_scans_every_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package = root / "src" / "our_harness"
+            package.mkdir(parents=True)
+            (package / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
+            (package / ".gitignore").write_text("local.md\n", encoding="utf-8")
+            (package / "local.md").write_text("See /opt/company/private\n", encoding="utf-8")
+            scratch = root / "scratch"
+            scratch.mkdir()
+            (scratch / ".gitignore").write_text("*\n", encoding="utf-8")
+            (scratch / "install.sh").write_text('cd "/home/somebody/app"\n', encoding="utf-8")
+            with mock.patch("our_harness.audit._run_git", side_effect=OSError("no git")):
+                result = audit_distribution(root)
+            self.assertFalse(result["passed"])
+            self.assertEqual(sorted(item["path"] for item in result["findings"]),
+                             ["scratch/install.sh", "src/our_harness/local.md"])
 
     def test_installed_resource_audit_scans_package(self) -> None:
         result = audit_installed_distribution()
