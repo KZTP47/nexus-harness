@@ -577,23 +577,25 @@ async function operate(value,request) {
     try{first=await operate(value,{...request,_singleTab:true,_scanDeadline:scanDeadline});}
     catch(error){
       // A tab that cannot load must not strand the other one for the whole scan.
+      // A tab left unread means more remains: a first-connect history baseline must
+      // not end before it, or that tab's whole history would look newly arrived.
       const held=JSON.parse(request.cursor||'{}');
       if(!held.split_inbox||!await recoverableTab(error))throw error;
       const fallback={...held,next_tab:held.next_tab==='Other'?'Focused':'Other'};
       const only=await operate(value,{...request,_singleTab:true,_scanDeadline:scanDeadline,cursor:JSON.stringify(fallback)});
       // Its own cursor already names the failed tab, which therefore leads the next scan.
-      return {...only,warnings:[...only.warnings,'The '+(fallback.next_tab==='Other'?'Focused':'Other')+' inbox tab did not finish loading, so the other tab was checked instead. '+NEXT_SCAN]};
+      return {...only,has_more:true,warnings:[...only.warnings,'The '+(fallback.next_tab==='Other'?'Focused':'Other')+' inbox tab did not finish loading, so the other tab was checked instead. '+NEXT_SCAN]};
     }
     const firstCursor=JSON.parse(first.cursor||'{}');
     if(!firstCursor.split_inbox)return first;
-    if(Date.now()>=scanDeadline-RESERVE_MS)return {...first,warnings:[...first.warnings,'The scan work budget was reached. The other inbox tab will be checked on the next scan.']};
+    if(Date.now()>=scanDeadline-RESERVE_MS)return {...first,has_more:true,warnings:[...first.warnings,'The scan work budget was reached. The other inbox tab will be checked on the next scan.']};
     let second;
     try{second=await operate(value,{...request,_singleTab:true,_secondPass:true,_scanDeadline:scanDeadline,cursor:first.cursor});}
     catch(error){
       if(!await recoverableTab(error))throw error;
       // The cursor already names the tab that just failed, so it leads the next scan
       // with the full work budget instead of being demoted to second place again.
-      return {...first,warnings:[...first.warnings,'The '+(firstCursor.next_tab==='Other'?'Other':'Focused')+' inbox tab did not finish loading. Imported messages were preserved; that tab is checked first on the next scan.']};
+      return {...first,has_more:true,warnings:[...first.warnings,'The '+(firstCursor.next_tab==='Other'?'Other':'Focused')+' inbox tab did not finish loading. Imported messages were preserved; that tab is checked first on the next scan.']};
     }
     return {messages:[...first.messages,...second.messages].filter((message,index,all)=>all.findIndex(other=>other.source_id===message.source_id)===index),
       failed_messages:[...first.failed_messages||[],...second.failed_messages||[]].filter((failure,index,all)=>all.findIndex(other=>other.source_id===failure.source_id)===index),

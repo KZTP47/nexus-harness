@@ -1794,6 +1794,34 @@ test('a failing inbox tab leads the next scan instead of being demoted again',as
     assert.ok(result.warnings.some(w=>/Other inbox tab did not finish loading/.test(w)&&/checked first on the next scan/.test(w)),
       'the warning must say the failed tab is checked first next time');
     assert.equal(result.messages.length,1,'the working tab must still import its mail');
+    assert.equal(result.has_more,true,'an unread tab means more remains, so a first-connect baseline cannot end before it');
+    // Next scan: the failing tab leads, fails again, and the other tab is checked instead.
+    const fallback=await operate(value,{command:'sync',connection:{email:'person@example.test'},cursor:result.cursor});
+    assert.ok(fallback.warnings.some(w=>/was checked instead/.test(w)),JSON.stringify(fallback.warnings));
+    assert.equal(fallback.has_more,true,'the tab that failed is still unread');
+  } finally {await browser.close();}
+});
+
+test('a scan whose budget ends before the second inbox tab says more remains',async()=>{
+  const installed=findInstalledBrowser();
+  assert.ok(installed,'Chrome or Edge required for browser mail fixture test');
+  const browser=await chromium.launch({executablePath:installed.executable,headless:true});
+  try {
+    const page=await browser.newPage();
+    const pane=id=>`<div data-convid="${id}"><h2 data-testid="conversation-subject">Thread</h2><article data-message-id="m-${id}"><div data-testid="SenderPersona"><span title="${id}@example.test">s</span></div><div role="document">Body ${id}</div></article></div>`;
+    await page.route('**/*',route=>route.fulfill({contentType:'text/html',body:
+      '<button id="mectrl_main_trigger" aria-label="person@example.test">Account</button><main role="main">'
+      +'<div role="tablist"><button role="tab" aria-selected="true">Focused</button><button role="tab" aria-selected="false">Other</button></div>'
+      +`<div role="option" data-convid="thread1" onclick='document.querySelector("#pane").innerHTML=${JSON.stringify(pane('thread1')).replaceAll("'",'&#39;')}'>Thread</div>`
+      +'<section id="pane"></section></main>'}));
+    await page.goto('https://outlook.office.com/mail/inbox');
+    await page.bringToFront();
+    await page.locator('[data-convid="thread1"]').click({trial:true,timeout:15000});
+    // The request started long ago: after the first tab the reserve is already reached.
+    const result=await operate({page,provider:'browser_outlook',lastInboxRefresh:Date.now()},
+      {command:'sync',connection:{email:'person@example.test'},_startedAt:Date.now()-96000});
+    assert.ok(result.warnings.some(w=>/scan work budget was reached/.test(w)),JSON.stringify(result.warnings));
+    assert.equal(result.has_more,true);
   } finally {await browser.close();}
 });
 test('the inbox scan scrolls the virtualised list and reads conversations below the first viewport',async()=>{
