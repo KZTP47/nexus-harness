@@ -22,7 +22,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import files
 from pathlib import Path
-from typing import Any, TYPE_CHECKING
+from typing import Any, Iterator, TYPE_CHECKING
 
 from . import bundle
 from . import cancellation
@@ -428,6 +428,13 @@ class HarnessHTTPServer(ThreadingHTTPServer):
         # Serializes project switching with the short admission window before
         # a command owns its durable run/provider lease.
         self.project_admission_lock = threading.Lock()
+        # Chat turns in flight on the current project. A turn pins the project
+        # (it cannot be moved away) without holding admission for the whole
+        # provider reply, so board edits and other commands are not queued
+        # behind a slow answer. Taken under admission, released under its own
+        # lock; read by the project move while it holds admission.
+        self._project_pins = 0
+        self._project_pins_lock = threading.Lock()
         # Marks the exact cross-process request+chat lease held by this thread.
         # A compatibility rewrite of authenticated pending admission metadata
         # is never allowed from a helper call outside that lease.
@@ -3186,6 +3193,20 @@ class HarnessHTTPServer(ThreadingHTTPServer):
         ]
         return standing
 
+    @contextmanager
+    def pinned_project(self) -> Iterator[LoadedConfig]:
+        """Hold the current project in place for one provider turn; yield its config."""
+
+        with self.project_admission_lock:
+            config = self.config
+            with self._project_pins_lock:
+                self._project_pins += 1
+        try:
+            yield config
+        finally:
+            with self._project_pins_lock:
+                self._project_pins -= 1
+
     def move_to(self, where: str) -> dict[str, Any]:
         """Show a different project, without stopping and starting again.
 
@@ -3212,6 +3233,14 @@ class HarnessHTTPServer(ThreadingHTTPServer):
             raise HarnessError(
                 "A swarm board or chat command is being accepted, or another project "
                 "command is contacting a provider. Wait for it before moving projects."
+            )
+        with self._project_pins_lock:
+            pinned = self._project_pins
+        if pinned:
+            self.project_admission_lock.release()
+            raise HarnessError(
+                "A chat is contacting a provider for this project. Wait for its "
+                "answer, or stop it, before moving projects."
             )
         if self.pipeline_running:
             self.project_admission_lock.release()
@@ -6867,10 +6896,11 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     str(body.get("request_id") or ""),
                 ))
             elif self.path == "/api/chat/say":
-                # The conversation has its own provider lock; admission also
-                # pins the current project until this provider turn finishes.
-                # This endpoint cannot run project commands or mutate project
-                # files, so copied-project execution authority is irrelevant.
+                # The conversation has its own provider lock; the turn pins the
+                # current project until it finishes, without holding admission
+                # for the whole reply. This endpoint cannot run project commands
+                # or mutate project files, so copied-project execution authority
+                # is irrelevant.
                 who = str(body.get("who") or "")
                 chat_key = f"talk:{who}"
                 # Claim the individual turn first so a duplicate request is
@@ -6878,8 +6908,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 # admission and silently becoming a second provider turn.
                 cancel_token = self.server.chat_cancellations.begin(chat_key)
                 try:
-                    with self.server.project_admission_lock:
-                        config = self.server.config
+                    with self.server.pinned_project() as config:
                         with cancellation.use(cancel_token):
                             answer = chat_lab.say(
                                 config, who, str(body.get("text") or ""),
@@ -6897,8 +6926,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 chat_key = "talk:everyone"
                 cancel_token = self.server.chat_cancellations.begin(chat_key)
                 try:
-                    with self.server.project_admission_lock:
-                        config = self.server.config
+                    with self.server.pinned_project() as config:
                         with cancellation.use(cancel_token):
                             answers = chat_lab.ask_everyone(
                                 config, str(body.get("text") or "")
