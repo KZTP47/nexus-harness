@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -94,6 +95,53 @@ class EmailMemoryTests(unittest.TestCase):
         for value in ('', 'Grandma', 'a@example.test,b@example.test', 'Friends: a@example.test;', 'a@example.test\n'):
             self.assertEqual(canonical_recipient(value), '')
         self.assertNotEqual(canonical_recipient('a+family@example.test'), canonical_recipient('a@example.test'))
+
+    def test_a_decoded_display_name_with_a_comma_is_still_one_recipient(self):
+        for value in ('Müller, Hans <H@x.de>', '"Müller, Hans" <h@x.de>', 'Smith, Dr. Jane <h@x.de>'):
+            self.assertEqual(canonical_recipient(value), 'h@x.de', value)
+        for value in ('boss@corp.test, <attacker@evil.test>', 'alice@corp.example, Bob <bob@evil.example>',
+                      'ceo@corp.example <attacker@evil.example>', 'Team: a, b <x@y.test>', 'a, b <x@y.test>, <z@y.test>'):
+            self.assertEqual(canonical_recipient(value), '', value)
+
+    def test_preferences_edited_by_an_older_version_recover_their_origin_once(self):
+        import sqlite3
+        from contextlib import closing
+        learned = self.memory.learn('a', 'draft1', 2, 'Sign as Dr. A', evidence={'message_id': 'm1'})
+        own = self.memory.learn('a', 'manual', 1, 'Be brief', authority='user')
+        edited = self.memory.save_preference('a', learned['id'], 'Sign as Dr. Ann')
+        self.memory.save_preference('a', own['id'], 'Be very brief')
+        # What an older version wrote: authority 'user' and no learned_authority.
+        with closing(sqlite3.connect(self.memory.path)) as db, db:
+            for account, identity, revision, raw in db.execute('SELECT account,id,revision,record FROM preferences').fetchall():
+                record = json.loads(raw); record.pop('learned_authority', None)
+                db.execute('UPDATE preferences SET record=? WHERE account=? AND id=? AND revision=?', (json.dumps(record), account, identity, revision))
+            db.execute("DELETE FROM metadata WHERE key='learned-authority/v1'")
+            # A preference whose first revision is gone falls back to its evidence.
+            orphan = {**edited, 'id': 'orphan', 'revision': 2, 'authority': 'user', 'evidence': {'message_id': 'm9'}}
+            orphan.pop('learned_authority', None)
+            db.execute('INSERT INTO preferences VALUES(?,?,?,?,?,?,?)', ('a', 'orphan', 2, orphan['text'], orphan['scope'], 'active', json.dumps(orphan)))
+        reopened = EmailMemory(self.root)
+        active = {p['id']: p for p in reopened.preferences('a')}
+        self.assertEqual(active[learned['id']]['learned_authority'], 'approved_edit')
+        self.assertEqual(active[learned['id']]['authority'], 'user', 'the edited wording still leads')
+        self.assertEqual(active[own['id']]['learned_authority'], 'user')
+        self.assertEqual(active['orphan']['learned_authority'], 'approved_edit')
+        # Idempotent: a later start does not rewrite what the user changed since.
+        with closing(sqlite3.connect(self.memory.path)) as db, db:
+            row = db.execute("SELECT revision,record FROM preferences WHERE account='a' AND id=? AND status='active'", (own['id'],)).fetchone()
+            record = json.loads(row[1]); record['learned_authority'] = 'approved_edit'
+            db.execute("UPDATE preferences SET record=? WHERE account='a' AND id=? AND revision=?", (json.dumps(record), own['id'], row[0]))
+        self.assertEqual({p['id']: p for p in EmailMemory(self.root).preferences('a')}[own['id']]['learned_authority'], 'approved_edit')
+
+    def test_an_edited_preference_keeps_the_scope_it_was_learned_for(self):
+        learned = self.memory.learn('a', 'draft1', 2, 'Sign as Dr. A')
+        self.assertEqual(learned['authority'], 'approved_edit')
+        edited = self.memory.save_preference('a', learned['id'], 'Sign as Dr. Ann')
+        self.assertEqual((edited['authority'], edited['learned_authority'], edited['scope']), ('user', 'approved_edit', learned['scope']))
+        again = EmailMemory(self.root).save_preference('a', learned['id'], 'Sign as Ann')
+        self.assertEqual(again['learned_authority'], 'approved_edit', 'a second edit does not forget the origin')
+        own = self.memory.learn('a', 'manual', 1, 'Be brief', authority='user')
+        self.assertEqual(self.memory.save_preference('a', own['id'], 'Be very brief')['learned_authority'], 'user')
 
     def test_automatic_category_supersession_edit_and_restart_preserve_scope(self):
         def learn(draft, recipient, text, fingerprint='v1'):

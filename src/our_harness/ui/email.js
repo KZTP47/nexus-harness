@@ -181,16 +181,25 @@
         if (state.account !== account || draft?.id !== identity || !['review', 'approved'].includes(draft.status)) throw new Error('This reply is no longer available for editing or sending. Your text is preserved.');
         // Metadata-only changes and an already-saved copy can be reconciled.
         // A genuinely different saved edit must not be silently overwritten.
-        if (state.editRevision !== draft.revision && draft.edited !== base && draft.edited !== text) throw new Error('A different version was saved while you were editing. Your text is preserved. Review the saved version before replacing it.');
+        if (state.editRevision !== draft.revision && draft.edited !== base && draft.edited !== text) throw new Error(wasDirty ? 'A different version was saved while you were editing. Your text is preserved. Review the saved version before replacing it.' : 'This reply was updated elsewhere. The newest saved version is shown now; review it and try again.');
         state.editRevision = draft.revision; state.editBase = draft.edited;
         const result = await post('prepare_draft', {account_id: account, draft_id: identity, revision: draft.revision, intent, text: intent === 'send' && sendVersion === 'original' ? draft.original : text});
         const prepared = result.draft || draft;
         state.editRevision = prepared.revision; state.editBase = prepared.edited;
+        // A refresh already in flight may predate prepare_draft; discard it and read again.
+        state.mutationRevision += 1;
+        if (state.refreshPromise) await state.refreshPromise;
         await refresh();
         requestErrors.delete('approve:' + identity); requestErrors.delete('revise:' + identity);
         return true;
       } catch (error) { requestErrors.set(kind + ':' + identity, error.message); note(error.message, true); return false; }
-      finally { if (!wasDirty && reply.value === text && currentDraft()?.edited === text) state.dirty = false; activeRequest = null; state.busy = false; controls(); }
+      finally {
+        // Without edits of their own the user sees the newest saved text, not a lock-out until Revert.
+        const restore = !wasDirty && reply.value === text && state.dirty;
+        if (restore) state.dirty = false;
+        activeRequest = null; state.busy = false;
+        if (restore && currentDraft()?.edited !== text) render(); else controls();
+      }
     }
     function controls() {
       root.querySelectorAll('button').forEach(button => { button.disabled = button.id !== 'emailRefresh' && !state.loaded; });
@@ -202,7 +211,7 @@
       const revising = (!!state.pendingRevision && state.pendingRevision.id === state.draft) || running('revise');
       for (const id of ['emailSave', 'emailApprove', 'emailRevise']) by(id).disabled = state.busy || !editable || revising;
       by('emailRevisionRequest').disabled = state.busy || !editable || revising;
-      by('emailDiscard').disabled = state.busy || revising || !['queued', 'review', 'error', 'approved'].includes(draft?.status); by('emailRevert').disabled = state.busy || revising || !state.dirty; by('emailReply').disabled = state.busy || !editable || revising; by('emailRetry').hidden = draft?.status !== 'error'; by('emailResume').hidden = draft?.status !== 'approved'; by('emailDownload').hidden = draft?.status !== 'exported'; by('emailRetryLearning').hidden = !draft?.learning_error;
+      by('emailDiscard').disabled = state.busy || revising || !['queued', 'review', 'error', 'approved', 'delivery_unknown'].includes(draft?.status); by('emailRevert').disabled = state.busy || revising || !state.dirty; by('emailReply').disabled = state.busy || !editable || revising; by('emailRetry').hidden = draft?.status !== 'error'; by('emailResume').hidden = draft?.status !== 'approved'; by('emailDownload').hidden = draft?.status !== 'exported'; by('emailRetryLearning').hidden = !draft?.learning_error;
       by('emailGenerate').disabled = state.busy || !state.message || !state.account || state.dirty;
       by('emailGenerate').disabled ||= running('draft') || ['queued', 'generating'].includes(draft?.status);
       by('emailApprove').disabled = state.busy || revising || running('approve') || (!editable && draft?.status !== 'approved');
@@ -540,13 +549,28 @@
     const composeSubject = field(compose, 'emailComposeSubject', 'Subject'); composeSubject.readOnly = true;
     const composeVersion = select(compose, 'emailComposeVersion', 'Version to send');
     for (const [value, title] of [['original', 'Original AI draft'], ['edited', 'Your reply']]) { const option = el('option', title); option.value = value; composeVersion.append(option); }
-    composeVersion.addEventListener('change', () => { sendVersion = composeVersion.value; composeBody.value = sendVersion === 'original' ? currentDraft().original : reply.value; showSendVersion(); });
+    // Edits made in this window to the original AI draft are kept per draft and
+    // original text (not revision: Save edits bumps it but keeps the original), so
+    // Escape, Cancel, switching versions or saving Your reply never loses them.
+    const originalEdits = new Map();
+    const textHash = text => { let hash = 0x811c9dc5; for (const char of String(text || '')) { hash ^= char.codePointAt(0); hash = Math.imul(hash, 0x01000193) >>> 0; } return hash.toString(16) + ':' + String(text || '').length; };
+    const originalKey = draft => JSON.stringify([state.account, draft.id, textHash(draft.original)]);
+    // The text a resumed (already approved) reply really sends is the saved one.
+    const composeText = (draft, resume) => resume ? draft.edited : sendVersion === 'original' ? (originalEdits.get(originalKey(draft)) ?? draft.original) : reply.value;
+    composeVersion.addEventListener('change', () => { sendVersion = composeVersion.value; composeBody.value = composeText(currentDraft(), false); showSendVersion(); });
     const composeBody = field(compose, 'emailComposeBody', 'Message', 'textarea'); composeBody.rows = 14;
     compose.append(el('p', 'From, To and Subject belong to the original conversation. Review the message before sending.', 'field-help'));
     let composeBinding = null, composeSending = false;
     composeBody.addEventListener('input', () => {
-      if (!composeSending && composeBinding?.id === state.draft && composeBinding.account === state.account) {
-        reply.value = composeBody.value; state.dirty = true; sendVersion = 'edited'; composeVersion.value = 'edited'; showSendVersion(); showDiff();
+      // Editing "Your reply" here keeps it in step with the page. Editing the
+      // original AI draft here changes only what this window sends, never the
+      // unsaved "Your reply" text behind it.
+      if (composeSending || composeBinding?.resume || composeBinding?.id !== state.draft || composeBinding.account !== state.account) return;
+      if (sendVersion === 'edited') { reply.value = composeBody.value; state.dirty = true; showDiff(); }
+      else {
+        const draft = currentDraft(); if (!draft) return;
+        originalEdits.set(originalKey(draft), composeBody.value);
+        while (originalEdits.size > 20) originalEdits.delete(originalEdits.keys().next().value);
       }
     });
     const composeError = el('p'); composeError.setAttribute('role', 'alert'); compose.append(composeError);
@@ -557,11 +581,13 @@
         composeError.textContent = 'This draft changed. Cancel and reopen it to review the latest version.'; return;
       }
       if (!composeBody.value.trim()) { composeError.textContent = 'Enter a message before sending.'; return; }
-      if (!composeBinding.resume) { reply.value = composeBody.value; state.dirty = true; }
+      // Only the edited version mirrors into Your reply; sending the original AI
+      // draft must not replace unsaved edits if the send fails or is cancelled.
+      if (!composeBinding.resume && sendVersion === 'edited') { reply.value = composeBody.value; state.dirty = true; }
       composeSending = true; composeBody.disabled = true; composeVersion.disabled = true; controls();
-      const result = composeBinding.resume ? await act('resume_draft', {account_id: state.account, draft_id: draft.id}) : await draftAction('approve_draft');
+      const result = composeBinding.resume ? await act('resume_draft', {account_id: state.account, draft_id: draft.id}) : await draftAction('approve_draft', composeBody.value);
       composeSending = false; composeBody.disabled = false; composeVersion.disabled = !!composeBinding?.resume;
-      if (result) compose.close();
+      if (result) { originalEdits.delete(originalKey(draft)); compose.close(); }
       else composeError.textContent = by('emailNotice').textContent;
       controls();
     });
@@ -580,7 +606,7 @@
       composeSubject.value = /^re:/i.test(message.subject || '') ? message.subject : 'Re: ' + (message.subject || '');
       if (composeBinding.resume) sendVersion = 'edited';
       composeVersion.value = sendVersion; composeVersion.disabled = composeBinding.resume; composeBody.readOnly = composeBinding.resume;
-      composeBody.value = sendVersion === 'original' ? draft.original : reply.value; composeError.textContent = '';
+      composeBody.value = composeText(draft, composeBinding.resume); composeError.textContent = '';
       showSendVersion();
       by('emailComposeSend').textContent = ['classic_outlook', 'import'].includes(account?.kind) ? 'Export reply' : 'Send';
       compose.showModal(); composeBody.focus();
@@ -745,7 +771,7 @@
       }
     }
 
-    async function draftAction(action) { const d = currentDraft(); if (!d) return; const text = reply.value; const browserSend = action === 'approve_draft' && ['browser_outlook', 'browser_gmail'].includes(currentAccount()?.kind); return await act(action, {account_id: state.account, draft_id: d.id, revision: state.editRevision ?? d.revision, text, learn: learn.checked, ...(browserSend ? {approval_contract: 'browser-send/v1'} : {})}, () => { state.dirty = false; }); }
+    async function draftAction(action, approvedText) { const d = currentDraft(); if (!d) return; const text = approvedText ?? reply.value; const browserSend = action === 'approve_draft' && ['browser_outlook', 'browser_gmail'].includes(currentAccount()?.kind); return await act(action, {account_id: state.account, draft_id: d.id, revision: state.editRevision ?? d.revision, text, learn: learn.checked, ...(browserSend ? {approval_contract: 'browser-send/v1'} : {})}, () => { state.dirty = false; }); }
     function render() {
       const s = state.snapshot;
       renderConnections();
@@ -785,15 +811,28 @@
       const failures = (s.failed_imports || []).filter(m => m.account_id === state.account && m.account_fingerprint === currentAccount()?.fingerprint);
       const counted = query ? 'Showing ' + messages.length + ' of ' + held.length + ' imported message' + (held.length === 1 ? '' : 's')
         : held.length + ' imported message' + (held.length === 1 ? '' : 's');
-      by('emailQueue').append(el('p', counted + (failures.length ? '; ' + failures.length + ' conversations need another check.' : '.')));
-      if (failures.length) { const details = el('details'); details.append(el('summary', 'Show import issues (' + failures.length + ')')); for (const failure of failures) details.append(el('p', 'Message could not be imported: ' + failure.error + ' Nexus will retry on a later inbox scan.')); by('emailQueue').append(details); }
+      by('emailQueue').append(el('p', counted + (failures.length ? '; ' + failures.length + (failures.length === 1 ? ' message' : ' messages') + ' could not be imported.' : '.')));
+      if (failures.length) {
+        const details = el('details'); details.open = state.importIssuesOpen; details.addEventListener('toggle', () => { state.importIssuesOpen = details.open; });
+        details.append(el('summary', 'Show import issues (' + failures.length + ')'));
+        for (const failure of failures) {
+          // Mailbox checks move past a message they could not import; only a browser
+          // row that changes is read again. The note says so, and can be cleared.
+          const line = el('p', 'Message could not be imported: ' + failure.error + ' It is still in your mailbox; open it there to reply. This note clears itself if a later check imports it.');
+          const account = state.account;
+          const dismiss = button(line, '', 'Dismiss', () => act('dismiss_failed_import', {account_id: account, failure_id: failure.id}, () => ({notice: 'Import note dismissed. The email itself was not changed.'})));
+          dismiss.dataset.work = '1'; dismiss.className = 'email-inline-action'; dismiss.title = 'Remove this note. Nothing in your mailbox changes.';
+          details.append(line);
+        }
+        by('emailQueue').append(details);
+      }
       if (state.message && !held.some(message => message.id === state.message)) { state.message = ''; state.draft = ''; state.dirty = false; state.editRevision = null; state.pendingRevision = null; }
       // A draft the assistant starts after the email was opened must still reach the open email.
       if (state.message && !state.dirty && !currentDraft()) { const newest = (s.drafts || []).filter(d => d.message_id === state.message && d.account_id === state.account).reverse(); const adopted = newest.find(d => !['discarded', 'sent', 'exported'].includes(d.status)) || newest[0]; if (adopted) state.draft = adopted.id; }
       if (!held.length) by('emailQueue').append(el('p', 'No messages yet. Import an email or check your connected inbox.'));
       else if (!messages.length) by('emailQueue').append(el('p', 'No messages match your search. Clear the search box to see them all.'));
       const scroller = el('div', undefined, 'email-queue-scroll'); if (messages.length) by('emailQueue').append(scroller);
-      const focusMessage = id => { for (const node of by('emailQueue').querySelectorAll('.email-message')) if (node.dataset.messageId === id) return node.focus(); };
+      const focusMessage = id => { for (const node of by('emailQueue').querySelectorAll('.email-message')) if (node.dataset.messageId === id) return node.focus({preventScroll: true}); };
       for (const m of messages) { const drafts = (s.drafts || []).filter(d => d.message_id === m.id && d.account_id === state.account); const newest = [...drafts].reverse(); const d = newest.find(d => !['discarded', 'sent', 'exported'].includes(d.status)) || newest[0]; const b = button(scroller, '', (m.subject || '(No subject)') + '\n' + m.sender + (d ? '\n' + d.status : ''), () => { if (state.busy) return note('Wait for the current action to finish.', true); if (state.dirty) return note('Save or discard your edits before opening another email.', true); state.message = m.id; state.draft = d?.id || ''; render(); focusMessage(m.id); }); b.className = 'email-message'; b.dataset.messageId = m.id; b.title = 'Open this message and the reply drafted for it.'; b.setAttribute('aria-pressed', String(state.message === m.id)); }
       scroller.scrollTop = keptScroll;
       if (focusedMessage) focusMessage(focusedMessage);
@@ -827,7 +866,10 @@
       const message = (state.snapshot.messages || []).find(m => m.id === target.message_id && (!target.account_id || m.account_id === target.account_id));
       if (!message) { note('That email is no longer in this mailbox.', true); return false; }
       if (state.message === message.id) { render(); return true; }
-      if (state.busy || state.dirty) { note('A new email from ' + (message.sender || 'a sender') + ' is waiting. Save or discard your edits to open it.'); return false; }
+      const waiting = state.snapshot.notifications?.show_details === false ? 'A new email is waiting.' : 'A new email from ' + (message.sender || 'a sender') + ' is waiting.';
+      if (compose.open) { note(waiting + ' Finish or cancel the reply you are reviewing to open it.'); return false; }
+      if (state.busy || state.dirty) { note(waiting + ' Save or discard your edits to open it.'); return false; }
+      if (state.account !== message.account_id && (state.newAccount || state.registrationDirty.size)) { note(waiting + ' Save or cancel the mailbox setup you are editing to open it.'); return false; }
       if (state.account !== message.account_id) { state.newAccount = false; state.account = message.account_id; fillAccount(); }
       const drafts = (state.snapshot.drafts || []).filter(d => d.message_id === message.id && d.account_id === message.account_id).reverse();
       state.message = message.id; state.draft = (drafts.find(d => !['discarded', 'sent', 'exported'].includes(d.status)) || drafts[0])?.id || '';
@@ -851,8 +893,14 @@
     const newest = notices[notices.length - 1]; const accounts = new Set(notices.map(n => n.account));
     return [noticeCard({...newest, id: 'summary-' + newest.id, kind: 'summary', count: notices.length, account: accounts.size === 1 ? newest.account : ''})];
   }
+  const NOTICE_CURSOR_KEY = 'nexus-mail-notice-cursor';
   function watchNotifications(api, show, options = {}) {
     const every = options.every || 4000; let boot = ''; let cursor = null; let failures = 0; let timer = null; let stopped = false;
+    // The cursor survives a reload of this tab, so the last two minutes are not
+    // replayed as new; a restarted server has a new boot mark and resets it.
+    const storage = options.storage === undefined ? (() => { try { return host.sessionStorage; } catch (_) { return null; } })() : options.storage;
+    try { const saved = JSON.parse(storage?.getItem(NOTICE_CURSOR_KEY) || 'null'); if (saved && typeof saved.boot === 'string' && saved.boot && Number.isInteger(saved.seq) && saved.seq >= 0) { boot = saved.boot; cursor = saved.seq; } } catch (_) { /* no saved cursor */ }
+    const remember = () => { try { storage?.setItem(NOTICE_CURSOR_KEY, JSON.stringify({boot, seq: cursor})); } catch (_) { /* private mode or blocked storage */ } };
     async function tick() {
       timer = null; let feed = null;
       try { feed = await api('/api/email/notifications' + (cursor === null ? '' : '?after=' + cursor)); failures = 0; } catch (_) { failures += 1; }
@@ -863,6 +911,9 @@
         const fresh = feed.items.filter(item => cursor === null ? Number(item.age_seconds) <= replay : Number(item.seq) > cursor);
         boot = String(feed.boot || ''); cursor = Math.max(cursor || 0, Number(feed.seq) || 0);
         for (const card of cardsFor(fresh)) { try { await show(card); } catch (_) { /* one card must not stop the rest */ } }
+        // Saved only once every card went somewhere (pop-up or page): a reload while
+        // the pop-up still decides must offer those cards again, not skip them.
+        if (!stopped) remember();
       }
       if (!stopped) timer = host.setTimeout(tick, every * Math.min(8, 2 ** failures));
     }
@@ -871,6 +922,7 @@
   }
   function showInPage(doc, card, onOpen) {
     let stack = doc.getElementById('nexusMailToasts');
+    if (stack && [...stack.children].some(node => node.dataset.id === card.id)) return;
     if (!stack) { stack = doc.createElement('div'); stack.id = 'nexusMailToasts'; stack.className = 'nexus-mail-toasts'; stack.setAttribute('role', 'log'); stack.setAttribute('aria-live', 'polite'); stack.setAttribute('aria-label', 'New email notifications'); doc.body.append(stack); }
     const span = (text, cls) => { const node = doc.createElement('span'); node.className = cls; node.textContent = text; return node; };
     const item = doc.createElement('div'); item.className = 'nexus-mail-toast'; item.dataset.id = card.id;

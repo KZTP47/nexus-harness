@@ -10,6 +10,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 from contextlib import contextmanager
 import re
@@ -86,35 +87,418 @@ def _transport(method, url, headers=None, body=None):
         raise HarnessError('The mail provider could not be reached. Check your network and reconnect if needed.') from None
 
 
+_VOID_TAGS = frozenset(('area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'keygen', 'link', 'meta', 'param', 'source', 'track', 'wbr'))
+_HEAD_TAGS = frozenset(('base', 'link', 'meta', 'noscript', 'script', 'style', 'template', 'title'))
+_BLOCK_TAGS = frozenset(('p', 'div', 'li', 'tr', 'table', 'ul', 'ol', 'dl', 'dt', 'dd', 'blockquote', 'pre', 'section', 'article',
+                         'header', 'footer', 'nav', 'main', 'aside', 'figure', 'figcaption', 'address', 'fieldset', 'details',
+                         'summary', 'form', 'center', 'hr', 'option', 'caption', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6'))
+# Start tags that end an open <p>, as browsers do.
+_P_ENDERS = frozenset(('address', 'article', 'aside', 'blockquote', 'center', 'details', 'dialog', 'dir', 'div', 'dl', 'fieldset',
+                       'figcaption', 'figure', 'footer', 'form', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'header', 'hgroup', 'hr',
+                       'main', 'menu', 'nav', 'ol', 'p', 'pre', 'search', 'section', 'summary', 'table', 'ul', 'xmp', 'listing',
+                       'plaintext'))
+# Elements whose content is never rendered (or is not the mail's text).
+_NEVER_SHOWN = frozenset(('script', 'style', 'template', 'title', 'iframe', 'noembed', 'noframes', 'datalist', 'textarea',
+                          'desc', 'metadata', 'rp', 'video', 'audio'))
+_CODE = frozenset(('script', 'style', 'template', 'title'))  # not text the sender wrote at all
+# An end tag never reaches past these to close an element opened outside them.
+_SCOPE = frozenset(('td', 'th', 'table', 'caption', 'template', 'button', 'object', 'marquee', 'applet'))
+_SPECIAL = (_P_ENDERS | frozenset(('li', 'dd', 'dt', 'td', 'th', 'tr', 'tbody', 'thead', 'tfoot', 'caption', 'select',
+                                   'button', 'object', 'applet', 'marquee', 'template', 'iframe', 'textarea')))
+_INLINE = frozenset(('a', 'abbr', 'b', 'bdi', 'bdo', 'big', 'cite', 'code', 'data', 'dfn', 'em', 'font', 'i', 'kbd', 'label',
+                     'mark', 'q', 's', 'samp', 'small', 'span', 'strike', 'strong', 'sub', 'sup', 'time', 'tt', 'u', 'var'))
+# Table structure: text or other elements placed directly inside it are moved
+# out in front of the table by browsers ("foster parenting").
+_TABLE_PARTS = frozenset(('table', 'tbody', 'thead', 'tfoot', 'tr'))
+_TABLE_CONTENT = frozenset(('caption', 'colgroup', 'col', 'tbody', 'thead', 'tfoot', 'tr', 'td', 'th', 'script', 'style', 'template'))
+_ABSOLUTE_SIZES = frozenset(('xx-small', 'x-small', 'small', 'medium', 'large', 'x-large', 'xx-large', 'xxx-large'))
+_ABSOLUTE_UNITS = frozenset(('px', 'pt', 'pc', 'in', 'cm', 'mm', 'q', 'rem', 'vw', 'vh', 'vmin', 'vmax', 'svh', 'lvh', 'dvh'))
+_LENGTH = re.compile(r'(\+?(?:\d+\.?\d*|\.\d+))([a-z%]*)$')
+HIDDEN_TEXT_LIMIT = 4000
+# Browsers stop nesting at this depth (deeper elements become siblings); it
+# also keeps every per-tag step cheap on hostile, endlessly nested markup.
+MAX_DEPTH = 512
+MAX_HTML = 2_000_000
+PARSE_BUDGET_SECONDS = 2.0
+_LOG = logging.getLogger(__name__)
+_KEYWORD = re.compile(r'[a-z-]+')
+_CLIPPING = re.compile(r'hidden|clip|scroll|auto')
+_NONZERO = re.compile(r'[1-9]')
+_SPACE = re.compile(r'\s+')
+
+
+class _OverBudget(Exception):
+    pass
+
+
+def _css(style):
+    """Declarations of one inline style, in order: comments and escapes removed,
+    the last declaration of a property wins unless an earlier one is !important.
+    Returns {property: value} and {property: position}."""
+    if not style or ':' not in style:
+        return {}, {}
+    style = re.sub(r'/\*.*?(?:\*/|$)', '', style, flags=re.S)
+
+    def unescape(match):
+        code = int(match.group(1), 16)
+        char = chr(code) if 0 < code < 0x110000 and not 0xD800 <= code <= 0xDFFF else '\ufffd'
+        # An escaped space is part of the word (`none\9` is not `none`), never trimmed.
+        return '\ufffd' if char.isspace() else char
+    style = re.sub(r'\\([0-9a-fA-F]{1,6})\s?', unescape, style)
+    style = re.sub(r'\\(.)', lambda m: '\ufffd' if m.group(1).isspace() else m.group(1), style)
+    found, order = {}, {}
+    for position, declaration in enumerate(style.split(';')):
+        name, colon, value = declaration.partition(':')
+        if not colon:
+            continue
+        name, value = name.strip().lower(), value.strip().lower()
+        important = bool(re.search(r'!\s*important\s*$', value))
+        value = re.sub(r'!\s*important\s*$', '', value).strip()
+        if name and value and (important or not found.get(name, ('', False))[1]):
+            found[name] = (value, important)
+            order[name] = position
+    return {name: value for name, (value, _) in found.items()}, order
+
+
+def _size(value):
+    """('zero' | 'absolute' | 'relative' | None) for a font-size value.
+
+    Only a literal zero hides. A relative size (em, %, larger, smaller,
+    inherit) keeps the parent's size, so it stays zero under a zero parent.
+    Anything that is not literal (calc(), min(), clamp(), var(), a negative or
+    unknown value) is 'absolute': uncertain text is never hidden by guesswork.
+    """
+    value = value.strip()
+    literal = _literal_size(value)
+    if literal:
+        return literal
+    if value in ('inherit', 'larger', 'smaller', 'unset', 'revert') or not value:
+        return None
+    return 'absolute'  # initial, calc(), var(), negative or invalid: not zero
+
+
+def _literal_size(value):
+    """The size a literal length or keyword gives, else None."""
+    if value in _ABSOLUTE_SIZES:
+        return 'absolute'
+    length = _LENGTH.match(value)
+    if not length:
+        return None
+    number, unit = float(length.group(1)), length.group(2)
+    if number == 0:
+        return 'zero'
+    if unit == '':
+        return None
+    return 'absolute' if unit in _ABSOLUTE_UNITS else 'relative'
+
+
+def _font_size(css, order):
+    candidates = []
+    if 'font-size' in css:
+        candidates.append((order.get('font-size', 0), _size(css['font-size'])))
+    if 'font' in css:
+        # The shorthand's size is its first token that is a size (`font:0/0 a`).
+        shorthand = next((size for size in (_literal_size(token.split('/', 1)[0]) for token in css['font'].split()) if size), None)
+        candidates.append((order.get('font', 0), shorthand))
+    return max(candidates)[1] if candidates else None  # the later declaration wins
+
+
+def _opacity(value):
+    """A literal opacity (number or percentage), clamped to 0..1; 1.0 when not literal."""
+    value = (value or '').strip()
+    try:
+        number = float(value[:-1]) / 100 if value.endswith('%') else float(value) if value else 1.0
+    except ValueError:
+        return 1.0  # `0px`, calc() and var() are not literal opacities: visible
+    return max(0.0, min(1.0, number))
+
+
+class _Element:
+    __slots__ = ('tag', 'hide', 'origin', 'unseen', 'zero', 'blocks', 'ordinal', 'details', 'block')
+
+    def __init__(self, tag, hide=False, origin=False, unseen=False, zero=False, ordinal=0, details=False):
+        self.tag, self.hide, self.origin, self.unseen, self.zero = tag, hide, origin, unseen, zero
+        self.blocks, self.ordinal, self.details, self.block = False, ordinal, details, tag in _BLOCK_TAGS
+
+
 class _ReadableHTML(HTMLParser):
-    """Extract inert visible text without loading images, links, or scripts."""
-    def __init__(self):
+    """Extract inert visible text without loading images, links, or scripts.
+
+    Best effort, modelled on how a browser builds the page: one stack of open
+    elements with implied ends and scoped end tags, and inherited hiding
+    (display:none, the hidden attribute, opacity 0, zero clipped boxes, zero
+    font size, visibility:hidden). Only literal, unambiguous signals hide text;
+    anything uncertain stays visible. Text a reader cannot see is kept apart in
+    `hidden_parts`, never in the body. Every step is amortised O(1): per-tag
+    counts answer "is one open?" without scanning, and the stack is capped.
+    """
+    CDATA_CONTENT_ELEMENTS = ('script', 'style', 'xmp', 'iframe', 'noembed', 'noframes', 'textarea', 'title')
+
+    def __init__(self, exempt=(), deadline=None):
         super().__init__(convert_charrefs=True)
-        self.parts = []
-        self.hidden = 0
+        self.parts, self.hidden_parts, self.hidden_size = [], [], 0
+        self.stack = [_Element('#root')]
+        self.open = {}  # tag -> how many are on the stack
+        self.code = 0  # open script/style/template/title
+        self.pending_inline = []  # hidden inline elements not yet known to hold blocks
+        self.pre = 0
+        self.head = False
+        self.quirks = True
+        self.started = False
+        self.exempt = frozenset(exempt)
+        self.ordinals = 0
+        self.confused = None
+        self.deadline = deadline
+        self.steps = 0
+
+    # -- tree building ---------------------------------------------------
+    def handle_decl(self, decl):
+        if not self.started and decl.lower().startswith('doctype'):
+            self.quirks = False
+
+    def _push(self, element):
+        self.stack.append(element)
+        self.open[element.tag] = self.open.get(element.tag, 0) + 1
+        if element.tag in _CODE:
+            self.code += 1
+
+    def _pop_to(self, index):
+        for element in self.stack[index:][::-1]:
+            if element.tag in ('td', 'th'):
+                self._emit('\t')
+            elif element.block:
+                self._emit('\n')
+            if element.tag == 'pre' and self.pre:
+                self.pre -= 1
+            self.open[element.tag] -= 1
+            if element.tag in _CODE:
+                self.code -= 1
+        del self.stack[index:]
+
+    def _find(self, names, stop):
+        if not any(self.open.get(name) for name in names):
+            return None  # none open: answered without a scan
+        for index in range(len(self.stack) - 1, 0, -1):
+            tag = self.stack[index].tag
+            if tag in names:
+                return index
+            if tag in stop:
+                return None
+        return None
+
+    def _implied_close(self, tag):
+        if tag in _P_ENDERS and not (tag == 'table' and self.quirks):
+            index = self._find(('p',), _SCOPE | {'html'})
+            if index:
+                self._pop_to(index)
+        if tag in ('li', 'dd', 'dt'):
+            names = ('li',) if tag == 'li' else ('dd', 'dt')
+            if any(self.open.get(name) for name in names):
+                for index in range(len(self.stack) - 1, 0, -1):
+                    current = self.stack[index].tag
+                    if current in names:
+                        self._pop_to(index)
+                        break
+                    if current in _SPECIAL and current not in ('address', 'div', 'p'):
+                        break
+        elif tag in ('td', 'th'):
+            index = self._find(('td', 'th'), ('table', 'template'))
+            if index:
+                self._pop_to(index)
+        elif tag in ('tr', 'tbody', 'thead', 'tfoot'):
+            index = self._find(('tr',) if tag == 'tr' else ('tr', 'tbody', 'thead', 'tfoot'), ('table', 'template'))
+            if index:
+                self._pop_to(index)
+        elif tag in ('option', 'optgroup'):
+            index = self._find(('option',) if tag == 'option' else ('option', 'optgroup'), _SPECIAL - {'option', 'optgroup'})
+            if index:
+                self._pop_to(index)
+
+    def _host(self, tag=None):
+        """The element text or a new element really belongs to: content placed
+        directly inside a table's structure is moved out in front of the table."""
+        index = len(self.stack) - 1
+        if self.stack[index].tag in _TABLE_PARTS and tag not in _TABLE_CONTENT:
+            while index > 0 and self.stack[index].tag in _TABLE_PARTS:
+                index -= 1
+        return self.stack[index]
+
+    def handle_startendtag(self, tag, attrs):
+        # `<br/>`, `<img .../>` and even `<div/>`: HTML ignores the slash.
+        self.handle_starttag(tag, attrs)
+
+    def _state(self, tag, values, css, order, parent):
+        display, opacity, clipped = '', 1.0, False
+        inline = tag in _INLINE
+        if css:
+            display = css.get('display', '')
+            display = display if _KEYWORD.fullmatch(display) else ''
+            opacity = _opacity(css.get('opacity', ''))
+            inline = (((tag in _INLINE and display in ('', 'inline')) or display == 'inline')
+                      and css.get('float', 'none') == 'none' and css.get('position', '') not in ('absolute', 'fixed'))
+            # A zero-size box that clips its overflow, unless the box still has room:
+            # table cells and tables ignore a zero height, padding keeps space open.
+            overflow = css.get('overflow', '') + css.get('overflow-x', '') + css.get('overflow-y', '')
+            clipped = bool(overflow and not inline and tag not in ('td', 'th', 'table', 'tr')
+                           and _CLIPPING.search(overflow)
+                           and any(_size(css.get(name, '')) == 'zero' for name in ('height', 'max-height', 'width', 'max-width'))
+                           and not any(_NONZERO.search(css.get(name, '')) for name in
+                                       ('padding', 'padding-top', 'padding-bottom', 'padding-left', 'padding-right')))
+        origin = (display == 'none' or ('hidden' in values and display in ('', 'none')) or opacity <= 0 or bool(clipped)
+                  or tag in _NEVER_SHOWN or (tag == 'object' and values.get('data'))
+                  or (tag == 'dialog' and 'open' not in values))
+        self.ordinals += 1
+        if origin and self.ordinals in self.exempt:
+            origin = False
+        # A closed <details> shows only its summary.
+        hide = parent.hide or bool(origin) or (parent.details and tag != 'summary')
+        visibility = css.get('visibility', '') if css else ''
+        unseen = parent.unseen if visibility not in ('hidden', 'collapse', 'visible') else visibility != 'visible'
+        size = _font_size(css, order) if css else None
+        zero = True if size == 'zero' else False if size == 'absolute' else parent.zero
+        element = _Element(tag, hide, bool(origin), unseen, zero, self.ordinals,
+                           details=(tag == 'details' and 'open' not in values))
+        return element, inline, display
 
     def handle_starttag(self, tag, attrs):
-        if tag in ('script', 'style', 'head', 'template'):
-            self.hidden += 1
-        if not self.hidden and tag in ('p', 'div', 'br', 'li', 'tr', 'h1', 'h2', 'h3'):
-            self.parts.append('\n')
+        self.started = True
+        self._tick()
+        values = {}
+        for name, value in attrs:
+            values.setdefault(name.lower(), value or '')  # the first duplicate attribute wins
+        css, order = _css(values.get('style', ''))
+        if tag in ('html', 'body'):
+            if tag == 'body':
+                self.head = False
+            # Their styles apply to the whole page (a body at size 0 or opacity 0).
+            root, _, _ = self._state(tag, values, css, order, self.stack[0])
+            root.tag = '#root'
+            self.stack[0] = root
+            return
+        if tag == 'head':
+            self.head = True
+            return
+        if self.head and tag not in _HEAD_TAGS:
+            self.head = False
+        self._implied_close(tag)
+        element, inline, display = self._state(tag, values, css, order, self._host(tag))
+        block = (tag in _BLOCK_TAGS or tag in ('td', 'th')) if display in ('', 'none') else not (display.startswith('inline') or display == 'contents')
+        element.block = block and tag not in ('td', 'th')
+        if tag not in _VOID_TAGS and len(self.stack) < MAX_DEPTH:
+            if block and self.pending_inline:
+                for ancestor in self.pending_inline:
+                    ancestor.blocks = True
+                self.pending_inline = []
+            if element.origin and tag in _INLINE:
+                self.pending_inline.append(element)
+            self._push(element)
+        if tag == 'pre':
+            self.pre += 1
+        if tag == 'br':
+            self._emit('\n')
+        elif block and tag not in ('tr', 'li', 'option', 'td', 'th'):
+            self._emit('\n')
+        elif tag in ('tr', 'li', 'dt', 'dd', 'option') and self.parts and self.parts[-1] != '\n':
+            self._emit('\n')
+
+    def _tick(self):
+        self.steps += 1
+        if self.deadline and not self.steps % 512 and time.monotonic() > self.deadline:
+            raise _OverBudget()
 
     def handle_endtag(self, tag):
-        if tag in ('script', 'style', 'head', 'template') and self.hidden:
-            self.hidden -= 1
-        if not self.hidden and tag in ('p', 'div', 'li', 'tr'):
-            self.parts.append('\n')
+        self._tick()
+        if tag in ('html', 'body'):
+            return  # content after </body> still belongs to the body
+        if tag == 'head':
+            self.head = False
+            return
+        if tag in _VOID_TAGS:
+            if tag == 'br':
+                self._emit('\n')  # `</br>` is read as a line break, as browsers do
+            return
+        stop = _SCOPE - {tag} if tag not in ('tr', 'tbody', 'thead', 'tfoot') else frozenset(('table', 'template'))
+        index = self._find((tag,), stop)
+        if index:
+            self._pop_to(index)
+
+    def _unseen(self, host=None):
+        top = host or self.stack[-1]
+        return top.hide or top.unseen or top.zero or top.details
+
+    def _emit(self, separator):
+        if not self.head and not self._unseen():
+            self.parts.append(separator)
 
     def handle_data(self, data):
-        if not self.hidden:
-            self.parts.append(data)
+        if self.head and data.strip():
+            self.head = False  # text cannot be in a head; the body has begun
+        if self.head:
+            return
+        text = data if self.pre or self.stack[-1].tag == 'xmp' else _SPACE.sub(' ', data)
+        host = self._host() if data.strip() else self.stack[-1]
+        if self._unseen(host):
+            if not self.code and self.hidden_size < HIDDEN_TEXT_LIMIT:
+                self.hidden_parts.append(text)
+                self.hidden_size += len(text)
+        else:
+            self.parts.append(text)
+
+    def close(self):
+        super().close()
+        # An inline hidden element (a span, a font) left open around block content
+        # is broken markup: a browser would hide the rest of the mail by accident.
+        self.confused = next((element.ordinal for element in self.stack if element.origin
+                              and element.tag in _INLINE and element.blocks), None)
+
+
+def _tidy(text):
+    text = re.sub(r' *\t[ \t]*', '\t', text)
+    text = re.sub(r'[ \t]*\n[ \t]*', '\n', text)
+    return re.sub(r'\n{3,}', '\n\n', text).strip()
+
+
+def _strip_tags(value):
+    """Linear last resort: every text run, tags removed. Nothing is judged hidden."""
+    import html as entities
+    value = re.sub(r'<!--.*?(?:-->|$)', ' ', value, flags=re.S)
+    value = re.sub(r'<(?:br|/p|/div|/tr|/li|/h[1-6])\b[^>]*>', '\n', value, flags=re.I)
+    value = re.sub(r'<[^>]*>', ' ', value)
+    return _tidy(re.sub(r'[ \t\r\f\v]+', ' ', entities.unescape(value)))
+
+
+def _html_parts(value):
+    """(visible text, hidden text) of an HTML body, both plain text."""
+    value = str(value or '')[:MAX_HTML]
+    value = re.sub(r'<!--(?:->|>)', '<!---->', value)  # `<!-->` and `<!--->` are empty comments
+    value = value.replace('--!>', '-->')
+    unclosed = value.rfind('<!--')
+    if unclosed != -1 and value.find('-->', unclosed + 4) == -1:
+        value = value[:unclosed]  # a comment never closed runs to the end (as on every Python version)
+    deadline = time.monotonic() + PARSE_BUDGET_SECONDS
+
+    def read(exempt=()):
+        parser = _ReadableHTML(exempt, deadline)
+        parser.feed(value)
+        parser.close()
+        return _tidy(''.join(parser.parts)), _tidy(''.join(parser.hidden_parts)), parser.confused
+    try:
+        visible, hidden, confused = read()
+        if not visible and confused is not None:
+            # Nothing else is visible and the markup is broken: read that one element,
+            # rather than refusing mail a person can plainly read.
+            visible, hidden, _ = read((confused,))
+    except _OverBudget:
+        # Pathological markup: keep every word rather than stall the mailbox.
+        _LOG.warning('HTML mail took longer than %.1f s to read; used the plain tag-stripping reader.', PARSE_BUDGET_SECONDS)
+        return _strip_tags(value), ''
+    return visible, hidden[:HIDDEN_TEXT_LIMIT]
 
 
 def _plain_html(value):
-    parser = _ReadableHTML()
-    parser.feed(value)
-    parser.close()
-    return re.sub(r'\n[ \t]*\n+', '\n\n', ''.join(parser.parts)).strip()
+    # Nothing visible (image-only mail, or text that is all hidden) is ''. The
+    # mail is refused as unreadable rather than drafted from hidden text.
+    return _html_parts(value)[0]
 
 
 class MessageImportError(HarnessError):
@@ -147,7 +531,9 @@ def _single_reply_to(value):
     return text
 
 
-def _gmail_body(payload):
+def _gmail_body(payload, hidden=None):
+    """The readable text of a Gmail payload. Text an HTML body hides from view
+    is appended to `hidden` (when given), never to the body."""
     plain, html = [], []
     pending = [(payload, 0)]
     visited = 0
@@ -186,7 +572,12 @@ def _gmail_body(payload):
             pending.extend((child, depth + 1) for child in parts)
     if pending:
         raise MessageImportError('The email has too many MIME parts to process completely. No draft was generated.')
-    return _bounded_body('\n'.join(plain) if plain else _plain_html('\n'.join(html)))
+    if plain:
+        return _bounded_body('\n'.join(plain))
+    visible, unseen = _html_parts('\n'.join(html))
+    if hidden is not None and unseen:
+        hidden.append(unseen)
+    return _bounded_body(visible)
 
 
 class EmailConnectors:
@@ -609,9 +1000,9 @@ class EmailConnectors:
                         continue
                     raise
                 body = message.get('body') or {}
-                content = str(body.get('content') or '')
+                content, hidden_text = str(body.get('content') or ''), ''
                 if str(body.get('contentType') or '').lower() == 'html':
-                    content = _plain_html(content)
+                    content, hidden_text = _html_parts(content)
                 sender = (message.get('from') or {}).get('emailAddress') or {}
                 try:
                     reply_addresses = message.get('replyTo') or []
@@ -625,7 +1016,8 @@ class EmailConnectors:
                     continue
                 messages.append({'source_id': message_id, 'sender': _mail_header(sender.get('address'), 500), 'subject': _mail_header(message.get('subject'), 1000), 'body': content,
                                  'reply_to': reply_to, 'internet_message_id': _mail_header(message.get('internetMessageId'), 1000),
-                                 'thread_id': str(message.get('conversationId') or ''), 'received_at': str(message.get('receivedDateTime') or '')})
+                                 'thread_id': str(message.get('conversationId') or ''), 'received_at': str(message.get('receivedDateTime') or ''),
+                                 **({'hidden_text': hidden_text} if hidden_text else {})})
             next_url = result.get('@odata.nextLink') or result.get('@odata.deltaLink')
             if not isinstance(next_url, str) or not next_url:
                 raise HarnessError('The mailbox did not return a continuation cursor.')
@@ -677,8 +1069,9 @@ class EmailConnectors:
                 received = datetime.fromtimestamp(int(item.get('internalDate', 0)) / 1000, timezone.utc).isoformat() if item.get('internalDate') else ''
             except (ValueError, OverflowError, OSError):
                 received = ''
+            hidden = []
             try:
-                content = _gmail_body(payload)
+                content = _gmail_body(payload, hidden)
                 reply_to = _single_reply_to(headers.get('reply-to'))
             except MessageImportError as exc:
                 failed_messages.append({'source_id': message_id, 'error': str(exc)})
@@ -686,7 +1079,8 @@ class EmailConnectors:
                 continue
             messages.append({'source_id': message_id, 'sender': _mail_header(headers.get('from'), 500), 'subject': _mail_header(headers.get('subject'), 1000), 'body': content,
                              'reply_to': reply_to, 'internet_message_id': _mail_header(headers.get('message-id'), 1000),
-                             'references': _mail_header(headers.get('references'), 4000), 'thread_id': str(item.get('threadId') or ''), 'received_at': received})
+                             'references': _mail_header(headers.get('references'), 4000), 'thread_id': str(item.get('threadId') or ''), 'received_at': received,
+                             **({'hidden_text': '\n'.join(hidden)} if hidden else {})})
         next_page = result.get('nextPageToken', '')
         history = held['history'] if next_page or held['mode'] == 'initial' else str(result.get('historyId') or held['history'])
         mode = held['mode'] if next_page else 'history'

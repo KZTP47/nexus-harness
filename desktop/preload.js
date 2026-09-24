@@ -120,7 +120,12 @@ contextBridge.exposeInMainWorld("harnessDesktop", {
     "harness:showMailNotification", notice && typeof notice === "object" ? notice : {}),
   onMailNotificationActivated: (listener) => {
     if (typeof listener !== "function") return;
-    ipcRenderer.on("harness:mailNotificationActivated", (_event, target) => listener(target || {}));
+    // The main process holds the newest click until a page takes it, so one
+    // made while this page was reloading still opens its email, exactly once.
+    const take = () => ipcRenderer.invoke("harness:takeMailNotificationActivation")
+      .then((target) => { if (target && typeof target === "object") listener(target); }, () => {});
+    ipcRenderer.on("harness:mailNotificationActivated", take);
+    take();
   },
   onFullScreenChanged: (listener) => {
     if (typeof listener !== "function") return;

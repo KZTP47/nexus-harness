@@ -20,9 +20,14 @@ class LocalAdapter:
         self.cursor = ''
         self.sent = []
         self.send_result = {'status': 'sent'}
+        # The identity saved when the browser connection was verified.
+        self.saved_email = 'owner@example.test'
 
     def status(self, kind, identity):
         return dict(self.connection)
+
+    def _binding(self, identity):
+        return {'id': identity, 'email': self.saved_email}
 
     def adapter(self, kind):
         return self
@@ -58,6 +63,8 @@ class LocalWorkflowTests(unittest.TestCase):
         self.adapter = LocalAdapter('browser_outlook')
         self.studio = self.reopen()
         self.account = self.studio.connect_local('browser_outlook', 'local-id', {'provider_route': 'fixture-route'})['account']
+        # The first scan after connecting is history; mail arriving after it is new.
+        self.studio.dispatch('sync', {'account_id': self.account['id']})
 
     def provider(self, route, task, context):
         self.calls.append((task, context))
@@ -93,6 +100,7 @@ class LocalWorkflowTests(unittest.TestCase):
             with self.subTest(kind=kind):
                 self.adapter.connection['provider'] = kind
                 account = self.studio.connect_local(kind, 'local-id', {'provider_route': 'fixture-route'})['account']
+                self.studio.dispatch('sync', {'account_id': account['id']})
                 self.arrive(kind)
                 service = self.service()
                 service._poll_account(account['id'])
@@ -411,7 +419,8 @@ class LocalWorkflowTests(unittest.TestCase):
 
     def test_browser_expired_session_reaches_recovering_send_worker(self):
         draft = self.approve(self.draft())
-        self.adapter.connection['state'] = 'sign_in_required'
+        # Like the real worker, a signed-out page reports no mailbox identity.
+        self.adapter.connection.update(state='sign_in_required', email='')
         self.adapter.send_result = {'status': 'not_sent', 'error': 'Sign in required after recovery'}
         with self.assertRaisesRegex(HarnessError, 'after recovery'):
             self.studio.finalize_draft(draft['id'])
@@ -670,7 +679,8 @@ class LocalWorkflowTests(unittest.TestCase):
         service.dispatch('notification_settings', {'enabled': False})
         self.arrive('silent-one')
         service._poll_account(self.account['id'])
-        self.assertEqual(len(service.notifications()['items']), 1)
+        self.assertEqual(len(service._notices), 1, 'no notice is raised while the cards are off')
+        self.assertEqual(service.notifications()['items'], [], 'and none already raised is served')
         self.assertEqual(self.studio.snapshot()['drafts'][-1]['status'], 'review')
 
     def test_a_broken_notice_never_stops_the_draft_it_announces(self):
@@ -699,6 +709,7 @@ class LocalSyncReportingTests(unittest.TestCase):
         self.adapter = LocalAdapter('browser_outlook')
         self.studio = EmailStudio(self.config, provider_call=lambda *a, **k: 'Draft.', local_mail=self.adapter)
         self.account = self.studio.connect_local('browser_outlook', 'local-id', {'provider_route': 'fixture-route'})['account']
+        self.studio.dispatch('sync', {'account_id': self.account['id']})  # the history baseline
 
     def service(self):
         service = EmailService(SimpleNamespace(config=self.config), studio=self.studio, engine=Mock())
@@ -813,3 +824,393 @@ class LocalSyncReportingTests(unittest.TestCase):
         stored = self.studio.snapshot()['messages'][-1]
         self.assertEqual(stored['source_id'], 'undated')
         self.assertEqual(stored['received_at'], '')
+
+
+class MailboxBaselineTests(unittest.TestCase):
+    """Only mail that arrives after a connection's first look is new mail."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='mail-baseline-')
+        self.addCleanup(self.temp.cleanup)
+        self.config = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), Path(self.temp.name), [], {})
+        self.adapter = LocalAdapter('browser_outlook')
+        self.studio = self.reopen()
+
+    def reopen(self):
+        return EmailStudio(self.config, provider_call=lambda *a, **k: 'Draft.', local_mail=self.adapter)
+
+    def arrive(self, source):
+        self.adapter.messages.append(dict(source_id=source, sender='colleague@example.test', subject=source, body='Can you help?',
+            browser_reference={'contract': 'browser-reply/v1', 'provider': self.adapter.connection['provider'],
+                               'source_hash': source, 'row_id': source, 'row_attr': 'data-convid'}))
+
+    def connect(self, kind='browser_outlook'):
+        return self.studio.connect_local(kind, 'local-id', {'provider_route': 'fixture-route'})['account']
+
+    def service(self):
+        service = EmailService(SimpleNamespace(config=self.config), studio=self.studio, engine=Mock())
+        service._start_draft = lambda draft: None
+        return service
+
+    def eligible(self, account):
+        return {m['source_id']: m['auto_draft_eligible'] for m in self.studio._all('message', account['id'])}
+
+    def test_existing_inbox_is_history_and_later_mail_is_drafted_and_announced(self):
+        for kind in ('browser_outlook', 'browser_gmail', 'classic_outlook'):
+            with self.subTest(kind=kind):
+                self.adapter.connection['provider'] = kind
+                self.adapter.messages = []
+                self.arrive(kind + '-old-1'); self.arrive(kind + '-old-2')
+                account = self.connect(kind)
+                service = self.service()
+                service._poll_account(account['id'])
+                self.assertEqual(self.eligible(account), {kind + '-old-1': False, kind + '-old-2': False})
+                self.assertEqual([d for d in self.studio.snapshot()['drafts'] if d['account_id'] == account['id']], [])
+                self.assertEqual([n for n in service.notifications()['items'] if n['account_id'] == account['id']], [])
+                self.arrive(kind + '-new')
+                self.studio = self.reopen()  # the baseline outcome survives a restart
+                service = self.service()
+                service._poll_account(account['id'])
+                self.assertTrue(self.eligible(account)[kind + '-new'])
+                drafted = [d for d in self.studio.snapshot()['drafts'] if d['account_id'] == account['id']]
+                self.assertEqual(len(drafted), 1)
+                self.assertEqual([n['draft_id'] for n in service.notifications()['items']], [drafted[0]['id']])
+
+    def test_a_baseline_spanning_several_batches_stays_history_until_the_backlog_ends(self):
+        batches = iter([dict(messages=[], cursor='c0', warnings=[], has_more=False)])
+        self.adapter.sync = lambda identity, cursor: next(batches)
+        account = self.connect()
+        pages = [(['old-1'], True), (['old-2'], True), (['old-3'], False), (['new-1'], False)]
+        calls = []
+
+        def sync(identity, cursor):
+            names, more = pages[len(calls)]
+            calls.append(cursor)
+            return dict(messages=[dict(source_id=n, sender='a@example.test', subject=n, body='Hi') for n in names],
+                        cursor='c%d' % len(calls), warnings=[], has_more=more)
+        self.adapter.sync = sync
+        self.studio.dispatch('sync', {'account_id': account['id']})
+        self.studio = self.reopen()  # still inside the baseline after a restart
+        self.assertTrue(self.studio._get('account', account['id'])['history_baseline'])
+        self.studio.dispatch('sync', {'account_id': account['id']})
+        self.studio.dispatch('sync', {'account_id': account['id']})
+        self.assertNotIn('history_baseline', self.studio._get('account', account['id']))
+        self.studio.dispatch('sync', {'account_id': account['id']})
+        self.assertEqual(self.eligible(account), {'old-1': False, 'old-2': False, 'old-3': False, 'new-1': True})
+
+    def test_mail_the_mailbox_dates_after_the_baseline_began_is_new_even_mid_baseline(self):
+        import datetime as clock
+        account = self.connect()
+        later = (clock.datetime.now(clock.timezone.utc) + clock.timedelta(minutes=5)).isoformat()
+        earlier = (clock.datetime.now(clock.timezone.utc) - clock.timedelta(days=3)).isoformat()
+        pages = [([('old-1', earlier)], True), ([('old-2', ''), ('arrived', later)], True), ([('old-3', earlier)], False)]
+        calls = []
+
+        def sync(identity, cursor):
+            names, more = pages[len(calls)]
+            calls.append(cursor)
+            return dict(messages=[dict(source_id=n, sender='a@example.test', subject=n, body='Hi', received_at=when) for n, when in names],
+                        cursor='c%d' % len(calls), warnings=[], has_more=more)
+        self.adapter.sync = sync
+        for _ in range(3):
+            self.studio.dispatch('sync', {'account_id': account['id']})
+        self.assertEqual(self.eligible(account), {'old-1': False, 'old-2': False, 'arrived': True, 'old-3': False})
+        self.assertNotIn('history_before', self.studio._get('account', account['id']))
+
+    def test_a_browser_row_seen_arriving_during_the_baseline_is_drafted_and_announced(self):
+        import datetime as clock
+        account = self.connect()
+        after = (clock.datetime.now(clock.timezone.utc) + clock.timedelta(minutes=2)).strftime('%Y-%m-%dT%H:%M:%S.') + '123Z'
+        before = (clock.datetime.now(clock.timezone.utc) - clock.timedelta(days=1)).strftime('%Y-%m-%dT%H:%M:%S.') + '000Z'
+        pages = [([('old-1', None)], True),
+                 ([('arrived', after), ('listed-first', None), ('seen-long-ago', before), ('garbled', 'yesterday-ish'),
+                   ('naive', after[:-1])], True),
+                 ([('old-2', None)], False)]
+        calls = []
+
+        def sync(identity, cursor):
+            names, more = pages[len(calls)]
+            calls.append(cursor)
+            return dict(messages=[dict(source_id=n, sender='a@example.test', subject=n, body='Hi', received_at='', first_seen_at=seen)
+                                  for n, seen in names], cursor='c%d' % len(calls), warnings=[], has_more=more)
+        self.adapter.sync = sync
+        service = self.service()
+        service._poll_account(account['id'])  # one scan drains the three pages of the baseline
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(self.eligible(account), {'old-1': False, 'arrived': True, 'listed-first': False, 'seen-long-ago': False,
+                                                  'garbled': False, 'naive': False, 'old-2': False})
+        stored = {m['source_id']: m for m in self.studio._all('message', account['id'])}
+        self.assertTrue(stored['arrived']['first_seen_at'].startswith(after[:19]))
+        self.assertTrue(stored['arrived']['first_seen_at'].endswith('+00:00'))
+        for name in ('listed-first', 'garbled', 'naive', 'old-1'):
+            self.assertNotIn('first_seen_at', stored[name], 'null or invalid values are ignored')
+        drafts = self.studio.snapshot()['drafts']
+        self.assertEqual([d['message_id'] for d in drafts], [stored['arrived']['id']])
+        self.assertEqual([n['subject'] for n in service.notifications()['items']], ['arrived'])
+
+    def test_mail_that_arrived_while_away_is_history_even_when_the_browser_stamps_it_just_seen(self):
+        import datetime as clock
+        stamp = lambda seconds=0: (clock.datetime.now(clock.timezone.utc) + clock.timedelta(seconds=seconds)).isoformat().replace('+00:00', 'Z')
+        original = self.adapter.sync
+        stamped = {}
+
+        def sync(identity, cursor):
+            result = original(identity, cursor)
+            for message in result['messages']:
+                message['first_seen_at'] = stamped.get(message['source_id'])
+            return result
+        self.adapter.sync = sync
+        self.arrive('first')
+        account = self.connect()
+        self.studio.dispatch('sync', {'account_id': account['id']})
+        for leave, back in ((lambda: self.studio.disconnect_local(account['id']), self.connect),
+                            (lambda: self.studio.dispatch('account_save', {'account_id': account['id'], 'poll_enabled': False}),
+                             lambda: self.studio.dispatch('account_save', {'account_id': account['id'], 'poll_enabled': True}))):
+            leave()
+            name = 'away-%d' % len(stamped)
+            self.arrive(name); stamped[name] = stamp(1)  # the kept worker cache stamps it at the next scan
+            back()
+            self.studio = self.reopen()  # across a restart too
+            service = self.service()
+            service._poll_account(account['id'])
+            self.assertFalse(self.eligible(account)[name], name)
+            self.assertEqual(service.notifications()['items'], [])
+            # Once that baseline is over, a row the browser sees arrive later is new again.
+            fresh = name + '-fresh'
+            self.arrive(fresh); stamped[fresh] = stamp(30)
+            service._poll_account(account['id'])
+            self.assertTrue(self.eligible(account)[fresh], fresh)
+
+    def test_mail_from_the_time_away_read_over_several_passes_stays_history(self):
+        import datetime as clock
+        iso = lambda moment: moment.isoformat().replace('+00:00', 'Z')
+        for first_pass_more in (True, False):  # a backlog, or a second inbox tab read next pass
+            with self.subTest(first_pass_more=first_pass_more):
+                self.adapter.messages = []
+                self.arrive('first')
+                account = self.connect()
+                self.studio.dispatch('sync', {'account_id': account['id']})
+                self.studio.disconnect_local(account['id'])
+                account = self.connect()
+                observed = iso(clock.datetime.now(clock.timezone.utc) + clock.timedelta(seconds=1))
+
+                def row(name, seen):
+                    return dict(source_id=name, sender='colleague@example.test', subject=name, body='Can you help?', first_seen_at=seen,
+                                browser_reference={'contract': 'browser-reply/v1', 'provider': 'browser_outlook',
+                                                   'source_hash': name, 'row_id': name, 'row_attr': 'data-convid'})
+                later = iso(clock.datetime.now(clock.timezone.utc) + clock.timedelta(minutes=5))
+                # Pass 1 observes (stamps) all three rows but opens only one.
+                passes = [dict(messages=[row('away-1', observed)], cursor='k1', warnings=[], has_more=first_pass_more),
+                          dict(messages=[row('away-2', observed), row('away-3', observed)], cursor='k2', warnings=[], has_more=False),
+                          dict(messages=[row('arrived-later', later)], cursor='k3', warnings=[], has_more=False)]
+                self.adapter.sync = lambda identity, cursor: passes.pop(0)
+                service = self.service()
+                for _ in range(3):
+                    self.studio.dispatch('sync', {'account_id': account['id']})
+                self.studio = self.reopen()
+                self.assertEqual({k: v for k, v in self.eligible(account).items() if k != 'first'},
+                                 {'away-1': False, 'away-2': False, 'away-3': False, 'arrived-later': True})
+                self.adapter.sync = LocalAdapter.sync.__get__(self.adapter)
+
+    def test_a_backlog_that_never_ends_cannot_hold_drafting_for_ever(self):
+        from our_harness import email_studio
+        account = self.connect()
+        counter = iter(range(1000))
+        self.adapter.sync = lambda identity, cursor: dict(
+            messages=[dict(source_id='m%d' % next(counter), sender='a@example.test', subject='s', body='Hi')],
+            cursor='c', warnings=[], has_more=True)
+        with patch.object(email_studio, 'HISTORY_BASELINE_SYNCS', 3):
+            for _ in range(4):
+                self.studio.dispatch('sync', {'account_id': account['id']})
+        self.assertEqual(self.eligible(account), {'m0': False, 'm1': False, 'm2': False, 'm3': True})
+
+    def test_reconnecting_differently_or_turning_checks_back_on_starts_a_new_baseline(self):
+        self.arrive('first')
+        account = self.connect()
+        self.studio.dispatch('sync', {'account_id': account['id']})
+        # Same connection again, checks still on: no new baseline; new mail is new.
+        self.connect()
+        self.arrive('second')
+        self.service()._poll_account(account['id'])
+        self.assertEqual(self.eligible(account), {'first': False, 'second': True})
+        # Checks off, "Check inbox now" imports mail, checks back on: that mail is history.
+        self.studio.dispatch('account_save', {'account_id': account['id'], 'poll_enabled': False})
+        self.arrive('while-off')
+        self.studio.dispatch('sync', {'account_id': account['id']})
+        self.assertTrue(self.eligible(account)['while-off'])
+        self.studio.dispatch('account_save', {'account_id': account['id'], 'poll_enabled': True})
+        self.assertFalse(self.eligible(account)['while-off'])
+        self.assertTrue(self.eligible(account)['second'], 'mail that already has a draft is left alone')
+        self.service()._poll_account(account['id'])
+        self.assertEqual({d['message_id'] for d in self.studio.snapshot()['drafts']},
+                         {m['id'] for m in self.studio._all('message', account['id']) if m['source_id'] == 'second'})
+        # Disconnected, mail arrives, reconnected: the scan after reconnecting is history.
+        self.studio.disconnect_local(account['id'])
+        self.arrive('while-away')
+        self.connect()
+        self.studio.dispatch('sync', {'account_id': account['id']})
+        self.assertFalse(self.eligible(account)['while-away'])
+        # A changed connection re-reads everything under new ids, as history.
+        self.adapter.connection['config_fingerprint'] = 'v2'
+        account = self.connect()
+        self.studio.dispatch('sync', {'account_id': account['id']})
+        current = self.studio._get('account', account['id'])['fingerprint']
+        fresh = [m for m in self.studio._all('message', account['id']) if m['account_fingerprint'] == current]
+        self.assertEqual(len(fresh), 4)
+        self.assertFalse(any(m['auto_draft_eligible'] for m in fresh))
+
+    def test_only_mail_imported_by_the_drafting_scan_is_announced(self):
+        account = self.connect()
+        self.studio.dispatch('sync', {'account_id': account['id']})
+        self.arrive('checked-by-hand')
+        self.studio.dispatch('sync', {'account_id': account['id']})  # "Check inbox now"
+        service = self.service()
+        service._poll_account(account['id'])
+        self.assertEqual(len(self.studio.snapshot()['drafts']), 1, 'the stored message is still drafted')
+        self.assertEqual(service.notifications()['items'], [], 'but it is not announced as new mail')
+        self.arrive('arrived-now')
+        service._poll_account(account['id'])
+        self.assertEqual([n['subject'] for n in service.notifications()['items']], ['arrived-now'])
+
+    def test_notices_already_raised_follow_the_current_privacy_setting(self):
+        account = self.connect()
+        self.studio.dispatch('sync', {'account_id': account['id']})
+        service = self.service()
+        self.adapter.messages.append(dict(source_id='private', sender='Dr. Jane Private <jane@clinic.example>',
+            subject='Your results', body='Please call.', browser_reference={'contract': 'browser-reply/v1',
+            'provider': 'browser_outlook', 'source_hash': 'private', 'row_id': 'private', 'row_attr': 'data-convid'}))
+        service._poll_account(account['id'])
+        self.assertEqual(service.notifications()['items'][0]['subject'], 'Your results')
+        service.dispatch('notification_settings', {'show_details': False})
+        hidden = service.notifications()['items'][0]
+        self.assertEqual((hidden['sender'], hidden['subject'], hidden['account'], hidden['private']), ('', '', '', True))
+        self.assertEqual(hidden['draft_id'], self.studio.snapshot()['drafts'][0]['id'], 'the card still opens the email')
+        service.dispatch('notification_settings', {'enabled': False})
+        self.assertEqual(service.notifications()['items'], [])
+        self.assertEqual(service.notifications()['seq'], 1)
+
+
+class BrowserDeliveryRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='mail-delivery-')
+        self.addCleanup(self.temp.cleanup)
+        self.config = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), Path(self.temp.name), [], {})
+        self.adapter = LocalAdapter('browser_outlook')
+        self.studio = self.reopen()
+        self.account = self.studio.connect_local('browser_outlook', 'local-id', {'provider_route': 'fixture-route'})['account']
+        self.studio.dispatch('sync', {'account_id': self.account['id']})
+        self.adapter.messages.append(dict(source_id='one', sender='colleague@example.test', subject='one', body='Can you help?',
+            browser_reference={'contract': 'browser-reply/v1', 'provider': 'browser_outlook',
+                               'source_hash': 'one', 'row_id': 'one', 'row_attr': 'data-convid'}))
+        service = EmailService(SimpleNamespace(config=self.config), studio=self.studio, engine=Mock())
+        service._start_draft = lambda draft: self.studio.process_draft(draft['id'])
+        service._poll_account(self.account['id'])
+        self.draft = self.studio.snapshot()['drafts'][0]
+
+    def reopen(self):
+        return EmailStudio(self.config, provider_call=lambda *a, **k: 'Draft reply.', local_mail=self.adapter)
+
+    def approve(self):
+        return self.studio.dispatch('approve_draft', dict(account_id=self.account['id'], draft_id=self.draft['id'],
+            revision=self.draft['revision'], text='Approved reply.', learn=False, approval_contract='browser-send/v1'))['draft']
+
+    def test_a_signed_out_session_whose_saved_identity_differs_is_refused_and_can_be_retried(self):
+        draft = self.approve()
+        self.adapter.connection.update(state='sign_in_required', email='')
+        self.adapter.saved_email = 'someone-else@example.test'
+        with self.assertRaises(HarnessError):
+            self.studio.finalize_draft(draft['id'])
+        self.assertEqual(self.adapter.sent, [])
+        stored = self.studio._get('draft', draft['id'])
+        self.assertEqual(stored['status'], 'approved')
+        self.assertIn('session changed', stored['error'], 'the reason is shown and the reply can be reopened')
+        reopened = self.studio.dispatch('save_draft', dict(account_id=self.account['id'], draft_id=draft['id'],
+            revision=stored['revision'], text='Changed after the refusal.'))['draft']
+        self.assertEqual(reopened['status'], 'review')
+        self.assertEqual(self.adapter.sent, [])
+
+    def test_a_missing_browser_reference_is_recorded_without_sending(self):
+        draft = self.approve()
+        message = self.studio._get('message', draft['message_id'])
+        message.pop('browser_reference')
+        self.studio._put('message', message)
+        with self.assertRaisesRegex(HarnessError, 'Check the inbox again'):
+            self.studio.finalize_draft(draft['id'])
+        self.assertIn('Check the inbox again', self.studio._get('draft', draft['id'])['error'])
+        self.assertEqual(self.adapter.sent, [])
+
+    def test_mailbox_preparation_does_not_hold_the_studio_lock(self):
+        other = dict(self.draft)
+        saved = {}
+
+        def prepare(identity, incoming, body, submission_id):
+            # Another request saves a preference while the mailbox page gets ready.
+            thread = threading.Thread(target=lambda: saved.update(self.studio.dispatch('memory_save',
+                {'account_id': self.account['id'], 'text': 'Keep it short.'})))
+            thread.start(); thread.join(5)
+            return {'status': 'ready'}
+        self.adapter.prepare_reply = prepare
+        result = self.studio.prepare_draft(dict(account_id=self.account['id'], draft_id=other['id'],
+            revision=other['revision'], intent='send'))
+        self.assertTrue(result['ready'])
+        self.assertEqual(saved['memory']['text'], 'Keep it short.')
+
+    def test_a_draft_changed_during_mailbox_preparation_is_not_overwritten(self):
+        def prepare(identity, incoming, body, submission_id):
+            thread = threading.Thread(target=lambda: self.studio.dispatch('save_draft', dict(account_id=self.account['id'],
+                draft_id=self.draft['id'], revision=self.draft['revision'], text='Saved meanwhile.')))
+            thread.start(); thread.join(5)
+            return {'status': 'ready'}
+        self.adapter.prepare_reply = prepare
+        with self.assertRaisesRegex(HarnessError, 'changed during preparation'):
+            self.studio.prepare_draft(dict(account_id=self.account['id'], draft_id=self.draft['id'],
+                revision=self.draft['revision'], intent='send'))
+        self.assertEqual(self.studio._get('draft', self.draft['id'])['edited'], 'Saved meanwhile.')
+
+    def test_a_send_interrupted_by_a_crash_becomes_unknown_and_is_never_resent(self):
+        draft = self.approve()
+        stuck = self.studio._get('draft', draft['id'])
+        stuck.update(status='sending', submission_id=stuck['id'], submission_contract='browser-reply/v1',
+                     approved_revision=stuck['revision'])
+        self.studio._put('draft', stuck)  # the process stopped here, mid-send
+        self.studio = self.reopen()
+        settled = self.studio._get('draft', draft['id'])
+        self.assertEqual(settled['status'], 'delivery_unknown')
+        self.assertIn('will not send it again', settled['error'])
+        with self.assertRaises(HarnessError):
+            self.studio.finalize_draft(draft['id'])
+        self.assertEqual(self.adapter.sent, [])
+        confirmed = self.studio.dispatch('confirm_browser_delivery', dict(account_id=self.account['id'], draft_id=draft['id'],
+            revision=settled['revision'], confirmation_contract='browser-delivery-confirmation/v1'))['draft']
+        self.assertEqual((confirmed['status'], confirmed['delivery_status']), ('sent', 'user_confirmed'))
+        self.assertEqual(self.adapter.sent, [])
+
+    def test_an_uncertain_delivery_can_be_discarded_without_sending(self):
+        draft = self.approve()
+        stuck = self.studio._get('draft', draft['id'])
+        stuck['status'] = 'sending'
+        self.studio._put('draft', stuck)
+        # Seen while holding the delivery lock, a `sending` draft has no live owner.
+        discarded = self.studio.dispatch('discard_draft', {'account_id': self.account['id'], 'draft_id': draft['id']})['draft']
+        self.assertEqual(discarded['status'], 'discarded')
+        self.assertEqual(self.adapter.sent, [])
+
+
+class FailedImportNoteTests(unittest.TestCase):
+    def test_the_page_can_clear_an_import_note_through_the_service(self):
+        temp = tempfile.TemporaryDirectory(prefix='mail-notes-')
+        self.addCleanup(temp.cleanup)
+        config = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), Path(temp.name), [], {})
+        adapter = LocalAdapter('browser_outlook')
+        studio = EmailStudio(config, provider_call=lambda *a, **k: 'Draft.', local_mail=adapter)
+        account = studio.connect_local('browser_outlook', 'local-id', {'provider_route': 'fixture-route'})['account']
+        adapter.sync = lambda identity, cursor: dict(messages=[dict(source_id='bad', sender='not an address', subject='x', body='y')],
+                                                     cursor='c1', warnings=[])
+        studio.dispatch('sync', {'account_id': account['id']})
+        failure = studio.snapshot()['failed_imports'][0]
+        service = EmailService(SimpleNamespace(config=config), studio=studio, engine=Mock())
+        self.assertEqual(service.dispatch('dismiss_failed_import', {'account_id': account['id'], 'failure_id': failure['id']}),
+                         {'dismissed': failure['id']})
+        self.assertEqual(EmailStudio(config, provider_call=lambda *a, **k: 'Draft.', local_mail=adapter).snapshot()['failed_imports'], [])
+        with self.assertRaises(HarnessError):
+            service.dispatch('dismiss_failed_import', {'account_id': account['id'], 'failure_id': failure['id']})

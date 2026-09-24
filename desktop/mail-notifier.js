@@ -16,6 +16,11 @@ const MOST_WAITING = 3;
 // After this many pop-ups in a row broke before showing anything, report
 // failure so the page shows its own in-page card instead.
 const MOST_BROKEN = 2;
+// A cause that passes (memory pressure, a driver reset) gets one fresh
+// attempt after this long, instead of no pop-ups for the rest of the session.
+const RETRY_BROKEN_MS = 10 * 60 * 1000;
+// A page that neither loads nor fails within this long counts as broken.
+const LOAD_TIMEOUT_MS = 15000;
 
 function clean(value, limit) {
   return String(value ?? "")
@@ -62,27 +67,60 @@ class MailNotifier {
     this.waiting = [];
     this.shown = new Map();
     this.broken = 0;
+    this.height = 0;
+    this.displayWatch = null;
+    this.brokenAt = 0;
+    // Callers waiting to hear whether a queued card reached a loaded page.
+    this.answers = new Map();
+    this.now = typeof options.now === "function" ? options.now : () => Date.now();
+    this.loadTimeoutMs = Number(options.loadTimeoutMs) || LOAD_TIMEOUT_MS;
   }
 
   owns(sender) {
     return Boolean(this.window && !this.window.isDestroyed() && sender === this.window.webContents);
   }
 
+  // True once the card is on a loaded pop-up page, false when the caller must
+  // show its own in-page card. While the page loads the answer is a promise:
+  // the caller only moves on once the card has really gone somewhere.
   show(raw) {
     const notice = sanitizeNotice(raw);
     if (!notice) return false;
-    if (this.broken >= MOST_BROKEN) return false;
+    if (this.broken >= MOST_BROKEN) {
+      if (this.now() - this.brokenAt < RETRY_BROKEN_MS) return false;
+      this.broken = MOST_BROKEN - 1;
+    }
+    // A reloaded page, or a second Nexus window, may offer a card that is
+    // already on screen or waiting; it is shown once.
+    if (this.shown.has(notice.id) && this.window && !this.window.isDestroyed()) {
+      return this.answers.has(notice.id) ? this.answers.get(notice.id).promise : true;
+    }
     this.shown.set(notice.id, notice);
     // Remember only what is still on screen or about to be.
     while (this.shown.size > 50) this.shown.delete(this.shown.keys().next().value);
     const target = this.ensureWindow();
     if (!target) return false;
-    if (this.loaded) target.webContents.send("mail-toast:show", notice);
-    else {
-      this.waiting.push(notice);
-      this.waiting.splice(0, Math.max(0, this.waiting.length - MOST_WAITING));
+    if (this.loaded) {
+      target.webContents.send("mail-toast:show", notice);
+      return true;
     }
-    return true;
+    let settle;
+    const promise = new Promise((resolve) => { settle = resolve; });
+    this.answers.set(notice.id, { promise, settle });
+    this.waiting.push(notice);
+    // Only the newest few wait; an older one goes to the caller's own card.
+    for (const dropped of this.waiting.splice(0, Math.max(0, this.waiting.length - MOST_WAITING))) {
+      this.answer(dropped, false);
+    }
+    return promise;
+  }
+
+  answer(notice, delivered) {
+    const waiting = this.answers.get(notice.id);
+    if (!waiting) return;
+    this.answers.delete(notice.id);
+    if (!delivered) this.shown.delete(notice.id);
+    waiting.settle(delivered);
   }
 
   ensureWindow() {
@@ -124,11 +162,18 @@ class MailNotifier {
       created.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
     }
     this.guard(created.webContents);
+    this.watchDisplays();
+    const late = setTimeout(() => { if (this.window === created && !this.loaded) this.discard(created); }, this.loadTimeoutMs);
+    if (typeof late.unref === "function") late.unref();
     created.webContents.once("did-finish-load", () => {
+      clearTimeout(late);
       if (this.window !== created) return;
       this.loaded = true;
       this.broken = 0;
-      for (const notice of this.waiting.splice(0)) created.webContents.send("mail-toast:show", notice);
+      for (const notice of this.waiting.splice(0)) {
+        created.webContents.send("mail-toast:show", notice);
+        this.answer(notice, true);
+      }
     });
     created.on("closed", () => {
       if (this.window === created) {
@@ -152,11 +197,22 @@ class MailNotifier {
 
   discard(created) {
     if (this.window !== created) return;
-    if (!this.loaded) this.broken += 1;
+    if (!this.loaded) {
+      this.broken += 1;
+      if (this.broken >= MOST_BROKEN) this.brokenAt = this.now();
+    }
     this.window = null;
     this.loaded = false;
-    this.waiting = [];
+    this.height = 0;
     if (!created.isDestroyed()) created.destroy();
+    if (!this.waiting.length) return;
+    // Cards already delivered to a loaded pop-up that later crashes are not
+    // replayed: the caller was told they were shown and has moved on.
+    // Cards waiting for a page that broke are carried to a fresh pop-up. After
+    // repeated failures they go back to the caller, which shows its own card:
+    // its notice cursor has already moved past them, so nothing may be dropped.
+    if (this.broken < MOST_BROKEN && this.ensureWindow()) return;
+    for (const notice of this.waiting.splice(0)) this.answer(notice, false);
   }
 
   // The page reports how tall its stack is. The window grows upward from the
@@ -164,22 +220,39 @@ class MailNotifier {
   resize(sender, height) {
     if (!this.owns(sender)) return false;
     const wanted = Math.min(MAX_HEIGHT, Math.max(0, Math.ceil(Number(height) || 0)));
+    this.height = wanted;
     if (!wanted) {
       this.window.hide();
       return true;
     }
-    const area = this.workArea();
-    this.window.setBounds({
-      x: Math.round(area.x + area.width - TOAST_WIDTH - MARGIN),
-      y: Math.round(area.y + area.height - wanted - MARGIN),
-      width: TOAST_WIDTH,
-      height: wanted,
-    });
+    this.place(wanted);
     if (!this.window.isVisible()) {
       if (typeof this.window.showInactive === "function") this.window.showInactive();
       else this.window.show();
     }
     return true;
+  }
+
+  // A monitor unplugged, a docked laptop or a changed scale would otherwise
+  // leave the stack off screen or floating mid-display until the next card.
+  watchDisplays() {
+    const screen = this.electron && this.electron.screen;
+    if (this.displayWatch || !screen || typeof screen.on !== "function") return;
+    const follow = () => {
+      if (this.window && !this.window.isDestroyed() && this.height && this.window.isVisible()) this.place(this.height);
+    };
+    for (const name of ["display-metrics-changed", "display-removed", "display-added"]) screen.on(name, follow);
+    this.displayWatch = { screen, follow };
+  }
+
+  place(height) {
+    const area = this.workArea();
+    this.window.setBounds({
+      x: Math.round(area.x + area.width - TOAST_WIDTH - MARGIN),
+      y: Math.round(area.y + area.height - height - MARGIN),
+      width: TOAST_WIDTH,
+      height,
+    });
   }
 
   workArea() {
@@ -201,12 +274,19 @@ class MailNotifier {
   }
 
   close() {
-    this.waiting = [];
+    for (const notice of this.waiting.splice(0)) this.answer(notice, false);
     this.shown.clear();
+    this.height = 0;
+    if (this.displayWatch && typeof this.displayWatch.screen.removeListener === "function") {
+      for (const name of ["display-metrics-changed", "display-removed", "display-added"]) {
+        this.displayWatch.screen.removeListener(name, this.displayWatch.follow);
+      }
+    }
+    this.displayWatch = null;
     if (this.window && !this.window.isDestroyed()) this.window.destroy();
     this.window = null;
     this.loaded = false;
   }
 }
 
-module.exports = { MailNotifier, sanitizeNotice, TOAST_WIDTH, MARGIN };
+module.exports = { MailNotifier, sanitizeNotice, TOAST_WIDTH, MARGIN, RETRY_BROKEN_MS };

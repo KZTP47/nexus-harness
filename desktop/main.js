@@ -45,6 +45,14 @@ let desktopSettingsStore = null;
 let shutdownCoordinator = null;
 const pendingJsonExports = new Map();
 const mailToastPage = pageUrl("mail-toast.html");
+// A click on a mail card that arrives while the main page reloads (or before it
+// listens) waits here until the page takes it, so the email still opens.
+const MAIL_ACTIVATION_MS = 120000;
+let pendingMailActivation = null;
+// A held click belongs to the Nexus server (project) whose page raised it.
+function pageOrigin(url) {
+  try { return new URL(String(url || "")).origin; } catch (_error) { return ""; }
+}
 const mailNotifier = new MailNotifier({
   electron,
   page: mailToastPage,
@@ -60,6 +68,7 @@ const mailNotifier = new MailNotifier({
     if (window.isMinimized()) window.restore();
     window.show();
     window.focus();
+    pendingMailActivation = { target, at: Date.now(), origin: pageOrigin(window.webContents.getURL()) };
     window.webContents.send("harness:mailNotificationActivated", target);
   },
 });
@@ -209,6 +218,8 @@ function pageUrl(name, parameters = {}) {
 }
 
 function showPage(name, parameters) {
+  // Leaving the project page: a held mail click no longer has a page to open it.
+  pendingMailActivation = null;
   if (window && !window.isDestroyed()) window.loadURL(pageUrl(name, parameters));
 }
 
@@ -293,6 +304,8 @@ async function openProject(chosen, options = {}) {
   chosen = remembered;
   reviewedTrust = null;
   repairAvailable = false;
+  // Mail cards on screen belong to the project being closed.
+  mailNotifier.close();
   showPage("starting.html", { project: path.basename(chosen) });
   try {
     const stopped = await server.stop();
@@ -815,6 +828,14 @@ ipcMain.handle("harness:appIconDataUrl", (event) => {
 ipcMain.handle("harness:showMailNotification", (event, notice) => (
   fromHarnessWindow(event) ? mailNotifier.show(notice) : false
 ));
+ipcMain.handle("harness:takeMailNotificationActivation", (event) => {
+  if (!fromHarnessWindow(event)) return null;
+  const held = pendingMailActivation;
+  pendingMailActivation = null;
+  if (!held || Date.now() - held.at >= MAIL_ACTIVATION_MS) return null;
+  // Another project's page (or the starting page) never receives this click.
+  return held.origin && held.origin === pageOrigin(event.sender.getURL()) ? held.target : null;
+});
 ipcMain.on("mail-toast:resize", (event, height) => { mailNotifier.resize(event.sender, height); });
 ipcMain.on("mail-toast:activate", (event, id) => { mailNotifier.activate(event.sender, id); });
 ipcMain.handle("harness:focusHarness", (event) => {

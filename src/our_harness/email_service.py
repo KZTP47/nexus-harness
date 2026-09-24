@@ -244,12 +244,22 @@ class EmailService:
             })
 
     def notifications(self, after=None):
-        """Bounded in-memory feed read by every open panel page, whatever tab it shows."""
+        """Bounded in-memory feed read by every open panel page, whatever tab it shows.
+
+        The current settings apply to notices already in the feed: turning the
+        cards off, or hiding sender and subject while sharing a screen, also
+        covers a page that reloads and replays the last two minutes.
+        """
+        settings = self.notification_settings()
         with self._lock:
             now = time.monotonic()
             items = [{**{k: v for k, v in notice.items() if k != 'raised'},
                       'age_seconds': round(max(0.0, now - notice['raised']), 1)}
                      for notice in self._notices if after is None or notice['seq'] > after]
+            if not settings['enabled']:
+                items = []
+            elif not settings['show_details']:
+                items = [{**item, 'account': '', 'sender': '', 'subject': '', 'private': True} for item in items]
             return {'contract': NOTICE_CONTRACT, 'boot': self._notice_boot, 'seq': self._notice_seq,
                     'replay_seconds': NOTICE_REPLAY_SECONDS, 'items': items}
 
@@ -260,7 +270,7 @@ class EmailService:
                    "account_save", "import", "create_draft", "retry_draft", "retry_learning", "retry_automatic_learning",
                    "emailengine_configure", "emailengine_accounts", "emailengine_connect", "emailengine_prepare", "emailengine_sign_in", "check_delivery",
                    "save_draft", "approve_draft", "confirm_browser_delivery", "discard_draft", "memory_save", "memory_delete",
-                   "notification_settings"}
+                   "notification_settings", "dismiss_failed_import"}
         if action not in allowed:
             raise HarnessError("Unknown email action.")
         if action == 'notification_settings':
@@ -489,6 +499,9 @@ class EmailService:
                     last_duration_seconds=round(time.monotonic() - started, 3))
 
     def _scan_account(self, account_id):
+        # Only mail this scan imported is new. Older stored mail that is drafted
+        # now (after a restart, or a manual check) is never announced as new.
+        scan_started = datetime.now(timezone.utc)
         for _ in range(8):
             if self._stop.is_set():
                 return
@@ -513,12 +526,21 @@ class EmailService:
                     and message.get('auto_draft_eligible', True)
                     and message.get('account_fingerprint') == owning.get('fingerprint')):
                 result = self.studio.dispatch('create_draft', {'account_id': account_id, 'message_id': message['id']})
-                if result['draft'].get('status') == 'queued' and not result['draft'].get('revision'):
+                if (result['draft'].get('status') == 'queued' and not result['draft'].get('revision')
+                        and self._imported_since(message, scan_started)):
                     try:
                         self._announce_drafting(owning, message, result['draft'])
                     except Exception:
                         pass  # A notification must never stop the draft it announces.
                 self._start_draft(result['draft'])
+
+    @staticmethod
+    def _imported_since(message, moment):
+        try:
+            imported = datetime.fromisoformat(str(message.get('imported_at', '')))
+        except ValueError:
+            return False
+        return (imported if imported.tzinfo else imported.replace(tzinfo=timezone.utc)) >= moment
 
     def close(self):
         self._stop.set()
