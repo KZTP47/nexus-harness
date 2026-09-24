@@ -30,6 +30,8 @@ const NEXT_SCAN = 'It will be checked again on the next scan.';
 // Walking the list costs budget the conversations themselves need, so collection
 // is capped well before the work deadline and resumes on the next scan.
 const ROW_LIMIT = 200;
+// First-observation stamps are kept for the conversations the worker saw most recently.
+const FIRST_SEEN_LIMIT = 2000;
 // A conversation the mailbox never paints must not be retried ahead of new
 // mail on every scan, so each failure pushes its next attempt further out.
 const FAILURE_COOLDOWN_MS = 300000;
@@ -624,6 +626,12 @@ async function operate(value,request) {
   for(const key of Object.keys(rowCache)){const entry=rowCache[key];if(!/^[a-f0-9]{64}$/.test(key)||!entry||!/^[a-f0-9]{64}$/.test(entry.signature)||!Number.isFinite(entry.checked_at)||entry.checked_at>Date.now())delete rowCache[key];}
   const rowFailures=cacheValid&&cursor.parser_contract===PARSER_CONTRACT&&cursor.row_failures&&typeof cursor.row_failures==='object'&&!Array.isArray(cursor.row_failures)?{...cursor.row_failures}:{};
   for(const key of Object.keys(rowFailures)){const entry=rowFailures[key];if(!/^[a-f0-9]{64}$/.test(key)||!entry||!Number.isInteger(entry.count)||entry.count<1||!Number.isFinite(entry.at)||entry.at>Date.now())delete rowFailures[key];}
+  // When this worker first saw each conversation row: list observation only, never mail
+  // content. A tab without this state (fresh, reconnected or upgraded cursor) is a baseline.
+  const firstValid=cacheValid&&cursor.first_seen_contract==='browser-first-seen/v1';
+  const firstSeen=firstValid&&cursor.first_seen&&typeof cursor.first_seen==='object'&&!Array.isArray(cursor.first_seen)?{...cursor.first_seen}:{};
+  for(const key of Object.keys(firstSeen)){const entry=firstSeen[key];if(!/^[a-f0-9]{32}$/.test(key)||!Array.isArray(entry)||entry.length!==2||!entry.every(n=>Number.isSafeInteger(n)&&n>=0&&n<=Date.now())||entry[0]>entry[1])delete firstSeen[key];else firstSeen[key]=[...entry];}
+  const firstTabs=firstValid&&cursor.first_seen_tabs&&typeof cursor.first_seen_tabs==='object'&&!Array.isArray(cursor.first_seen_tabs)?{...cursor.first_seen_tabs}:{};
   if(!cacheValid&&value.lastScanCacheBinding)await ensureInbox(value,{force:true,deadline:workDeadline});
   value.lastScanCacheBinding=cacheBinding;
   let tabName=cursor.next_tab==='Other'?'Other':'Focused';let splitInbox=false;
@@ -652,6 +660,18 @@ async function operate(value,request) {
   let tabSettled=true;
   await selectInboxTab();
   const snapshotRows=async()=> (await value.page.evaluate(readRows,{provider:value.provider,signatures:true})).map(({summary,...row})=>({...row,signature:digest(summary)}));
+  const firstKey=row=>digest([row.attr,row.id]).slice(0,32);
+  // A list is newest first. On a tab already tracked, an unknown row listed above a row seen
+  // before, or at the top of a list that was empty, has arrived: it is stamped now. Rows of a
+  // baseline scan or found by scrolling below known rows existed already: 0, reported as null.
+  const observe=(snapshot,atTop=false)=>{
+    const now=Date.now(),tab=firstTabs[tabName];let knownBelow=false;
+    for(const row of [...snapshot].reverse()){
+      const entry=firstSeen[firstKey(row)];
+      if(entry){entry[1]=now;knownBelow=true;continue;}
+      firstSeen[firstKey(row)]=[tab&&(knownBelow||(atTop&&tab.empty))?now:0,now];
+    }
+  };
   // One viewport is a few conversations, so the list is walked to its end to find
   // the mail below it; a scan that never scrolled could only ever see the top.
   const scrollTo=async top=>{
@@ -676,6 +696,7 @@ async function operate(value,request) {
     const add=async(resume='')=>{
       let overflow=false;
       const snapshot=await snapshotRows();
+      observe(snapshot,top===0);
       const start=resume?snapshot.findIndex(row=>row.id===resume)+1:0;
       for (const row of snapshot.slice(start)) {
         if(found.has(row.id))continue;
@@ -690,6 +711,7 @@ async function operate(value,request) {
       for(const row of walk.pending)found.set(row.id,row);
       await scrollTop();
       const fresh=await snapshotRows();
+      observe(fresh,true);
       for(const row of (fresh.length<=ROW_LIMIT?fresh:fresh.slice(0,10))){
         if(found.has(row.id))found.set(row.id,{...row,top:0});
         else if(found.size<ROW_LIMIT)found.set(row.id,{...row,top:0});
@@ -720,7 +742,8 @@ async function operate(value,request) {
   const collected = await collectRows();
   const rows = collected.rows;
   const nextTab=splitInbox?(tabName==='Focused'?'Other':'Focused'):undefined;
-  const cacheFields=()=>({parser_contract:PARSER_CONTRACT,message_offsets:messageOffsets,walk_contract:'browser-walk/v1',walks:progress,row_cache_contract:'browser-row-cache/v1',row_cache_binding:cacheBinding,row_cache:Object.fromEntries(Object.entries(rowCache).sort((a,b)=>b[1].checked_at-a[1].checked_at).slice(0,200)),row_failures:Object.fromEntries(Object.entries(rowFailures).sort((a,b)=>b[1].at-a[1].at).slice(0,200)),split_inbox:splitInbox,next_tab:nextTab});
+  const cacheFields=()=>({parser_contract:PARSER_CONTRACT,message_offsets:messageOffsets,walk_contract:'browser-walk/v1',walks:progress,row_cache_contract:'browser-row-cache/v1',row_cache_binding:cacheBinding,row_cache:Object.fromEntries(Object.entries(rowCache).sort((a,b)=>b[1].checked_at-a[1].checked_at).slice(0,200)),row_failures:Object.fromEntries(Object.entries(rowFailures).sort((a,b)=>b[1].at-a[1].at).slice(0,200)),split_inbox:splitInbox,next_tab:nextTab,
+    first_seen_contract:'browser-first-seen/v1',first_seen:Object.fromEntries(Object.entries(firstSeen).sort((a,b)=>b[1][1]-a[1][1]).slice(0,FIRST_SEEN_LIMIT)),first_seen_tabs:{...firstTabs,[tabName]:{empty:!rows.length}}});
   if (!rows.length && (inboxStatus==='empty'||await value.page.evaluate(inboxState,value.provider)==='empty')) return {messages:[],failed_messages:[],has_more:false,cursor:JSON.stringify({...cursor,contract:SYNC_CONTRACT,...cacheFields()}),warnings:notes};
   const seen=cursor.seen || [];
   if (!Array.isArray(seen) || seen.some(id=>typeof id!=='string') || seen.length>5000) throw new Error('Browser mail cursor is invalid.');
@@ -972,7 +995,8 @@ async function operate(value,request) {
     parsedCount++;
     const source_id=sourceHash(value.provider,row,message);
     const browser_reference={contract:REPLY_CONTRACT,provider:value.provider,row_attr:row.attr,row_id:row.id,message_id:message.message_id,source_hash:source_id,content_hash:contentHash(message),...(splitInbox?{inbox_tab:tabName}:{})};
-    if (!seen.includes(source_id)) { if(message.sender.toLowerCase()!==refreshed.email.toLowerCase()) messages.push({source_id,...message,browser_reference}); seen.push(source_id); }
+    const first=firstSeen[firstKey(row)]?.[0];
+    if (!seen.includes(source_id)) { if(message.sender.toLowerCase()!==refreshed.email.toLowerCase()) messages.push({source_id,...message,first_seen_at:first?new Date(first).toISOString():null,browser_reference}); seen.push(source_id); }
     }catch(error){
       const identity=await status(value,request.connection);
       if(identity.state!=='connected')throw new Error('Mailbox sign-in changed while checking mail. Reconnect the browser.');
@@ -1012,6 +1036,7 @@ async function operate(value,request) {
     // Add arrivals/reordered visible rows without retrying the same failed row
     // indefinitely. Unreadable rows are never added to the durable seen set.
     const currentRows=await snapshotRows();
+    observe(currentRows);
     const arrivals=currentRows.length<=ROW_LIMIT?currentRows:currentRows.slice(0,10);
     const additions=arrivals.filter(item=>changed(item)&&!cooling(item)&&!attempted.has(item.id)&&!ordered.some(queued=>queued.id===item.id));
     ordered.splice(ordered.indexOf(row)+1,0,...additions);
