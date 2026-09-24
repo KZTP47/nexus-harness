@@ -6,6 +6,7 @@
   <title>Nexus Harness</title>
   <link rel="stylesheet" href="/styles.css">
   <link rel="stylesheet" href="/email.css">
+  <link rel="stylesheet" href="/live-team.css">
 </head>
 <body>
   <a id="skipToWorkspace" class="skip-link" href="#startView">Skip to current workspace</a>
@@ -71,6 +72,7 @@
     <button type="button" disabled data-view="start" aria-pressed="true" title="Set up your project and ask for a change">Start here</button>
     <button type="button" disabled data-view="swarm" class="the-swarm" aria-pressed="false" title="A board of your agents, the projects they are on, and which of them may talk to each other">AI Agent Swarm orchestrator</button>
     <button type="button" disabled data-view="pipelines" class="the-automations" aria-pressed="false" title="Work that runs itself: draw the jobs as boxes, join them with arrows, press Run">visual test automation</button>
+    <button type="button" disabled data-view="liveteam" aria-pressed="false" title="Agents with live sessions working together at the same time (Agent Runtime v3 preview)">Live team</button>
     <button type="button" disabled data-view="email" aria-pressed="false" title="Read incoming mail, review replies, and teach your assistant">Email assistant</button>
     <button type="button" disabled data-view="settings" aria-pressed="false" title="Change any setting, without opening a file">Settings</button>
   </nav>
@@ -1926,9 +1928,11 @@
     <button id="theChatTrayOn" class="the-chat-tray-arrow" type="button"
       aria-label="Show the chats further right">&#8594;</button>
   </div>
+  <main id="liveTeamView" data-view-panel="liveteam" class="data-view live-team" hidden tabindex="-1" aria-label="Live team"></main>
   <main id="emailView" data-view-panel="email" class="data-view email-workspace" hidden tabindex="-1" aria-label="Email assistant"></main>
   <script src="/email.js"></script>
   <script src="/app.js"></script>
   <script src="/session-health.js"></script>
+  <script src="/live-team.js"></script>
 </body>
 </html>

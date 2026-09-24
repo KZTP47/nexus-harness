@@ -128,10 +128,16 @@ Generate Codex app-server schemas from the installed version and feature-detect 
 | Phase | Deliverable | Removes |
 |---|---|---|
 | 0 (done 2026-09-24) | Stall watchdog, native-tools prompt, live chat activity feed, Claude thinking and block-collision fix, Codex reasoning summaries while watched | Worst waits, blind waiting |
-| 1 | Unified event model + Codex app-server session adapter + Claude stream-json persistent session adapter, behind a setting, for direct chats | Process per turn, no deltas |
-| 2 | Nexus MCP server (messages, tasks, decisions, report_result); drop the forced schema for v3 sessions | Tool round-trips, schema slips |
-| 3 | Push mailbox + parallel agents with worktrees/copies and path leases; Work Together on v3 | Serial turns, 5 message stores |
-| 4 | ACP client for Gemini/Copilot and registry agents; retire relay/collaborate/legacy paths; migrate goals | Concept sprawl |
+| 1 (done 2026-09-24) | Unified event model, persistent Codex app-server and Claude stream-json sessions, in a separate **Live team** tab rather than behind a setting | Process per turn, no deltas |
+| 2 (done 2026-09-24) | Nexus MCP server (messages, tasks, questions, reserved paths, report_result, approvals); no forced output schema | Tool round-trips, schema slips |
+| 3 (done 2026-09-24) | Push mailbox, parallel agents, per-agent git worktrees, path leases, closure reasons with a transition log, resume verification, stuck-task sweep | Serial turns |
+| 4 (partly done 2026-09-24) | ACP client for Gemini and Copilot is built. Retiring relay, collaborate and legacy paths and migrating goals is the owner's decision, once Live team has proven itself | Concept sprawl, not yet |
+
+What was built and how to use it: [docs/LIVE_TEAM.md](../LIVE_TEAM.md). Tested by clicking
+through the tab against real Codex and Claude sessions: a two-agent game build, messaging one
+agent, close and reopen with both conversations remembered, Allow and Deny cards, worktree
+branches with a commit from each agent, and Interrupt. Gemini stopped at its Google Cloud
+project requirement, with a clear message. Copilot was only exercised against a stand-in.
 
 ## Sources
 

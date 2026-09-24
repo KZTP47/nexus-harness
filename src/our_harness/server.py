@@ -420,6 +420,14 @@ class HarnessHTTPServer(ThreadingHTTPServer):
             settings_path=swarm_runs._base().parent / "session-health.json",
         )
         self.session_health.on_recovered(self._session_recovered)
+        from .agent_runtime.manager import RuntimeManager
+        # Agent Runtime v3: persistent, streaming agent sessions ("Live team").
+        self.live_teams = RuntimeManager(
+            root=swarm_runs._base().parent / "agent-runtime-v3",
+            board=lambda: self.swarm_standing().get("board", {}),
+            config=lambda: self.config,
+            project_root=lambda: self.config.project_root,
+        )
         self.events = EventBus(redactor=CredentialRedactor(config))
         self._swarm_runs: swarm_runs.SwarmRunStore | None = None
         self._swarm_communication_runs: swarm_runs.SwarmRunStore | None = None
@@ -3097,6 +3105,7 @@ class HarnessHTTPServer(ThreadingHTTPServer):
         return resumed
 
     def server_close(self) -> None:
+        self.live_teams.close_all()
         self.session_health.close()
         self.email.close()
         with self._long_horizon_lifecycle_lock:
@@ -3929,11 +3938,30 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 self._static("email.js", "text/javascript; charset=utf-8")
             elif parsed.path == "/session-health.js":
                 self._static("session-health.js", "text/javascript; charset=utf-8")
+            elif parsed.path == "/live-team.js":
+                self._static("live-team.js", "text/javascript; charset=utf-8")
+            elif parsed.path == "/live-team.css":
+                self._static("live-team.css", "text/css; charset=utf-8")
             elif parsed.path == "/email.css":
                 self._static("email.css", "text/css; charset=utf-8")
             elif parsed.path == "/api/email":
                 self._require_token()
                 self._json(self.server.email.snapshot())
+            elif parsed.path == "/api/live-team":
+                self._require_token()
+                manager = self.server.live_teams
+                self._json({"agents": manager.available_agents(), "saved": manager.saved(),
+                            "project": str(self.server.config.project_root),
+                            "running": [team.snapshot() for team in manager.teams.values() if team.state != "closed"]})
+            elif parsed.path == "/api/live-team/team":
+                self._require_token()
+                query = urllib.parse.parse_qs(parsed.query)
+                team = self.server.live_teams.team(query.get("team", [""])[0])
+                try:
+                    after = int(query.get("after", ["0"])[0])
+                except ValueError:
+                    after = 0
+                self._json({"team": team.snapshot(), "events": team.events(after)})
             elif parsed.path == "/api/session-health":
                 # In-memory; every open page polls it to show sign-in problems.
                 self._require_token()
@@ -6392,6 +6420,31 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     "needs_your_say": done.needs_your_say,
                     **connection,
                 })
+            elif self.path == "/api/live-team":
+                manager = self.server.live_teams
+                action = str(body.get("action") or "")
+                if action == "create":
+                    self._json({"team": manager.create(body)})
+                elif action == "reopen":
+                    self._json({"team": manager.reopen(str(body.get("team") or ""))})
+                elif action == "say":
+                    team = manager.team(str(body.get("team") or ""))
+                    text = str(body.get("text") or "").strip()
+                    if not text:
+                        raise HarnessError("Type a message first.")
+                    self._json({"outcomes": team.say(text, str(body.get("to") or ""))})
+                elif action == "answer":
+                    manager.team(str(body.get("team") or "")).answer(str(body.get("question") or ""),
+                                                                    str(body.get("answer") or ""))
+                    self._json({"answered": True})
+                elif action == "interrupt":
+                    manager.team(str(body.get("team") or "")).interrupt(str(body.get("agent") or ""))
+                    self._json({"interrupted": True})
+                elif action == "close":
+                    manager.close(str(body.get("team") or ""))
+                    self._json({"closed": True})
+                else:
+                    raise HarnessError("Unknown live team action.")
             elif self.path == "/api/session-health":
                 monitor = self.server.session_health
                 action = str(body.get("action") or "")

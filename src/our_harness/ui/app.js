@@ -807,6 +807,7 @@ function switchView(name, options = {}) {
   $("workflowActions").hidden = name !== "workflow";
   if (name === "memory") refreshMemory();
   if (name === "email") window.nexusEmail?.refresh();
+  if (name === "liveteam") window.nexusLiveTeam?.refresh();
   if (name === "prompts") refreshPrompts();
   if (name === "start") { refreshCheckup(); refreshHowItWorks(); }
   if (name === "checks") { refreshChecks(); $("starterUrl").placeholder = window.location.origin + "/"; }

@@ -1161,7 +1161,9 @@ class SubscriptionCLIProvider(Provider):
                     # Use normal Claude allow rules; managed/user denials still
                     # apply, and no skip-permissions or unsupported auto mode is
                     # required for older configured models.
-                    argv.extend(["--allowedTools", "Bash,WebFetch,WebSearch"])
+                    # Claude Code on Windows runs shell commands through its
+                    # PowerShell tool; the user's denials cover both tools.
+                    argv.extend(["--allowedTools", "Bash,PowerShell,WebFetch,WebSearch"])
                     # The user's explicit command denials become real Claude
                     # permission rules; deny rules win over the allow above.
                     rules, unenforceable = native_execution.claude_deny_rules(
