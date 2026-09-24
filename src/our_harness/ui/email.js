@@ -622,7 +622,7 @@
       return act('confirm_browser_delivery', {account_id: state.account, draft_id: draft.id, revision: draft.revision, confirmation_contract: 'browser-delivery-confirmation/v1'}, () => { verifiedSend.checked = false; return {notice: 'Your verification was recorded. No reply was resent.'}; });
     }).dataset.work = '1';
     review.append(manualDelivery);
-    button(review, 'emailRetry', 'Retry draft', () => act('retry_draft', {account_id: state.account, draft_id: state.draft})).dataset.work = '1'; button(review, 'emailResume', 'Retry approved workflow', () => act('resume_draft', {account_id: state.account, draft_id: state.draft})).dataset.work = '1'; button(review, 'emailDownload', 'Download reply (.eml)', () => act('export_email', {account_id: state.account, draft_id: state.draft}, async result => {
+    button(review, 'emailRetry', 'Retry draft', () => act('retry_draft', {account_id: state.account, draft_id: state.draft, provider_route: by('emailProvider').value, provider_model: by('emailModel').value})).dataset.work = '1'; button(review, 'emailResume', 'Retry approved workflow', () => act('resume_draft', {account_id: state.account, draft_id: state.draft})).dataset.work = '1'; button(review, 'emailDownload', 'Download reply (.eml)', () => act('export_email', {account_id: state.account, draft_id: state.draft}, async result => {
       const filename = result.filename || 'reply.eml';
       if (typeof host.harnessDesktop?.saveEmailFile === 'function') {
         let saved;

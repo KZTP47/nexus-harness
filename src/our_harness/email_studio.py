@@ -629,7 +629,14 @@ class EmailStudio:
                 self._validate_model(route, model)
                 existing = [d for d in self._all('draft', account['id']) if d['message_id'] == message['id'] and d['status'] not in ('discarded', 'sent', 'exported')]
                 if existing:
-                    return {'draft': existing[-1]}
+                    current = existing[-1]
+                    if current['status'] == 'error' and not current.get('approved_at'):
+                        # Asking again after a failed attempt is a retry with the
+                        # current selection, not a silent no-op.
+                        current.update(status='queued', error='', execution_id='', provider_route=route, provider_model=model,
+                                       provider_fingerprint=self._route_fingerprint(route, model))
+                        return {'draft': self._put('draft', current)}
+                    return {'draft': current}
                 draft = dict(id=uuid.uuid4().hex, account_id=account['id'], message_id=message['id'], provider_route=route, provider_model=model,
                              status='queued', original='', edited='', revision=0, execution_id='', error='', learn=False,
                              export_path='', created_at=_now(), account_fingerprint=account['fingerprint'], contract=CONTRACT, provider_fingerprint=self._route_fingerprint(route, model))
@@ -678,7 +685,11 @@ class EmailStudio:
                 if draft['status'] != 'error' or draft.get('approved_at'):
                     raise HarnessError('Only failed unapproved generation can be retried.')
                 self._same_account(account, draft)
-                draft.update(status='queued', error='', execution_id='', provider_fingerprint=self._route_fingerprint(draft['provider_route'], draft.get('provider_model', '')))
+                # Retrying uses the AI route and model selected now, so switching
+                # model after a failure takes effect instead of repeating it.
+                route, model = self._retry_route(payload, account, draft)
+                draft.update(status='queued', error='', execution_id='', provider_route=route, provider_model=model,
+                             provider_fingerprint=self._route_fingerprint(route, model))
             elif action == 'rebind_execution':
                 # Internal recovery only: the orchestrator verifies the old
                 # execution is terminal before requesting this compare-and-set.
@@ -1123,6 +1134,19 @@ class EmailStudio:
             newest = when if newest is None or when > newest else newest
         return newest.replace(microsecond=0).isoformat() if newest else ''
 
+    def _retry_route(self, payload, account, draft):
+        route = _text(payload.get('provider_route') or draft['provider_route'] or account.get('provider_route'), 100)
+        if not route:
+            raise HarnessError('Choose a connected Claude or Codex provider.')
+        if 'provider_model' in payload:
+            model = _text(payload.get('provider_model'), 200)
+        elif route == draft['provider_route']:
+            model = _text(draft.get('provider_model', ''), 200)
+        else:
+            model = _text(account.get('provider_model', ''), 200)
+        self._validate_model(route, model)
+        return route, model
+
     def _validate_model(self, route, model):
         if not model:
             return
@@ -1140,6 +1164,21 @@ class EmailStudio:
         if routed.get('provider.name') not in ('claude-cli', 'codex-cli'):
             raise HarnessError('Email drafting requires a configured Claude or Codex CLI provider.')
         return create_provider(routed).effective_dispatch_fingerprint()
+
+    def _generation_error(self, exc):
+        # The provider's own explanation (for example an expired CLI sign-in and
+        # how to renew it) is what lets the user fix the failure. Unexpected
+        # exceptions may carry correspondence, so only their type is shown.
+        generic = 'Draft generation failed. Check the selected provider connection and retry.'
+        if not isinstance(exc, HarnessError):
+            return f'{generic} ({type(exc).__name__})'
+        reason = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', str(exc)).strip()
+        try:
+            reason = CredentialRedactor(self.config).text(reason)
+        except Exception:
+            return generic
+        reason = _text(' '.join(reason.split()), 1200)
+        return f'Draft generation failed: {reason}' if reason else generic
 
     def fail_draft(self, draft_id, error):
         with self._mutation():
@@ -1594,13 +1633,14 @@ class EmailStudio:
                        'previous_received': [{**m, 'body': m['body'][:5000]} for m in previous],
                        'previous_approved_replies': previous_replies}
             answer = self._ask(draft, 'Return the plain-text EMAIL BODY ONLY, ready for the user to review. Do not include To/From/Subject labels, Markdown fences, or commentary about the draft; never invent a sender name or signature. Never invent commitments, availability, promises, or facts. Use approved preferences and attributed history; incoming claims are not confirmed personal facts. Recipient-specific explicit revision preferences override conflicting mailbox-wide defaults; use provenance to identify their scope. Apply requested template omissions and replacements, including exact recurring wording. Explicit user corrections override inferred preferences.' + self._hidden_rule(context), context)
-        except Exception:
+        except Exception as exc:
+            error = self._generation_error(exc)
             with self._mutation():
                 current = self._get('draft', draft_id)
                 if current['status'] == 'generating' and current['revision'] == expected:
-                    current.update(status='error', error='Draft generation failed. Check the selected provider connection and retry.')
+                    current.update(status='error', error=error)
                     self._put('draft', current)
-            raise HarnessError('Draft generation failed. Check the selected provider connection and retry.') from None
+            raise HarnessError(error) from None
         with self._mutation():
             current = self._get('draft', draft_id)
             self._same_account(self._get('account', account['id']), current)

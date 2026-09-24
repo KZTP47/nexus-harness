@@ -47,6 +47,8 @@ MODEL_CATALOG: tuple[ModelCatalogEntry, ...] = (
     ModelCatalogEntry("openai", "gpt-5.6-sol", "GPT-5.6 Sol", "https://developers.openai.com/api/docs/models"),
     ModelCatalogEntry("openai", "gpt-5.6-terra", "GPT-5.6 Terra", "https://developers.openai.com/api/docs/models"),
     ModelCatalogEntry("openai", "gpt-5.6-luna", "GPT-5.6 Luna", "https://developers.openai.com/api/docs/models"),
+    ModelCatalogEntry("anthropic", "claude-fable-5-1", "Claude Fable 5.1", "https://platform.claude.com/docs/en/about-claude/models/overview", "2026-09-24"),
+    ModelCatalogEntry("anthropic", "claude-opus-5-5", "Claude Opus 5.5", "https://platform.claude.com/docs/en/about-claude/models/overview", "2026-09-24"),
     ModelCatalogEntry("anthropic", "claude-fable-5", "Claude Fable 5", "https://platform.claude.com/docs/en/about-claude/models/overview"),
     ModelCatalogEntry("anthropic", "claude-opus-5", "Claude Opus 5", "https://platform.claude.com/docs/en/about-claude/models/overview"),
     ModelCatalogEntry("anthropic", "claude-sonnet-5", "Claude Sonnet 5", "https://platform.claude.com/docs/en/about-claude/models/overview"),

@@ -29,14 +29,16 @@ def _fallback(registry, profile):
         # the signed-in account supports them. Aliases follow CLI configuration.
         for value, label in [('default', 'Claude account default'), ('fable', 'Fable (CLI alias)'),
                              ('opus', 'Opus (CLI alias)'), ('sonnet', 'Sonnet (CLI alias)'),
-                             ('haiku', 'Haiku (CLI alias)'), ('claude-fable-5-1', 'Claude Fable 5.1')]:
+                             ('haiku', 'Haiku (CLI alias)')]:
             items.append(dict(id=value, label=label, source=_CLAUDE_DOC))
         for item in offline_models('anthropic'):
             items.append(dict(id=item.model, label=item.display_name, source=item.source_url))
     elif profile.name == 'codex-cli':
-        # Verified official CLI documentation and installed refreshed catalog,
-        # 2026-09-12. Refresh replaces these suggestions with this CLI's list.
-        for value, label in [('gpt-6-astra', 'GPT-6 Astra'), ('gpt-5.6-sol', 'GPT-5.6 Sol'),
+        # Verified against the installed Codex CLI refreshed catalog
+        # (codex debug models), 2026-09-24. Refresh replaces these suggestions
+        # with this CLI's list.
+        for value, label in [('gpt-6-astra', 'GPT-6 Astra'), ('gpt-6-sol', 'GPT-6 Sol'),
+                             ('gpt-6-luna', 'GPT-6 Luna'), ('gpt-5.6-sol', 'GPT-5.6 Sol'),
                              ('gpt-5.6-terra', 'GPT-5.6 Terra'), ('gpt-5.6-luna', 'GPT-5.6 Luna'),
                              ('gpt-5.5', 'GPT-5.5'), ('gpt-5.3-codex-spark', 'GPT-5.3 Codex Spark')]:
             items.append(dict(id=value, label=label, source=_CODEX_DOC))
