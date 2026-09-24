@@ -97,7 +97,28 @@ def _process_token(pid: int) -> str:
         return ""
 
 
-def _owner_is_alive(pid: int, token: str, thread_id: int = 0) -> bool:
+# When Windows refuses even a limited query handle (csrss, lsass, another
+# user's or an elevated process), the owner's birth token cannot be checked,
+# so the PID may have been reused. Such an owner keeps its lease only while
+# the run was updated this recently; a reused PID can never hold it forever.
+ACCESS_DENIED_LEASE_MS = 2 * 60 * 60 * 1000
+# How often a polling owner refreshes its lease (well inside the window).
+HEARTBEAT_INTERVAL_MS = 60 * 1000
+
+
+def _lease_is_fresh(last_seen_ms: int | None) -> bool:
+    if last_seen_ms is None:
+        return True
+    try:
+        seen = int(last_seen_ms)
+    except (TypeError, ValueError):
+        return False
+    return _now_ms() - seen <= ACCESS_DENIED_LEASE_MS
+
+
+def _owner_is_alive(
+    pid: int, token: str, thread_id: int = 0, *, last_seen_ms: int | None = None,
+) -> bool:
     if pid == os.getpid() and thread_id:
         living = {int(one.native_id or 0) for one in threading.enumerate()}
         if thread_id not in living:
@@ -119,10 +140,13 @@ def _owner_is_alive(pid: int, token: str, thread_id: int = 0) -> bool:
             kernel32.CloseHandle.restype = wintypes.BOOL
             process = kernel32.OpenProcess(0x100000 | 0x1000, False, pid)
             if not process:
-                # Access denied proves a process owns the PID but prevents
-                # birth-token verification, so fail closed. Invalid/missing
-                # PIDs are dead and may be recovered.
-                return int(ctypes.get_last_error()) == 5
+                # Access denied proves some process owns the PID but prevents
+                # birth-token verification, so the PID may have been reused.
+                # Trust it only while the lease was recently updated.
+                # Invalid/missing PIDs are dead and may be recovered.
+                if int(ctypes.get_last_error()) != 5:
+                    return False
+                return _lease_is_fresh(last_seen_ms)
             try:
                 if int(kernel32.WaitForSingleObject(process, 0)) != 258:
                     return False
@@ -139,7 +163,9 @@ def _owner_is_alive(pid: int, token: str, thread_id: int = 0) -> bool:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
-    except (OSError, PermissionError):
+    except PermissionError:
+        return _lease_is_fresh(last_seen_ms)
+    except OSError:
         return True
     return True
 
@@ -1197,6 +1223,7 @@ class PipelineRunStore:
             if _owner_is_alive(
                 int(row["owner_pid"]), str(row["owner_token"] or ""),
                 int(row["owner_thread_id"] or 0),
+                last_seen_ms=int(row["updated_at_ms"] or row["created_at_ms"] or 0),
             ):
                 continue
             result = {
@@ -1466,7 +1493,38 @@ class PipelineRunStore:
             ).fetchone()
             if row is not None:
                 self._verify_run(connection, row)
-        return row is None or bool(row["stop_requested"]) or row["state"] not in ACTIVE_STATES
+        stop = row is None or bool(row["stop_requested"]) or row["state"] not in ACTIVE_STATES
+        if not stop:
+            self._heartbeat(row)
+        return stop
+
+    def _heartbeat(self, row: sqlite3.Row) -> None:
+        """Keep a live owner's lease fresh while it polls (running or waiting).
+
+        The owner polls ``should_stop``/``decision`` while it waits for a
+        decision, so a waiting run keeps moving ``updated_at_ms``. That is
+        what another process uses when it cannot read the owner's identity
+        (Windows access denied), see ``_owner_is_alive``. Throttled.
+        """
+
+        if int(row["owner_pid"] or 0) != os.getpid() or row["state"] not in ACTIVE_STATES:
+            return
+        run_id = str(row["run_id"])
+        now = _now_ms()
+        beats = self.__dict__.setdefault("_last_heartbeat_ms", {})
+        if now - int(beats.get(run_id, 0)) < HEARTBEAT_INTERVAL_MS:
+            return
+        beats[run_id] = now
+        try:
+            with self._transaction() as connection:
+                connection.execute(
+                    "UPDATE pipeline_runs SET updated_at_ms=? WHERE run_id=? AND owner_pid=? "
+                    "AND state IN ('accepted','running','waiting','stopping')",
+                    (now, run_id, os.getpid()),
+                )
+                self._seal_run(connection, run_id)
+        except (sqlite3.Error, HarnessError):
+            beats.pop(run_id, None)
 
     def decide(self, run_id: str, step: str, carry_on: bool) -> dict[str, Any]:
         if not step or len(step) > 500 or any(ord(char) < 32 for char in step):
@@ -1525,6 +1583,8 @@ class PipelineRunStore:
             ).fetchone()
             if row is not None:
                 self._verify_decision(row)
+        if run is not None and row is None:
+            self._heartbeat(run)
         return None if row is None else bool(row["carry_on"])
 
     def finish(self, run_id: str, attempt_id: str, result: dict[str, Any]) -> dict[str, Any]:

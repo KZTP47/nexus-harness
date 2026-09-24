@@ -113,6 +113,40 @@ class TransactionSafetyRegressionTests(unittest.TestCase):
             self.assertEqual(applied["state"], "applied")
             self.assertEqual(target.read_text(encoding="utf-8"), "after")
 
+    def test_a_write_never_reaches_through_a_hard_link(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            root = base / "project"
+            root.mkdir()
+            outside = base / "outside.txt"
+            outside.write_text("outside original", encoding="utf-8")
+            target = root / "linked.txt"
+            try:
+                os.link(outside, target)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"hard links unavailable: {exc}")
+            inside_twin = root / "twin.txt"
+            os.link(target, inside_twin)
+            transaction = FileTransaction(root)
+            # A refused (stale-baseline) transaction never severs the link.
+            with self.assertRaises(HarnessError):
+                transaction.apply([ChangePlan("linked.txt", "0" * 64, "stale edit")])
+            self.assertEqual(os.stat(target).st_nlink, 3)
+            applied = transaction.apply([ChangePlan("linked.txt", file_sha256(target), "agent edit")])
+            self.assertEqual(applied.get("hard_links_separated"), ["linked.txt"])
+            self.assertEqual(target.read_text(encoding="utf-8"), "agent edit")
+            self.assertEqual(outside.read_text(encoding="utf-8"), "outside original")
+            self.assertEqual(inside_twin.read_text(encoding="utf-8"), "outside original")
+            self.assertEqual(os.stat(target).st_nlink, 1)
+            transaction.rollback(str(applied["transaction_id"]))
+            self.assertEqual(target.read_text(encoding="utf-8"), "outside original")
+            self.assertEqual(outside.read_text(encoding="utf-8"), "outside original")
+            # Deleting a linked name removes only that name.
+            os.link(outside, root / "gone.txt")
+            transaction.apply([ChangePlan("gone.txt", file_sha256(root / "gone.txt"), None, delete=True)])
+            self.assertFalse((root / "gone.txt").exists())
+            self.assertEqual(outside.read_text(encoding="utf-8"), "outside original")
+
     def test_project_lock_excludes_another_process(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

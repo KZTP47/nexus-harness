@@ -4,6 +4,7 @@ import hashlib
 import difflib
 import json
 import os
+import shutil
 import stat
 import tempfile
 import time
@@ -150,6 +151,61 @@ def _same_snapshot(left: _FileSnapshot, right: _FileSnapshot) -> bool:
         and left.size == right.size
         and left.modified_ns == right.modified_ns
     )
+
+
+def _separate_hard_link(path: Path, expected_sha256: str | None = None) -> bool:
+    """Give a hard-linked target its own copy before it is rewritten.
+
+    Writes happen in place through an exclusive lease, so rewriting a file
+    that has other hard links would also change those links, possibly
+    outside the project. Replacing this one name with an identical private
+    copy first leaves every other link with its old content. It runs only
+    after the transaction's baseline check passed (a refused transaction
+    never severs a link) and the caller records it in the manifest.
+
+    The copy is made with ``shutil.copy2`` so content, permission bits and
+    timestamps are kept (on Windows CopyFile also keeps attributes and
+    alternate data streams). An explicit ACL on the original is NOT copied:
+    the new file gets the folder's inherited permissions, like any file an
+    editor saves by replace. Rollback restores the content through this
+    separate file; it does not re-create the hard link.
+    Returns True when a link was separated.
+    """
+
+    target = filesystem_path(path)
+    try:
+        before = os.stat(target, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISREG(before.st_mode) or int(getattr(before, "st_nlink", 1) or 1) <= 1:
+        return False
+    temporary = target.with_name(f".{target.name}.nexus-unlink-{uuid.uuid4().hex[:12]}.tmp")
+    try:
+        shutil.copy2(target, temporary)
+        copied = sha256_bytes(Path(temporary).read_bytes())
+        current = os.stat(target, follow_symlinks=False)
+        if (current.st_ino, current.st_size, current.st_mtime_ns) != (
+            before.st_ino, before.st_size, before.st_mtime_ns,
+        ) or sha256_bytes(target.read_bytes()) != copied or (
+            expected_sha256 is not None and copied != expected_sha256
+        ):
+            raise HarnessError(
+                f"Concurrent edit conflict while separating a hard-linked file: {target.name}"
+            )
+        with open(temporary, "rb+") as stream:
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+    except OSError as exc:
+        raise HarnessError(
+            f"Could not separate the hard-linked file {target.name} before writing it: {exc}"
+        ) from exc
+    finally:
+        try:
+            if os.path.lexists(temporary):
+                os.unlink(temporary)
+        except OSError:
+            pass
+    return True
 
 
 class _ExclusiveTarget:
@@ -508,10 +564,24 @@ class FileTransaction:
                         )
             txid = transaction_id or self.new_transaction_id()
             prepared, backup_root, manifest = self._prepare_locked(entries, txid)
+            prepared = list(prepared)
             attempted: set[str] = set()
             try:
                 for entry, _path, before in prepared:
                     self._assert_unchanged(entry.path, before, "replacement")
+                # A rewrite must never reach through a hard link to the
+                # file's other names (possibly outside the project). This
+                # runs only after every baseline check passed, so a refused
+                # transaction never severs a link. Deleting removes only this
+                # one name, so it needs no separation.
+                separated: list[str] = []
+                for index, (entry, path, before) in enumerate(prepared):
+                    if not entry.delete and _separate_hard_link(path, before.sha256):
+                        separated.append(entry.path)
+                        prepared[index] = (entry, path, _read_snapshot(path))
+                if separated:
+                    manifest["hard_links_separated"] = separated
+                    self._write_manifest(backup_root / "manifest.json", manifest)
                 with ExitStack() as stack:
                     leases = [
                         stack.enter_context(_ExclusiveTarget(path, before))
