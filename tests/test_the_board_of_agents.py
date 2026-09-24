@@ -3831,7 +3831,7 @@ removeDirectLongGoalOutbox("chat-two", "request-two", "a".repeat(64))
 
     def test_normal_send_confirms_explicit_project_work_and_labels_iterative_turns(self) -> None:
         self.assertIn("function looksLikeProjectWork(words)", self.script)
-        self.assertIn("function confirmProjectWork(agent, words, mode)", self.script)
+        self.assertIn("function confirmProjectWork(agent, words, mode, alreadyConfirmed = false)", self.script)
         self.assertIn("allow_project_changes: projectPermission.confirmed", self.script)
         self.assertIn('agent_discussion: "Team discussion"', self.script)
         self.assertIn('agent_plan_review: "Plan review"', self.script)
@@ -11219,6 +11219,7 @@ function swarmChatIsHydrating() { return false; }
 function isLoneAgentChat() { return false; }
 function syncChatTeamReadiness() { return []; }
 function confirmProjectWork() { return {allowed: true, confirmed: true}; }
+function askBeforeProjectWorkEarly() { return null; }
 function nextSwarmChatRevision() {}
 function setWhatCanBePressedInSwarm() {}
 function rememberSwarmChatComposer() {}
@@ -11367,8 +11368,9 @@ async function request(path, options = {}) {
 assert.equal(prepareDraft, words);
 // No saved access choice for this chat: since v0.2.28 the composer offers
 // Full project access (agents lead; the user restricts explicitly).
-// No mode was picked in this chat: the composer sends none (""), and the server applies its Full default.
-assert.deepEqual(events.find(event => event.kind === "prepare").body.policy, {agent_access_mode:"",execution_mode:"facilitator"});
+// No mode was picked in this chat: the composer omits the mode (an empty one
+// is rejected by the desktop outbox), and the server applies its Full default.
+assert.deepEqual(events.find(event => event.kind === "prepare").body.policy, {execution_mode:"facilitator"});
 assert.equal(startDraft, "", "draft must clear only after exact prepare receipt");
 assert.equal(box.value, "");
 assert.deepEqual(events.map((event) => event.kind), [

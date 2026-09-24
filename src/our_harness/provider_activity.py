@@ -15,6 +15,10 @@ CONTRACT = "public-provider-activity/v1"
 FINGERPRINT = hashlib.sha256(CONTRACT.encode()).hexdigest()
 TEXT_LIMIT = 24_000
 SUMMARY_CONTRACT = "codex-exec-public-reasoning-summary/v1"
+# Claude Code prints summarized thinking in its own interface; the same
+# summarized text from its stream is shown to the user here (never to agents).
+CLAUDE_THINKING_CONTRACT = "claude-code-summarized-thinking/v1"
+SUMMARY_CONTRACTS = frozenset({SUMMARY_CONTRACT, CLAUDE_THINKING_CONTRACT})
 
 
 class PublicStream:
@@ -143,7 +147,7 @@ class PublicStream:
                           "text": self.redactor.text(str(fields.get("text") or ""))[:8000],
                           "details": raw[:12000], "truncated": True})
             if kind == "reasoning_summary":
-                value["summary_contract"] = SUMMARY_CONTRACT
+                value["summary_contract"] = fields.get("summary_contract", SUMMARY_CONTRACT)
         else:
             value = json.loads(raw)
         key = identity + ":" + str(value.get("status", "message"))
@@ -229,8 +233,18 @@ class PublicStream:
             if not isinstance(block, dict):
                 continue
             block_type = block.get("type")
+            # Claude Code prints one assistant event per content block, all
+            # with the same message id and each block at index 0, so the line
+            # ordinal keeps two blocks of one message from colliding.
             if kind == "assistant" and block_type == "text":
-                self.text(f"{identity}-{index}", block.get("text"))
+                self.text(f"{identity}-{self.ordinal}-{index}", block.get("text"))
+            elif kind == "assistant" and block_type == "thinking" \
+                    and isinstance(block.get("thinking"), str) and block["thinking"].strip():
+                try:
+                    self.emit(f"{identity}-{self.ordinal}-{index}-thinking", "reasoning_summary",
+                              text=block["thinking"], summary_contract=CLAUDE_THINKING_CONTRACT)
+                except Exception:
+                    pass  # Optional display must never fail the provider turn.
             elif kind == "assistant" and block_type == "tool_use" and block.get("id"):
                 tool_id = str(block["id"])
                 name = str(block.get("name") or "provider_tool")

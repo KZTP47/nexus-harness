@@ -245,6 +245,15 @@ class _DPAPI:
         return self._crypt(base64.b64decode(value), True).decode()
 
 
+class _SignInRequired(HarnessError):
+    """The mailbox page is signed out; the saved browser profile needs a sign-in."""
+
+
+def _mailbox_sign_in_lapsed(error):
+    return bool(re.search(r'sign-?in (?:expired|changed|required)|signed out|identity is unavailable',
+                          str(error), re.IGNORECASE))
+
+
 class EmailStudio:
     def __init__(self, config, *, secret_store=None, provider_call=None, connectors=None, local_mail=None):
         self.config = config
@@ -911,8 +920,9 @@ class EmailStudio:
                 raise HarnessError('Reconnect this mailbox before checking for new mail.')
             try:
                 connection = self.local_mail.status(account['kind'], account['connector_id'])
-                if (connection.get('state') != 'connected'
-                        or connection.get('config_fingerprint') != account['connector_fingerprint']
+                if connection.get('state') != 'connected':
+                    raise _SignInRequired('The mailbox is signed out. Sign in again in the mailbox window; Nexus reconnects by itself.')
+                if (connection.get('config_fingerprint') != account['connector_fingerprint']
                         or connection.get('email', '').lower() != account['email'].lower()):
                     raise HarnessError('The mailbox session changed. Reconnect the same mailbox to continue.')
                 result = self.local_mail.adapter(account['kind']).sync(account['connector_id'], account.get('cursor', ''))
@@ -956,6 +966,8 @@ class EmailStudio:
                         self._put('failed_import', dict(id=_fingerprint(['failed-import', current['id'], current['fingerprint'], source_id]),
                                   account_id=current['id'], account_fingerprint=current['fingerprint'], source_id=source_id,
                                   error=str(failure.get('error', 'Message could not be imported.'))[:1000], checked_at=_now()))
+                    current.pop('session_state', None)
+                    current.pop('session_since', None)
                     current.update(cursor=result['cursor'], last_sync=_now(), connection_state='connected',
                                    error=' '.join(str(w) for w in result.get('warnings', []))[:1000],
                                    sync_has_more=bool(result.get('has_more')))
@@ -974,10 +986,14 @@ class EmailStudio:
                 return {'imported': len(result['messages']), 'has_more': bool(result.get('has_more'))}
             except Exception as exc:
                 error = str(exc)[:1000] if isinstance(exc, HarnessError) else 'Mailbox check failed. Reopen the connection and try again.'
+                signed_out = isinstance(exc, _SignInRequired) or _mailbox_sign_in_lapsed(error)
                 with self._mutation():
                     current = self._get('account', account['id'])
                     if current['fingerprint'] == account['fingerprint'] and current.get('connection_state') != 'disconnected':
                         current['error'] = error
+                        if signed_out:
+                            current.setdefault('session_since', _now())
+                            current['session_state'] = 'sign_in_required'
                         self._put('account', current)
                 raise HarnessError(error) from None
         if account['kind'] in ('outlook', 'gmail', 'emailengine'):

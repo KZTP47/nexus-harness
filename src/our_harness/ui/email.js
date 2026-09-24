@@ -743,7 +743,7 @@
       by('emailReconnect').hidden = !connectedKind || account?.kind === 'emailengine';
       by('emailDisconnect').hidden = !connectedKind || account?.connection_state === 'disconnected';
       by('emailAccountForm').hidden = connectedKind; by('emailOAuthAssistantSettings').hidden = !connectedKind;
-      by('emailConnectionStatus').textContent = !state.loaded ? 'Loading mailbox and assistant settings...' : account ? (account.name || account.email || 'Mailbox') + ' - ' + (connectedKind ? ({connected: 'Connected', reconnect_required: 'Reconnect required', disconnected: 'Disconnected'}[account.connection_state] || 'Checking connection') : account.kind === 'import' ? 'Imported mail; replies are exported' : 'Manual IMAP mailbox') + (account.error ? ': ' + account.error : '') : 'Choose Outlook or Gmail to begin, or expand manual setup to import mail.';
+      by('emailConnectionStatus').textContent = !state.loaded ? 'Loading mailbox and assistant settings...' : account ? (account.name || account.email || 'Mailbox') + ' - ' + (connectedKind ? (account.session_state === 'sign_in_required' ? 'Signed out - Nexus opened the sign-in and reconnects by itself' : {connected: 'Connected', reconnect_required: 'Reconnect required', disconnected: 'Disconnected'}[account.connection_state] || 'Checking connection') : account.kind === 'import' ? 'Imported mail; replies are exported' : 'Manual IMAP mailbox') + (account.error ? ': ' + account.error : '') : 'Choose Outlook or Gmail to begin, or expand manual setup to import mail.';
       for (const provider of ['outlook', 'gmail']) {
         const connector = oauth[provider] || {}; if (!state.registrationDirty.has(provider) && typeof connector.client_id === 'string') { by('emailClientId-' + provider).value = connector.client_id; if (provider === 'outlook') by('emailTenant').value = connector.tenant || 'common'; }
         const pending = (oauth.pending || []).filter(item => item.provider === provider).at(-1);
@@ -782,13 +782,27 @@
       const orchestration = s.orchestration || {}; by('emailEngineStatus').textContent = typeof orchestration === 'string' ? orchestration : [orchestration.status || orchestration.state || (orchestration.running ? 'Running' : orchestration.available ? 'Ready to start' : 'Not available'), orchestration.message || orchestration.detail || orchestration.error || ''].filter(Boolean).join(' — ');
       by('emailOperations').replaceChildren();
       const operationLabels = {generate: 'Creating draft', finalize: 'Processing approved reply', delivery: 'Checking delivery status', models: 'Refresh models', revise: 'Revising reply with AI', draft: 'Creating draft', sync: 'Checking inbox', approve: 'Resuming approved reply', engine: 'Starting Kestra', learning: 'Learning preferences', 'automatic-learning': 'Learning from saved revision', recovery: 'Checking interrupted workflow'};
+      for (const hold of s.sign_in_holds || []) {
+        // Held, not failed: the drafts start by themselves once the sign-in works.
+        const line = el('p', 'Waiting for ' + hold.label + ' sign-in - ' + hold.drafts + ' draft' + (hold.drafts === 1 ? '' : 's') + ' will be written automatically once it answers again.');
+        line.className = 'email-waiting'; by('emailOperations').append(line);
+      }
+      // One line per distinct problem, not one per email: the same failure on ten
+      // drafts is one thing to fix. A failure whose draft has since moved on is gone.
+      const draftStatus = new Map((s.drafts || []).map(d => [d.id, d.status]));
+      const grouped = new Map();
       for (const operation of s.operations || []) {
         if (!['running', 'failed'].includes(operation.state)) continue;
-        const prefix = String(operation.kind || operation.action || operation.id || '').split(':')[0];
+        const [prefix, subject] = String(operation.kind || operation.action || operation.id || '').split(':');
+        if (operation.state === 'failed' && ['generate', 'draft'].includes(prefix) && subject && draftStatus.has(subject) && draftStatus.get(subject) !== 'error') continue;
         const label = operationLabels[prefix] || 'Email workflow';
         const detail = operation.state === 'failed' ? 'Failed: ' + (operation.error || 'Check the workflow status and retry this action.') : 'In progress';
-        const line = el('p', label + ' - ' + detail);
-        if (operation.state === 'failed') line.className = 'email-error';
+        const key = label + ' - ' + detail;
+        grouped.set(key, {count: (grouped.get(key)?.count || 0) + 1, failed: operation.state === 'failed'});
+      }
+      for (const [text, entry] of grouped) {
+        const line = el('p', text + (entry.count > 1 ? ' (\u00d7' + entry.count + ')' : ''));
+        if (entry.failed) line.className = 'email-error';
         by('emailOperations').append(line);
       }
       const syncOperation = (s.operations || []).find(item => (item.id || item.kind) === 'sync:' + state.account);
@@ -944,7 +958,7 @@
   if (host.document) {
     let studio; let watcher = null;
     const ensure = () => { const root = host.document.getElementById('emailView'); if (!studio) studio = createEmailStudio(root, (path, options) => request(path, options)); return studio; };
-    const openFromNotice = async target => { if (typeof host.switchView === 'function') host.switchView('email', {userInitiated: true}); return ensure().open(target); };
+    const openFromNotice = async target => { if (!target?.account_id) return; /* a sign-in card: the window is focused and the banner shows it */ if (typeof host.switchView === 'function') host.switchView('email', {userInitiated: true}); return ensure().open(target); };
     host.nexusEmail = {
       refresh() { return ensure().refresh(); },
       open: openFromNotice,

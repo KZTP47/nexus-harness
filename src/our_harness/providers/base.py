@@ -2080,6 +2080,12 @@ def collect_stream(
 
 
 def create_provider(config: LoadedConfig) -> Provider:
+    from ..session_health import observe_provider
+
+    return observe_provider(_create_provider(config), str(config.get("provider.name") or ""))
+
+
+def _create_provider(config: LoadedConfig) -> Provider:
     name = config.get("provider.name")
     if name in {"openai", "openai-compatible"}:
         return OpenAIProvider(config)

@@ -6983,6 +6983,10 @@ async function boot() {
     // New-mail corner notifications work from every tab, not only once the
     // Email view has been opened.
     window.nexusEmail?.watch?.();
+    // Sign-in problems (AI and mailbox) are shown on every tab once the
+    // session token exists; the script may load just after this line.
+    window.nexusSessionBannerWanted = true;
+    window.nexusSessionHealth?.start?.();
     template = migrateGraph(value.template);
     graph = structuredClone(template);
     catalog = await request("/api/catalog");
@@ -7567,6 +7571,14 @@ async function refreshChatGoalAfterAction(agentId, goal, chatKey) {
   await refreshLongGoals(true);
 }
 
+// Ask before the durable goal inventory is read: that read can take a while
+// and the question only depends on local state. Returns null when no early
+// question applies (not project work, or this chat already shows a goal).
+function askBeforeProjectWorkEarly(agentId, agent, words, mode) {
+  if (mode !== "work" || !words || chatLongGoalContext(agentId).goal) return null;
+  return confirmProjectWork(agent, words, mode);
+}
+
 async function sendToActiveChatGoal(agentId, box) {
   const conversation = activeConversationFor(agentId);
   if (!conversation?.id) return {handled: false};
@@ -7857,7 +7869,10 @@ function chatCollaborationPreference(conversation, settings = null) {
 
 function chatProjectPolicy(conversation, accessMode) {
   const settings = chatCollaborationPreference(conversation);
-  return {agent_access_mode: accessMode, execution_mode: chatExecutionPreference(conversation),
+  // No saved choice means the user kept the displayed default. Leave the mode
+  // out so the server applies (and records) its own default access mode.
+  return {...(accessMode ? {agent_access_mode: accessMode} : {}),
+    execution_mode: chatExecutionPreference(conversation),
     ...(Object.keys(settings).length ? {collaboration: settings} : {})};
 }
 
@@ -8681,7 +8696,7 @@ function syncChatRecipientWords(agentId, card = null) {
       team.setAttribute("aria-label", words.team);
     }
     if (help) help.textContent = words.help
-      + " Project-file work always asks for confirmation.";
+      + " With Full project access, project-file work starts without asking again.";
   }
   return words;
 }
@@ -10836,9 +10851,63 @@ function activityWords(activity) {
   return seconds ? `Working for ${seconds}s` : "Working now";
 }
 
+// One short, plain line per live provider event: what the agent is thinking,
+// running, editing or saying right now. Allow-listed server rows only.
+function liveActivityLine(row) {
+  const parsed = (value) => { try { return JSON.parse(value || "{}"); } catch (_) { return {}; } };
+  const clip = (value, size = 220) => {
+    const words = String(value || "").replace(/\s+/g, " ").trim();
+    return words.length > size ? `${words.slice(0, size - 1)}…` : words;
+  };
+  if (row.kind === "reasoning_summary") return {icon: "💭", text: `Thinking: ${clip(row.text, 300)}`};
+  if (row.kind === "message") return {icon: "💬", text: clip(row.text, 300)};
+  if (row.kind === "notice") return {icon: "⚠", text: clip(row.text)};
+  if (row.kind !== "tool") return null;
+  const args = parsed(row.arguments);
+  const result = parsed(row.result);
+  const failed = row.status === "failed";
+  const running = row.status === "requested";
+  const command = Array.isArray(args.command) ? args.command.join(" ") : args.command;
+  const files = Array.isArray(args.changes)
+    ? args.changes.map((one) => String(one?.path || "").split(/[\\/]/).pop()).filter(Boolean) : [];
+  if (command) {
+    const exit = Number.isInteger(result.exit_code) && result.exit_code !== 0 ? ` (exit ${result.exit_code})` : "";
+    return {icon: failed ? "✗" : running ? "▶" : "✓", text: `${running ? "Running" : failed ? "Failed" : "Ran"} ${clip(command, 160)}${exit}`};
+  }
+  if (files.length) return {icon: "✎", text: `${running ? "Editing" : "Edited"} ${clip(files.join(", "), 160)}`};
+  if (args.query) return {icon: "🔎", text: `Searching the web: ${clip(args.query, 160)}`};
+  const name = String(row.name || "tool").replace(/_/g, " ");
+  const target = args.file_path || args.path || args.pattern || args.url || args.description || "";
+  return {icon: failed ? "✗" : running ? "▶" : "✓", text: `${running ? "Using" : failed ? "Failed" : "Used"} ${name}${target ? `: ${clip(target, 140)}` : ""}`};
+}
+
+function showLiveActivityFeed(panel, activity) {
+  let feed = panel.querySelector(".chat-activity-feed");
+  const rows = (activity.liveActivity || []).map((row) => ({row, line: liveActivityLine(row)}))
+    .filter((one) => one.line).slice(-8);
+  if (!rows.length) { if (feed) feed.hidden = true; return; }
+  if (!feed) {
+    feed = make("ol", "chat-activity-feed");
+    feed.setAttribute("aria-label", "What the agents are doing right now");
+    feed.setAttribute("aria-live", "polite");
+    panel.append(feed);
+  }
+  feed.hidden = false;
+  const agents = theSwarmBoard().agents || [];
+  feed.replaceChildren(...rows.map(({row, line}) => {
+    const item = make("li", `chat-activity-line chat-activity-${row.status || row.kind || "event"}`);
+    const who = agents.find((one) => String(one.who || "") === String(row.route || ""));
+    item.append(make("span", "chat-activity-icon", line.icon));
+    if (who?.name) item.append(make("strong", "chat-activity-who", who.name));
+    item.append(make("span", "chat-activity-text", line.text));
+    return item;
+  }));
+}
+
 function showActivityInPanel(panel, activity) {
   panel.hidden = !activity;
   if (!activity) return;
+  showLiveActivityFeed(panel, activity);
   const elapsed = activityWords(activity);
   const snapshot = JSON.stringify([activity.state, activity.stage, activity.detail, elapsed]);
   if (panel.dataset.activitySnapshot === snapshot) return;
@@ -11042,6 +11111,7 @@ async function pollSwarmChatActivity(agentId, chatKey, activityId) {
       still.remoteTurns = turns;
       renderTurnsThatArrived(agentId, chatKey);
     }
+    if (Array.isArray(update.provider_activity)) still.liveActivity = update.provider_activity;
     if (["complete", "error", "stopped"].includes(String(update.state || ""))) {
       settleSwarmChatActivityFromFeed(agentId, still, update);
       return;
@@ -15072,7 +15142,10 @@ function aReasoningSummaryRow(speaker, summary, className) {
   const details = make("details", "chat-tool-activity");
   details.open = expandedChatToolActivity.has(summary.eventId);
   const heading = make("summary", "chat-tool-heading");
-  heading.append(make("span", "chat-tool-speaker", speaker), make("strong", "chat-tool-name", "Reasoning summary"));
+  heading.append(make("span", "chat-tool-speaker", speaker), make("strong", "chat-tool-name", "Thinking"));
+  // The gist is readable without opening the row; the full text is inside.
+  const gist = String(summary.text || "").split(" ").filter(Boolean).join(" ");
+  if (gist) heading.append(make("span", "chat-tool-target chat-reasoning-preview", gist.length > 180 ? `${gist.slice(0, 179)}…` : gist));
   const body = make("div", "chat-tool-body");
   body.append(make("p", "hint", "Public provider summary · visible only to you · not a complete record of internal reasoning."));
   body.append(make("pre", "chat-tool-output", summary.text));
@@ -15119,7 +15192,10 @@ function aChatToolActivityRow(speaker, activity, at, className) {
     call_mcp_tool: "Call configured MCP tool",
     run_selected_verification: "Run verification", read_proposed_change: "Read proposed changes",
     read_shared_conversation: "Read earlier conversation"})[activity.name] || activity.name.replaceAll("_", " ");
-  const target = activity.arguments?.path || activity.arguments?.query || activity.arguments?.command || "";
+  const edited = Array.isArray(activity.arguments?.changes)
+    ? activity.arguments.changes.map((one) => String(one?.path || "").split(/[\\/]/).pop()).filter(Boolean).join(", ") : "";
+  const command = Array.isArray(activity.arguments?.command) ? activity.arguments.command.join(" ") : activity.arguments?.command;
+  const target = activity.arguments?.path || activity.arguments?.file_path || activity.arguments?.query || command || edited || "";
   heading.append(make("span", "chat-tool-speaker", speaker));
   heading.append(make("strong", "chat-tool-name", name));
   if (target) heading.append(make("span", "chat-tool-target", String(target)));
@@ -15938,7 +16014,7 @@ async function startAndReconcileDirectLongGoalAdmission(expected, payloadSha256)
   return {...started, goal: reconciled.goal, terminal_state: "reconciled"};
 }
 
-function confirmProjectWork(agent, words, mode) {
+function confirmProjectWork(agent, words, mode, alreadyConfirmed = false) {
   const needsConfirmation = mode === "work" || (mode === "auto" && looksLikeProjectWork(words));
   if (!needsConfirmation) return {allowed: true, confirmed: false};
   if (!directLongGoalRecoveryInventoryReady || directLongGoalRecoveryError) {
@@ -15974,7 +16050,12 @@ function confirmProjectWork(agent, words, mode) {
     if (theBigOne === agent?.id) $("theBigChatSaidBack").textContent = message;
     return {allowed: false, confirmed: false};
   }
+  if (alreadyConfirmed) return {allowed: true, confirmed: true};
   const conversation = activeConversationFor(agent?.id);
+  // Full project access (chosen, or the default kept) is the user's standing
+  // permission for file work in this chat; asking again for every task only
+  // gets in the way. Ask and Read only still confirm each project-file task.
+  if ((chatComposerAccessPreference(conversation) || "full") === "full") return {allowed: true, confirmed: true};
   const project = (conversation?.projects || []).find(
     (one) => one.id === conversation?.project
   );
@@ -16255,6 +16336,9 @@ async function sendWhatIsTypedTo(agentId) {
     sayInTheChatFor(agentId, "Wait for the attached files to finish loading before sending.");
     return;
   }
+  const earlyPermission = (confirmedPermission || goalQueueItem)
+    ? null : askBeforeProjectWorkEarly(agentId, agent, words, mode);
+  if (earlyPermission && !earlyPermission.allowed) return;
   if (!goalQueueItem) {
     const teamMessage = await sendToActiveChatGoal(agentId, box);
     if (teamMessage.handled) return teamMessage.result;
@@ -16277,7 +16361,8 @@ async function sendWhatIsTypedTo(agentId) {
       return;
     }
   }
-  const projectPermission = confirmedPermission || confirmProjectWork(agent, words, mode);
+  const projectPermission = confirmedPermission
+    || confirmProjectWork(agent, words, mode, Boolean(earlyPermission?.allowed));
   if (!projectPermission.allowed) return;
   const recoveryKey = requestChatKey;
   // The lease belongs to this immutable saved-chat identity. The selected
@@ -20507,6 +20592,8 @@ async function sendFromTheBigChat(mode = "chat") {
     $("theBigChatSaidBack").textContent = "Wait for the attached files to finish loading before sending.";
     return;
   }
+  const earlyPermission = askBeforeProjectWorkEarly(agentId, agent, said, mode);
+  if (earlyPermission && !earlyPermission.allowed) return;
   const teamMessage = await sendToActiveChatGoal(agentId, box);
   if (teamMessage.handled) return teamMessage.result;
   if (!said && mode === "chat" && (swarmChatAttachments.get(recoveryKey) || []).length) {
@@ -20527,7 +20614,7 @@ async function sendFromTheBigChat(mode = "chat") {
       return;
     }
   }
-  const projectPermission = confirmProjectWork(agent, said, mode);
+  const projectPermission = confirmProjectWork(agent, said, mode, Boolean(earlyPermission?.allowed));
   if (!projectPermission.allowed) return;
   swarmBusy.add(runtimeKey);
   swarmStopping.delete(runtimeKey);

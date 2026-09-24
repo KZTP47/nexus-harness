@@ -45,11 +45,11 @@ class PublicStreamTests(unittest.TestCase):
         self.assertEqual(rows[1]["status"], "failed")
         self.assertNotIn("PRIVATE_SENTINEL", repr(rows))
 
-    def test_claude_tools_and_public_text_exclude_thinking_and_images(self):
+    def test_claude_tools_and_public_text_exclude_redacted_thinking_and_images(self):
         rows = []
         stream = PublicStream("claude", rows.append, CredentialRedactor())
         stream.feed(encoded({"type": "assistant", "message": {"id": "a", "content": [
-            {"type": "thinking", "thinking": "PRIVATE"}, {"type": "text", "text": "Reading files"},
+            {"type": "redacted_thinking", "data": "PRIVATE"}, {"type": "text", "text": "Reading files"},
             {"type": "tool_use", "id": "tool-a", "name": "Read", "input": {"file_path": "other/root.txt"}}]}}))
         stream.feed(encoded({"type": "user", "message": {"content": [
             {"type": "tool_result", "tool_use_id": "tool-a", "content": [

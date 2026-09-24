@@ -133,6 +133,64 @@ rounds, until no high or medium finding remained.
   a crashed or never-loaded pop-up is replaced, clicks are tied to the project that raised them.
 - Drafting UI: the text shown is exactly the text sent; unsaved edits are never overwritten.
 
+## 2026-09-24: background session health (sign-ins look after themselves)
+
+Owner request: sessions are checked in the background, re-established automatically, announced
+loudly, and the user can take over; red errors and blockers should almost never appear.
+
+- **`session_health.SessionHealthMonitor`** (started by `serve_ui` only) watches every configured
+  CLI route (Claude, Codex, Gemini, Copilot), grouped per CLI installation. Two signals: the CLI's own
+  status command every 3 minutes (no model turn), and the outcome of every real request, reported by
+  `providers.create_provider`. `claude auth status` reports "logged in" with an expired OAuth token,
+  so an incident is only closed by a request that really works (a tiny check on a 20 s to 5 min back-off).
+- **Automatic recovery.** On an incident the provider's own sign-in window opens once (again after 30
+  min if still open). "I'll handle it" per session, or the global setting *Open sign-in windows for me
+  automatically* (saved next to the runtime data), turns that off. When the route answers again the
+  24-hour "would not answer" notes are cleared, board readiness is re-read, failed mail drafts on that
+  route are retried, and goals paused only because required provider work failed are resumed.
+- **Mail.** Automatic drafts wait (queued, shown as "Waiting for Claude sign-in") instead of each
+  failing. A signed-out browser mailbox is recorded as `session_state: sign_in_required` (it used to stay
+  "connected" and retry at full rate); its sign-in window is reopened with the saved profile, checks
+  back off to 90 s, and the next good check resumes it. Repeated identical failure rows are grouped and
+  rows for drafts that have since moved on disappear.
+- **Loud.** `/api/session-health` feeds an alert banner under the top bar on every tab (Open sign-in,
+  Check now, I'll handle it) and the desktop corner card.
+- **Saved chats no longer freeze on CLI updates.** A chat saved before route identities existed, whose
+  whole saved profile still matches, continues when only the resolved executable changed (Codex's
+  versioned install path) and records its identity. A missing program or a real profile change still
+  asks for review.
+- **Full project access means it.** With Full project access, "Work together on project files" no
+  longer asks for confirmation; Ask and Read only still confirm.
+
+## 2026-09-24: why team goals felt slow, measured
+
+Goal "are you guys here? greet each other, then make a 3JS game" (GPT Codex gpt-5.5 + Claude2):
+
+| Step | Time |
+|---|---|
+| Codex call 1 (greeting + one Nexus tool request) | 253 s |
+| Codex call 2 (after that one tool result) | stalled; hit the 600 s limit, task blocked |
+| Claude2 waited for both (Work Together claims one task at a time) | ~14 min |
+| Claude2 calls | 18 s, 23 s |
+
+The same prompt, 28 KB schema and flags replayed outside the goal, and through Nexus's own process
+runner, answered in 10.7-14.8 s (five runs). The schema costs about 2.5 s; Nexus's per-call checks about
+1.1 s. Both slow calls went silent right after `turn.started`, while Codex's own chatgpt.com connection was
+resetting: a service-side stall, amplified by Nexus waiting it out and by one full new Codex process per
+Nexus tool request.
+
+Fixed:
+- **Stall watchdog** (`codex_cli._StallWatch`, `STALL_RETRY_SECONDS = (120, 240)`): a turn that has shown
+  nothing beyond `thread.started`/`turn.started` and started no command, edit or other item is stopped and
+  retried (no work can be lost), then once more with a longer limit, then without one, all inside the
+  request deadline. The waiting card restarts its clock for the fresh attempt.
+- **Native tools first.** With Full access (native "work") the Codex prompt no longer says to use Nexus
+  tool requests "whenever the schema supports them", which contradicted the native instructions. Replayed,
+  Codex then built and browser-tested the game itself inside one turn instead of one turn per file read.
+
+Not changed: Work Together still runs one participant's turn at a time in the shared project folder
+(parallel turns would edit the same files concurrently).
+
 ## Open: known, not fixed
 
 - A protection that names no path ("don't touch the CI workflow") protects nothing; name the folder

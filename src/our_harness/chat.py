@@ -40,6 +40,7 @@ import time
 import uuid
 from .filesystem_paths import filesystem_path
 from urllib.parse import urlsplit
+import contextvars
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -2907,6 +2908,7 @@ def _ask_and_keep(
             conversation_key or _filed_under(filed_as or route)
         ),
         prefer_existing_conversation=bool(prefer_existing_conversation),
+        on_public_activity=_ambient_activity(route),
     )
     started = time.monotonic()
     try:
@@ -3012,6 +3014,35 @@ def _ask_and_keep(
     }
 
 
+# Live public activity for whatever request this thread (or a worker it
+# started through cancellation.submit, which copies the context) is serving.
+# A board chat sets it once; every provider call made while answering that
+# chat then streams its allow-listed thinking summaries, tool calls, edits and
+# interim messages to the chat, without each engine passing a sink along.
+_AMBIENT_ACTIVITY: contextvars.ContextVar[Callable[[dict[str, Any]], None] | None] = (
+    contextvars.ContextVar("nexus_ambient_public_activity", default=None)
+)
+
+
+@contextmanager
+def streaming_public_activity(sink: Callable[[dict[str, Any]], None] | None):
+    token = _AMBIENT_ACTIVITY.set(sink)
+    try:
+        yield
+    finally:
+        _AMBIENT_ACTIVITY.reset(token)
+
+
+def _ambient_activity(route: str) -> Callable[[dict[str, Any]], None] | None:
+    sink = _AMBIENT_ACTIVITY.get()
+    if sink is None:
+        return None
+
+    def forward(event: dict[str, Any]) -> None:
+        sink({**event, "route": str(route or "")})
+    return forward
+
+
 def ask_once(
     config: LoadedConfig,
     route: str,
@@ -3039,6 +3070,8 @@ def ask_once(
     known_problem = _known_route_setup_problem(config, named)
     if known_problem:
         raise ChatError(known_problem)
+    if on_public_activity is None and public_activity_factory is None:
+        on_public_activity = _ambient_activity(named)
     try:
         if named.startswith("web:"):
             from . import web_chats

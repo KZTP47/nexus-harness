@@ -305,8 +305,8 @@ def keep_page(
                 row.correlation["kind"] = "long_horizon_provider_activity"
                 row.correlation["provider_activity_id"] = message["activity_id"]
                 if provider_activity.get("kind") == "reasoning_summary":
-                    from .provider_activity import SUMMARY_CONTRACT
-                    if provider_activity.get("summary_contract") != SUMMARY_CONTRACT:
+                    from .provider_activity import SUMMARY_CONTRACTS
+                    if provider_activity.get("summary_contract") not in SUMMARY_CONTRACTS:
                         raise chat.ChatError("Unsupported public reasoning summary")
                     row.phase = "reasoning_summary"
                 if provider_activity.get("kind") == "notice":

@@ -1222,8 +1222,8 @@
               aria-label="Attach files or screenshots to this chat"
               accept="image/*,.zip,.docx,.txt,.md,.json,.yaml,.yml,.toml,.ini,.csv,.py,.js,.ts,.tsx,.jsx,.css,.html,.xml">
             <p id="theBigChatScopeHint" class="hint chat-auto-hint">Ask the selected agent only sends
-              to one assistant. Ask connected agents is the explicit team action. Project-file work always
-              asks for confirmation.</p>
+              to one assistant. Ask connected agents is the explicit team action. With Full project access,
+              project-file work starts without asking again.</p>
             <section id="theBigChatTeamReadiness" class="chat-team-readiness" hidden
               aria-live="polite" aria-label="Team connection readiness"></section>
             <div class="button-row the-big-chat-send-actions">
@@ -1929,5 +1929,6 @@
   <main id="emailView" data-view-panel="email" class="data-view email-workspace" hidden tabindex="-1" aria-label="Email assistant"></main>
   <script src="/email.js"></script>
   <script src="/app.js"></script>
+  <script src="/session-health.js"></script>
 </body>
 </html>

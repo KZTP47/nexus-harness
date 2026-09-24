@@ -25,11 +25,19 @@ class ReasoningSummaryTests(unittest.TestCase):
         self.assertEqual(rows[0]["kind"], "reasoning_summary")
         self.assertEqual(rows[0]["summary_contract"], SUMMARY_CONTRACT)
         self.assertNotIn("PRIVATE", repr(rows))
-        claude = PublicStream("claude", rows.append, CredentialRedactor())
-        claude.feed(encoded({"type": "assistant", "message": {"content": [
-            {"type": "thinking", "thinking": "PRIVATE"}, {"type": "redacted_thinking", "data": "PRIVATE"}]}}))
-        claude.finish()
-        self.assertEqual(len(rows), 1)
+        # Claude Code shows its summarized thinking to the user; the same text
+        # is shown here. Redacted (encrypted) thinking never is.
+        from our_harness.provider_activity import CLAUDE_THINKING_CONTRACT
+        with mock.patch.object(summary_observer, "offer", side_effect=lambda sink, value: sink(value)):
+            claude = PublicStream("claude", rows.append, CredentialRedactor())
+            claude.feed(encoded({"type": "assistant", "message": {"content": [
+                {"type": "thinking", "thinking": "Checking the API first."},
+                {"type": "redacted_thinking", "data": "PRIVATE"}]}}))
+            claude.finish()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[1]["kind"], "reasoning_summary")
+        self.assertEqual(rows[1]["summary_contract"], CLAUDE_THINKING_CONTRACT)
+        self.assertNotIn("PRIVATE", repr(rows))
 
     def test_summary_is_not_included_in_ordinary_chat_history(self):
         messages = chat._project_chat_history([

@@ -269,6 +269,30 @@ def _a_name_for_a_local_route(server: str, model: str) -> str:
 _CHAT_ACTIVITY_ID = re.compile(r"^[A-Za-z0-9_-]{8,80}$")
 
 
+def _public_activity_row(event: dict[str, Any]) -> dict[str, Any]:
+    """The bounded part of one PublicStream event that a chat page shows."""
+
+    def text(value: object, limit: int) -> str:
+        return str(value if value is not None else "")[:limit]
+    row = {
+        "id": text(event.get("id"), 200),
+        "kind": text(event.get("kind"), 40),
+        "status": text(event.get("status"), 40),
+        "name": text(event.get("name"), 120),
+        "route": text(event.get("route"), 100),
+        "provider": text(event.get("provider"), 40),
+        "text": text(event.get("text"), 4000),
+    }
+    for key in ("arguments", "result"):
+        value = event.get(key)
+        if value not in (None, "", {}, []):
+            try:
+                row[key] = json.dumps(value, ensure_ascii=False, default=str)[:2000]
+            except (TypeError, ValueError):
+                row[key] = text(value, 2000)
+    return row
+
+
 class ChatActivities:
     """Small process-local progress feed for long board-chat requests."""
 
@@ -331,6 +355,33 @@ class ChatActivities:
             previous["turns"] = [*previous.get("turns", []), kept][-16:]
             self.records[wanted] = previous
 
+    # Live, allow-listed provider activity (thinking summaries, tool calls,
+    # file edits, interim messages). Bounded per chat and per event; a newer
+    # state of the same item replaces the older one.
+    ACTIVITY_KEEP = 60
+
+    def add_activity(self, activity_id: object, event: object) -> None:
+        wanted = self._id(activity_id)
+        if not wanted or not isinstance(event, dict):
+            return
+        kept = _public_activity_row(event)
+        now = time.time()
+        with self.lock:
+            previous = self.records.get(wanted, {})
+            previous["activity"] = wanted
+            previous.setdefault("state", "working")
+            previous.setdefault("stage", "Agents are working")
+            previous.setdefault("detail", "Live activity from the agents appears below.")
+            previous.setdefault("started_at", now)
+            previous["updated_at"] = now
+            rows = [one for one in previous.get("provider_activity", [])
+                    if one.get("id") != kept["id"] or not kept["id"]]
+            kept["at"] = now
+            previous["provider_activity"] = [*rows, kept][-self.ACTIVITY_KEEP:]
+            self.records[wanted] = previous
+            while len(self.records) > self.limit:
+                self.records.pop(next(iter(self.records)))
+
     def read(self, activity_id: object) -> dict[str, Any]:
         wanted = self._id(activity_id)
         if not wanted:
@@ -361,6 +412,14 @@ class HarnessHTTPServer(ThreadingHTTPServer):
         self.started_id = secrets.token_urlsafe(8)
         from .email_service import EmailService
         self.email = EmailService(self)
+        from .session_health import SessionHealthMonitor
+        # Watches every configured CLI sign-in. Constructed for every server so
+        # the UI can always read it; only serve_ui starts its background work.
+        self.session_health = SessionHealthMonitor(
+            lambda: self.config,
+            settings_path=swarm_runs._base().parent / "session-health.json",
+        )
+        self.session_health.on_recovered(self._session_recovered)
         self.events = EventBus(redactor=CredentialRedactor(config))
         self._swarm_runs: swarm_runs.SwarmRunStore | None = None
         self._swarm_communication_runs: swarm_runs.SwarmRunStore | None = None
@@ -2985,7 +3044,60 @@ class HarnessHTTPServer(ThreadingHTTPServer):
         root = self._board_project_path(board, project_id)
         return self.require_no_long_horizon_path(root)
 
+    def _session_recovered(self, routes: list[str]) -> None:
+        """A sign-in works again: forget the refusals and let waiting work go."""
+
+        for route in routes:
+            chat_lab._write_down_that_it_would_not(self.config, route, "")
+        with self.authority_lock:
+            # Readiness is re-read on the next board refresh.
+            self._swarm_known_routes_revision = 0
+        try:
+            self.email.provider_recovered(routes)
+        finally:
+            self._resume_provider_paused_goals(routes)
+
+    def _resume_provider_paused_goals(self, routes: list[str]) -> list[str]:
+        """Resume goals that paused only because one of these routes failed.
+
+        The same resume the goal card's Resume button performs, for goals whose
+        pause note says required provider work failed and whose team uses one
+        of the routes that works again. Anything else stays for the user.
+        """
+
+        wanted = set(routes)
+        resumed: list[str] = []
+        try:
+            goals = self.long_horizon.store.list(100)
+        except Exception:
+            return resumed
+        for goal in goals:
+            if goal.get("status") != "paused" or not str(goal.get("note") or "").startswith(
+                    "Required provider work failed"):
+                continue
+            if not wanted & {str(one.get("who") or one.get("route") or "") for one in goal.get("agents") or []}:
+                continue
+            goal_id = str(goal.get("goal_id") or "")
+            try:
+                self.require_project_execution_authority(Path(str(goal.get("project", {}).get("path") or "")))
+                with self.project_admission_lock, self.swarm_lock:
+                    runtime = self.long_horizon
+                    if goal.get("require_all_participants") is True:
+                        projects = self.swarm_standing().get("board", {}).get("projects", [])
+                        selected = next((one for one in projects if isinstance(one, dict)
+                                         and one.get("id") == goal.get("project", {}).get("id")), None)
+                        if selected is None:
+                            continue
+                        runtime.resume(goal_id, project_verification_settings=selected)
+                    else:
+                        runtime.resume(goal_id)
+                resumed.append(goal_id)
+            except Exception:
+                continue
+        return resumed
+
     def server_close(self) -> None:
+        self.session_health.close()
         self.email.close()
         with self._long_horizon_lifecycle_lock:
             with self.authority_lock:
@@ -3815,11 +3927,22 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 self._static("app.js", "text/javascript; charset=utf-8")
             elif parsed.path == "/email.js":
                 self._static("email.js", "text/javascript; charset=utf-8")
+            elif parsed.path == "/session-health.js":
+                self._static("session-health.js", "text/javascript; charset=utf-8")
             elif parsed.path == "/email.css":
                 self._static("email.css", "text/css; charset=utf-8")
             elif parsed.path == "/api/email":
                 self._require_token()
                 self._json(self.server.email.snapshot())
+            elif parsed.path == "/api/session-health":
+                # In-memory; every open page polls it to show sign-in problems.
+                self._require_token()
+                query = urllib.parse.parse_qs(parsed.query)
+                try:
+                    after = int(query["after"][0]) if "after" in query else None
+                except ValueError:
+                    after = None
+                self._json(self.server.session_health.snapshot(after))
             elif parsed.path == "/api/email/notifications":
                 # Cheap in-memory read that every open page polls, whatever
                 # tab it shows; it never opens or creates the mail store.
@@ -3955,6 +4078,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     stage = "Starting the request"
                     detail = "Nexus is preparing the agent connection."
                     turns = []
+                    live_rows: dict[str, dict[str, Any]] = {}
                     for event in projection["events"]:
                         payload = event.get("payload")
                         if event.get("kind") == "progress" and isinstance(payload, dict):
@@ -3962,6 +4086,14 @@ class HarnessHandler(BaseHTTPRequestHandler):
                             detail = str(payload.get("detail") or detail)
                         elif event.get("kind") == "agent_turn" and isinstance(payload, dict):
                             turns.append(payload)
+                        elif event.get("kind") == "provider_activity" and isinstance(payload, dict):
+                            key = str(payload.get("id") or len(live_rows))
+                            live_rows.pop(key, None)
+                            live_rows[key] = payload
+                    if not live_rows:
+                        # Rows recorded before the durable run existed.
+                        live_rows = {str(i): one for i, one in enumerate(
+                            self.server.chat_activities.read(identity).get("provider_activity", []))}
                     state = {
                         "accepted": "waiting", "running": "working",
                         "stopping": "stopping", "complete": "complete",
@@ -3970,6 +4102,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     projection.update({
                         "activity": identity, "state": state,
                         "stage": stage, "detail": detail, "turns": turns,
+                        "provider_activity": list(live_rows.values())[-ChatActivities.ACTIVITY_KEEP:],
                     })
                     self._json(projection)
                 except (HarnessError, ValueError):
@@ -5547,6 +5680,17 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     activity.add_turn(activity_id, turn)
                     if run_id and run_store is not None:
                         run_store.event(run_id, "agent_turn", turn)
+
+                def live_provider_activity(event):
+                    # Runs on a provider's observer thread; never raises.
+                    try:
+                        activity.add_activity(activity_id, event)
+                        if run_id and run_store is not None:
+                            run_store.event(run_id, "provider_activity", _public_activity_row(event))
+                    except Exception:
+                        pass
+                activity_scope = chat_lab.streaming_public_activity(
+                    live_provider_activity if activity_id else None)
                 agent_id = str(body.get("agent") or "")
                 chat_id = str(body.get("chat") or "")
                 chat_key = chat_id or agent_id
@@ -5644,6 +5788,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                         raise cleanup_error
 
                 try:
+                    activity_scope.__enter__()
                     # Validate every message before accepting a durable run or
                     # taking a conversation lease. Reusing this checked value
                     # also keeps auto-routed file work from becoming the
@@ -6186,6 +6331,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                         ) from exc
                     raise
                 finally:
+                    activity_scope.__exit__(None, None, None)
                     release_chat_ownership()
                     if response_to_deliver is not None:
                         # Socket delivery is deliberately outside the execution
@@ -6246,6 +6392,23 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     "needs_your_say": done.needs_your_say,
                     **connection,
                 })
+            elif self.path == "/api/session-health":
+                monitor = self.server.session_health
+                action = str(body.get("action") or "")
+                key = str(body.get("session") or "")[:200]
+                if action == "open_sign_in":
+                    self._json(monitor.open_sign_in(key))
+                elif action == "check_now":
+                    monitor.check_now(key)
+                    self._json({"checking": True})
+                elif action == "manual":
+                    monitor.manual(key, bool(body.get("manual", True)))
+                    self._json(monitor.snapshot())
+                elif action == "settings":
+                    monitor.save_settings(body)
+                    self._json(monitor.snapshot())
+                else:
+                    raise HarnessError("Unknown session action.")
             elif self.path == "/api/team/login":
                 # This is intentionally a separate, explicit press from adding
                 # a route. Connecting settings must never pop up an account
@@ -7609,6 +7772,7 @@ def serve_ui(
     if not 0 <= port <= 65535:
         raise HarnessError("The UI port must be between 0 and 65535")
     server = HarnessHTTPServer((host, port), config)
+    server.session_health.start()
     url = loopback_url(host, server.server_port) + "/"
     print(f"Harness UI: {url}")
     # A desktop shell reads this exact line to find the port it was given.

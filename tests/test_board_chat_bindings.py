@@ -356,9 +356,11 @@ class BoardChatBindingTests(unittest.TestCase):
 
         changed = {
             one["agent_id"]: one["kind"]
-            for one in protected["binding_problem"]["changed_agents"]
+            for one in (protected["binding_problem"] or {}).get("changed_agents", [])
         }
-        self.assertEqual(changed["agent-2"], "effective_dispatch_changed")
+        # The peer's saved profile is unchanged and its program resolves:
+        # like any CLI update, that no longer freezes the chat.
+        self.assertNotIn("agent-2", changed)
         self.assertEqual(
             protected["binding"]["agent_routes"]["agent-1"][
                 "transport_contract"
@@ -614,7 +616,10 @@ class BoardChatBindingTests(unittest.TestCase):
             ],
         )
 
-    def test_pre_identity_executable_drift_is_fenced_but_reviewable(self) -> None:
+    def test_pre_identity_executable_drift_continues_automatically(self) -> None:
+        # A chat saved before route identities existed, whose saved profile
+        # still matches exactly, continues through a CLI auto-update (new
+        # path, file and version) like a chat that has an identity.
         first, second = self.local_tool_routes()
         board = self.board("workspace-d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1")
         with mock.patch.object(
@@ -624,9 +629,51 @@ class BoardChatBindingTests(unittest.TestCase):
                 self.config, board, "agent-1"
             )["chats"][0]
         self.forget_route_identities(conversation["id"])
+        before = swarm_chats._read(self.config)
+        held = next(one for one in before["chats"] if one["id"] == conversation["id"])
+        old_dispatch = held["binding"]["agent_routes"]["agent-1"]["effective_dispatch_fingerprint_sha256"]
         with mock.patch.object(
             provider_base.shutil, "which", return_value=str(second),
         ):
+            continued = next(
+                one for one in swarm_chats.list_for_agent(
+                    self.config, board, "agent-1"
+                )["chats"] if one["id"] == conversation["id"]
+            )
+
+        self.assertIsNone(continued["binding_problem"])
+        after = swarm_chats._read(self.config)
+        raw = next(one for one in after["chats"] if one["id"] == conversation["id"])
+        self.assertIn("agent-1", raw["binding"]["route_identities"])
+        self.assertNotEqual(
+            raw["binding"]["agent_routes"]["agent-1"]["effective_dispatch_fingerprint_sha256"],
+            old_dispatch,
+        )
+        # Restart: the recorded identity keeps it going without review.
+        with mock.patch.object(
+            provider_base.shutil, "which", return_value=str(second),
+        ):
+            again = next(
+                one for one in swarm_chats.list_for_agent(
+                    self.config, board, "agent-1"
+                )["chats"] if one["id"] == conversation["id"]
+            )
+        self.assertIsNone(again["binding_problem"])
+
+    def test_pre_identity_drift_to_a_missing_program_stays_reviewable(self) -> None:
+        first, second = self.local_tool_routes()
+        board = self.board("workspace-d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2")
+        with mock.patch.object(
+            provider_base.shutil, "which", return_value=str(first),
+        ):
+            conversation = swarm_chats.list_for_agent(
+                self.config, board, "agent-1"
+            )["chats"][0]
+        self.forget_route_identities(conversation["id"])
+        missing = self.root / "provider-c" / "agent-tool"
+        with mock.patch.object(
+            provider_base.shutil, "which", return_value=str(missing),
+        ), mock.patch("our_harness.provider_reconnect.shutil.which", return_value=None):
             protected = next(
                 one for one in swarm_chats.list_for_agent(
                     self.config, board, "agent-1"
@@ -636,11 +683,27 @@ class BoardChatBindingTests(unittest.TestCase):
         self.assertEqual(
             protected["binding_problem"]["code"], "agent_binding_changed"
         )
-        self.assertEqual(
-            protected["binding_problem"]["changed_agents"][0]["kind"],
-            "effective_dispatch_changed",
-        )
         self.assertTrue(protected["binding_problem"]["can_review_reconnect"])
+
+    def test_pre_identity_profile_change_is_still_reviewed(self) -> None:
+        first, _second = self.local_tool_routes()
+        board = self.board("workspace-d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3")
+        with mock.patch.object(
+            provider_base.shutil, "which", return_value=str(first),
+        ):
+            conversation = swarm_chats.list_for_agent(
+                self.config, board, "agent-1"
+            )["chats"][0]
+            self.forget_route_identities(conversation["id"])
+            self.config.data["providers"]["route-a"]["command"] = ["other-tool"]
+            protected = next(
+                one for one in swarm_chats.list_for_agent(
+                    self.config, board, "agent-1"
+                )["chats"] if one["id"] == conversation["id"]
+            )
+        self.assertEqual(
+            protected["binding_problem"]["code"], "agent_binding_changed"
+        )
 
     def test_tunable_edits_continue_across_restart(self) -> None:
         board = self.board("workspace-44444444444444444444444444444444")
