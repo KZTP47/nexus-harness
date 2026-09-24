@@ -212,6 +212,9 @@ jobs:
       - name: Install what the desktop app needs
         working-directory: desktop
         run: npm ci
+      - name: Install the build's release-gate dependencies
+        # build_windows_desktop.py runs the LangGraph distribution gate.
+        run: python -m pip install "langgraph>=1.2.11,<2" "langgraph-checkpoint-sqlite>=3.1.1,<4"
       - name: Build the exact unpacked desktop acceptance target
         working-directory: desktop
         env:

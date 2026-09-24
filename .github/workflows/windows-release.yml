@@ -138,6 +138,10 @@ jobs:
         working-directory: desktop
         run: npm ci
 
+      - name: Install the build's release-gate dependencies
+        # build_windows_desktop.py runs the LangGraph distribution gate.
+        run: python -m pip install "langgraph>=1.2.11,<2" "langgraph-checkpoint-sqlite>=3.1.1,<4"
+
       - name: Build versioned NSIS installer
         working-directory: desktop
         run: npm run build -- --win nsis
