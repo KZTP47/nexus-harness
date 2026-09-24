@@ -21,6 +21,7 @@ from pathlib import Path
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import threading
 import time
@@ -78,6 +79,16 @@ MAX_EVENTS = 4_000
 MAX_PARALLEL = 3
 MAX_PROVIDER_CALLS = 1_000
 MAX_CONTEXT_TOOL_CALLS = 500
+# Machine guard only: an agent that keeps receiving the identical tool result
+# this many times in a row is stuck, and every further turn spends the user's
+# provider calls. Pause with a clear note; all work is kept and Resume goes on.
+MAX_IDENTICAL_TOOL_REPEATS = 200
+# Stored context steps per task: a recent window plus a count of older,
+# settled steps. Each step can hold large tool results, and the whole task is
+# rewritten on every mutation, so an unbounded list slows every turn.
+CONTEXT_STEP_WINDOW = 64
+# Unacceptable closeout verdicts returned to the judge before Nexus pauses.
+MAX_CLOSEOUT_CORRECTIONS = 5
 MAX_DIALOGUE_MESSAGES = 64
 MAX_DIALOGUE_CHARACTERS = 96_000
 DIALOGUE_SCHEMA_VERSION = 1
@@ -707,6 +718,25 @@ def _allows_unconfigured_checks(document: dict[str, Any]) -> bool:
     } and BASELINE_CRITERIA[2] not in explicit
 
 
+def _unconfigured_checks_acceptable(document: dict[str, Any]) -> bool:
+    """No configured checks is fine unless the user explicitly asked for tests.
+
+    Tests are required only when the objective explicitly requests them, or
+    when the user explicitly added the deterministic-verification criterion.
+    Otherwise a goal completes on its authenticated evidence and reports that
+    no tests ran.
+    """
+    if requested_runtime_verification(str(document.get("objective") or "")):
+        return False
+    held = document.get("success_criteria_contract")
+    explicit = held.get("explicit_criteria") if isinstance(held, dict) else None
+    if isinstance(explicit, list):
+        return BASELINE_CRITERIA[2] not in explicit
+    # Without an authenticated criteria origin the criterion may be the
+    # user's own; honour it (a proven legacy default migrates on Resume).
+    return BASELINE_CRITERIA[2] not in (document.get("success_criteria") or [])
+
+
 def _legacy_default_criteria_proven(document: dict[str, Any]) -> bool:
     """Prove an attachment-free default request from its admitted SHA preimage.
 
@@ -741,10 +771,146 @@ def _legacy_default_criteria_proven(document: dict[str, Any]) -> bool:
     return hmac.compare_digest(candidate, str(document.get("admission_digest") or ""))
 
 
+# Command output shown to and kept for the agent. The run_command description
+# promises this much (goal_tools.MAX_COMMAND_OUTPUT_BYTES); other tool results
+# keep the smaller general bound.
+_COMMAND_RESULT_STRING_LIMIT = 100_000
+_GENERAL_RESULT_STRING_LIMIT = 32_000
+_SHOWN_RESULT_STRING_LIMIT = 12_000
+# Only the most recent steps keep full command output; older ones are compacted.
+CONTEXT_STEP_FULL_OUTPUT_WINDOW = 8
+
+
+AGENT_GIT_HISTORY_NOTE = (
+    "\n\nWORKING COPY GIT HISTORY\nThe working copy has read-only git history for context; the commit "
+    "`nexus/accepted-baseline` is your starting point. Pushing or changing remotes is not part of the task."
+)
+# One total budget for the tool results shown in a prompt. The newest results
+# are shown in full (command output up to _COMMAND_RESULT_STRING_LIMIT per
+# stream); older ones are compacted, then reduced to a reference. The full
+# results stay in the goal record, so the agent can request them again.
+SHOWN_TOOL_RESULTS_BUDGET = 200_000
+_SHOWN_TOOL_RESULTS_MAX = 80
+
+
+# The facilitator prompt's "previous tool effects" take this share of the one
+# budget; the current turn's tool results get the rest.
+PREVIOUS_EFFECTS_BUDGET = 40_000
+
+
+def _shown_tool_results(tool_results: list[dict[str, Any]], budget: int | None = None) -> list[Any]:
+    budget = SHOWN_TOOL_RESULTS_BUDGET if budget is None else int(budget)
+    shown: list[Any] = []
+    window = tool_results[-_SHOWN_TOOL_RESULTS_MAX:]
+    # Room kept for the short references that replace results which no longer fit.
+    used = 400 * len(window)
+    for one in reversed(window):
+        full = _durable_evidence(one, string_limit=_tool_result_string_limit(one.get("name"), shown=True), list_limit=80)
+        size = len(_canonical(full))
+        if used + size > budget:
+            full = _durable_evidence(one, string_limit=_SHOWN_RESULT_STRING_LIMIT, list_limit=80)
+            size = len(_canonical(full))
+        if used + size > budget:
+            full = {"call_id": one.get("call_id"), "name": one.get("name"), "omitted": True,
+                    "note": "Omitted to fit this prompt's tool-result budget. The full result is kept in the goal "
+                            "record; call the tool again if you still need it."}
+            size = 0  # Already reserved above.
+        used += size
+        shown.append(full)
+    shown.reverse()
+    return shown
+
+
+def _tool_result_string_limit(name: object, *, shown: bool = False) -> int:
+    if str(name or "") == "run_command":
+        return _COMMAND_RESULT_STRING_LIMIT
+    return _SHOWN_RESULT_STRING_LIMIT if shown else _GENERAL_RESULT_STRING_LIMIT
+
+
+def _dependency_copy_note(document: dict[str, Any]) -> str:
+    """Tell the user which installed dependencies the private copy lacks."""
+    missing = (document.get("execution_workspace") or {}).get("dependency_trees_unavailable") or []
+    if not missing:
+        return ""
+    shown = "; ".join(str(one) for one in missing[:5]) + (f"; and {len(missing) - 5} more" if len(missing) > 5 else "")
+    return (" Some installed dependencies were not copied into the private copy, so checks there may need "
+            "them installed again: " + shown + ".")
+
+
+def _denied_tool_command(document: dict[str, Any], call: dict[str, Any]) -> bool:
+    """True when a run_command call is a command the user explicitly denied."""
+    arguments = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
+    denied = goal_access.denied_argv(goal_access.state(document))
+    return bool(denied) and goal_access.normalized_argv(arguments.get("argv")) in denied
+
+
+_RECEIPT_TOOLS = frozenset({"workspace_snapshot", "run_selected_verification", "workspace_verify"})
+
+
+def _trim_context_steps(task: dict[str, Any]) -> None:
+    """Keep a recent window of context steps plus a count of older settled ones.
+
+    Only settled (complete/superseded) steps outside the window are dropped;
+    an unfinished step, and therefore any reserved effect, is never removed.
+    """
+    steps = task.get("context_steps")
+    if not isinstance(steps, list):
+        return
+    for step in steps[:-CONTEXT_STEP_FULL_OUTPUT_WINDOW]:
+        if step.get("state") in {"complete", "superseded"} and not step.get("output_compacted"):
+            step["results"] = _durable_evidence(step.get("results") or [], string_limit=_SHOWN_RESULT_STRING_LIMIT)
+            step["output_compacted"] = True
+    if len(steps) <= CONTEXT_STEP_WINDOW:
+        return
+    older, recent = steps[:-CONTEXT_STEP_WINDOW], steps[-CONTEXT_STEP_WINDOW:]
+    kept = [one for one in older if one.get("state") not in {"complete", "superseded"}]
+    removed = [one for one in older if one.get("state") in {"complete", "superseded"}]
+    if removed:
+        # Keep what later turns rely on in compact form: the files the agent
+        # asked to see again, and snapshot/verification receipts.
+        files = list(task.get("trimmed_requested_files") or [])
+        receipts = list(task.get("trimmed_receipts") or [])
+        for step in removed:
+            files.extend(one for one in step.get("requested_files", []) if one not in files)
+            for result in step.get("results", []):
+                if result.get("name") in _RECEIPT_TOOLS:
+                    held = result.get("result")
+                    if isinstance(held, dict) and held.get("snapshot_id"):
+                        # What load_snapshot needs; the file list is re-verified from disk.
+                        held = {key: held.get(key) for key in ("snapshot_id", "path", "fingerprint") if key in held}
+                    receipts.append({"step_id": step.get("step_id"), "call_id": result.get("call_id"),
+                                     "name": result.get("name"),
+                                     "result": _durable_evidence(held, string_limit=2_000, list_limit=20)})
+        task["trimmed_requested_files"] = files[-200:]
+        task["trimmed_receipts"] = receipts[-20:]
+        task["context_steps"] = [*kept, *recent]
+        task["context_steps_trimmed"] = int(task.get("context_steps_trimmed") or 0) + len(removed)
+
+
 def _binding_sha256(binding: object) -> str:
     """Return the stable, non-secret identity of one persisted route binding."""
 
     return hashlib.sha256(_canonical(binding).encode("utf-8")).hexdigest()
+
+
+# A goal agent's saved route_binding hashes the whole provider profile and the
+# resolved executable, so on its own it cannot tell "the user picked another
+# model" or "the CLI updated" from "this route now answers as another
+# provider". The versioned route identity (chat.route_identity) separates the
+# two, exactly as saved chats do: an unchanged identity is a tunable change,
+# refreshed in place; only a changed identity needs the user's review.
+ROUTE_TUNABLE_REFRESH_SCHEMA_VERSION = 1
+ROUTE_TUNABLE_REFRESH_CONTRACT = "goal-route-binding-tunable-refresh/v1"
+
+
+def _held_route_identity(agent: dict[str, Any]) -> dict[str, Any] | None:
+    held = agent.get("route_identity") if isinstance(agent, dict) else None
+    if not isinstance(held, dict) \
+            or held.get("route_identity_version") != chat_lab.ROUTE_IDENTITY_VERSION \
+            or held.get("route_identity_contract") != chat_lab.ROUTE_IDENTITY_CONTRACT \
+            or not re.fullmatch(r"[0-9a-f]{64}", str(held.get("route_identity_sha256") or "")):
+        return None
+    return {key: held[key] for key in ("route_identity_version", "route_identity_contract", "route_identity_sha256")}
 
 
 def _provider_binding_migration_map(
@@ -799,21 +965,126 @@ def _path_baseline_marker(root: Path, relative: str) -> str:
     return "other" if path.exists() else "missing"
 
 
-def _project_baseline_manifest(root: Path) -> dict[str, str]:
-    """Hash the useful source surface once per task, excluding dependency/build trees."""
+_CONTROL_DIRECTORIES = frozenset({".git", ".harness", ".nexus-verification"})
+# Build outputs that are regenerated wholesale. The per-turn observation scan
+# skips them (and dependency/cache trees); proposal and write_file targets
+# there are resolved with a direct per-path hash instead (_observed_baseline).
+_BUILD_OUTPUT_DIRECTORIES = frozenset({"dist", "build", "target", ".next", ".nuxt", ".svelte-kit", ".output"})
+_BASELINE_SKIPPED_DIRECTORIES = _CONTROL_DIRECTORIES | _BUILD_OUTPUT_DIRECTORIES | goal_workspaces.GENERATED_NAMES
+# The change record around an effect skips only control and dependency/cache
+# trees, so command and native edits to build outputs are still recorded.
+_EFFECT_SKIPPED_DIRECTORIES = _CONTROL_DIRECTORIES | goal_workspaces.GENERATED_NAMES
+# (root, relative) -> ((size, mtime_ns, inode), marker). Unchanged metadata
+# reuses the previous content hash, as Git's index does; bounded per process.
+_BASELINE_HASH_CACHE: dict[tuple[str, str], tuple[tuple[int, int, int], str]] = {}
+_BASELINE_HASH_CACHE_LIMIT = 500_000
+_BASELINE_HASH_CACHE_LOCK = threading.Lock()
+
+
+def _cached_baseline_marker(root: Path, relative: str, path: Path, *, reuse: bool = True) -> str:
+    """Hash one file, optionally reusing a hash whose metadata is unchanged.
+
+    Reuse is only for pre-effect scans: on NTFS an in-place same-size copy
+    can keep the file ID and carry the source's mtime, so a reused hash may be
+    stale. Uncached scans always re-hash and refresh the cache.
+    """
+    try:
+        metadata = path.lstat()
+    except OSError:
+        return _path_baseline_marker(root, relative)
+    if not stat.S_ISREG(metadata.st_mode):
+        return _path_baseline_marker(root, relative)
+    signature = (metadata.st_size, metadata.st_mtime_ns, getattr(metadata, "st_ino", 0))
+    key = (str(root), relative)
+    with _BASELINE_HASH_CACHE_LOCK:
+        held = _BASELINE_HASH_CACHE.get(key)
+    if reuse and held is not None and held[0] == signature:
+        return held[1]
+    marker = _path_baseline_marker(root, relative)
+    if time.time_ns() - metadata.st_mtime_ns < 2_000_000_000:
+        return marker  # Racily recent: a same-size rewrite could share this mtime.
+    with _BASELINE_HASH_CACHE_LOCK:
+        if len(_BASELINE_HASH_CACHE) >= _BASELINE_HASH_CACHE_LIMIT:
+            _BASELINE_HASH_CACHE.clear()
+        _BASELINE_HASH_CACHE[key] = (signature, marker)
+    return marker
+
+
+def _scan_markers(root: Path, skipped_directories: frozenset[str], *, reuse: bool) -> dict[str, str]:
     manifest: dict[str, str] = {}
-    skipped = {".git", ".harness", "node_modules", ".venv", "venv", "dist", "build"}
     for folder, directories, files in os.walk(root, followlinks=False):
-        directories[:] = sorted(one for one in directories if one not in skipped)
         base = Path(folder)
+        directories[:] = sorted(
+            one for one in directories
+            if one.casefold() not in skipped_directories and not (base / one / "pyvenv.cfg").is_file()
+        )
         for name in sorted(files):
+            folded = name.casefold()
+            if folded.endswith(goal_workspaces.GENERATED_FILE_SUFFIXES) or folded in goal_workspaces.GENERATED_NAMES:
+                continue
             path = base / name
             try:
                 relative = path.relative_to(root).as_posix()
-                manifest[relative] = _path_baseline_marker(root, relative)
+                manifest[relative] = _cached_baseline_marker(root, relative, path, reuse=reuse)
             except (OSError, ValueError, HarnessError):
                 continue
     return manifest
+
+
+def _project_baseline_manifest(root: Path, *, reuse_hashes: bool = False) -> dict[str, str]:
+    """The per-turn observation surface, excluding dependency and build trees.
+
+    Proposal and write_file baselines come from this scan, so by default every
+    file is hashed afresh; see ``_observed_baseline`` for skipped locations.
+    """
+    return _scan_markers(root, _BASELINE_SKIPPED_DIRECTORIES, reuse=reuse_hashes)
+
+
+def _project_effect_manifest(root: Path, *, reuse_hashes: bool = False) -> dict[str, str]:
+    """The change record around one effect (tool, command, native turn).
+
+    Only control and dependency/cache trees are skipped, so edits to build
+    outputs are recorded. Pass ``reuse_hashes`` only for the pre-effect scan.
+    """
+    return _scan_markers(root, _EFFECT_SKIPPED_DIRECTORIES, reuse=reuse_hashes)
+
+
+def _baseline_scan_skips(root: Path, relative: str) -> bool:
+    parts = [part for part in str(relative).replace("\\", "/").split("/") if part]
+    if not parts:
+        return False
+    if parts[-1].casefold().endswith(goal_workspaces.GENERATED_FILE_SUFFIXES) \
+            or parts[-1].casefold() in goal_workspaces.GENERATED_NAMES:
+        return True
+    folder = root
+    for part in parts[:-1]:
+        if part.casefold() in _BASELINE_SKIPPED_DIRECTORIES:
+            return True
+        folder = folder / part
+        try:
+            if (folder / "pyvenv.cfg").is_file():
+                return True
+        except OSError:
+            return False
+    return False
+
+
+def _observed_baseline(root: Path, manifest: dict[str, str], relative: str) -> str:
+    """Baseline marker of one proposal/write target.
+
+    The per-turn scan's value when it looked there; for a location the scan
+    skips (build outputs, caches, virtual environments), a direct per-path
+    hash, so an existing file there is never mistaken for a missing one.
+    """
+    relative = str(relative or "").replace("\\", "/").strip()
+    if relative in manifest:
+        return manifest[relative]
+    if _baseline_scan_skips(root, relative):
+        try:
+            return _path_baseline_marker(root, relative)
+        except (OSError, HarnessError):
+            return "missing"
+    return "missing"
 
 
 def _context_binding(document: dict[str, Any], baseline: dict[str, str] | None = None) -> dict[str, Any]:
@@ -1911,6 +2182,18 @@ class GoalStore(goal_access.AccessStoreMixin):
             existing_migrations = _provider_binding_migration_map(document)
             if set(existing_migrations).intersection(upgraded_bindings):
                 return False
+            # The strict-schema repair changes transport identity, not the
+            # user's access decision. Capture the validated access and roles
+            # before the route bindings move, then re-tie them afterwards
+            # exactly as a reviewed provider reconnect does. A record that was
+            # already stale stays read-only with no grants.
+            had_access = document.get("agent_access") is not None
+            saved_access = goal_access.state(document)
+            try:
+                saved_collaboration = collaboration.state(document)
+                collaboration_current = True
+            except HarnessError:
+                saved_collaboration, collaboration_current = None, False
             for agent in document.get("agents", []):
                 agent_id = str(agent.get("id") or "")
                 if agent_id not in upgraded_bindings:
@@ -1945,6 +2228,11 @@ class GoalStore(goal_access.AccessStoreMixin):
                         )
                     },
                 )
+            if had_access:
+                saved_access["binding"] = goal_access.binding(document)
+                document["agent_access"] = saved_access
+            if collaboration_current and saved_collaboration is not None:
+                collaboration.install(document, saved_collaboration)
 
         recovery_contract = _codex_schema_recovery_contract()
         for task in recoverable:
@@ -2340,6 +2628,18 @@ class GoalStore(goal_access.AccessStoreMixin):
                             "settled_ms": 0,
                         }
                         changed = True
+                    if document.get("agent_access") is None:
+                        # Created before Full was the default: it keeps Ask
+                        # (the record equals what it always read as), and the
+                        # user is told once that they can switch it to Full.
+                        document["agent_access"] = {"schema_version": 1, "binding": goal_access.binding(document),
+                                                    "mode": goal_access.LEGACY_MODE, "grants": {}}
+                        document["legacy_access_notice"] = {"schema_version": 1, "mode": goal_access.LEGACY_MODE,
+                                                            "note": goal_access.LEGACY_ASK_NOTE, "at_ms": _now()}
+                        if document.get("status") not in TERMINAL_GOALS:
+                            earlier = str(document.get("note") or "")
+                            document["note"] = goal_access.LEGACY_ASK_NOTE + (" " + earlier if earlier else "")
+                        changed = True
                     if not isinstance(document.get("collaboration_contract"), dict) \
                             and self._pristine_for_queue_migration(document):
                         if document.get("require_all_participants"):
@@ -2556,6 +2856,7 @@ class GoalStore(goal_access.AccessStoreMixin):
                     "route": route,
                     **context,
                 },
+                "route_identity": chat_lab.route_identity(self.config, route),
             })
         required = list(dict.fromkeys(
             str(one or "") for one in (participant_ids or []) if str(one or "")
@@ -2821,6 +3122,7 @@ class GoalStore(goal_access.AccessStoreMixin):
         """
 
         changed: list[dict[str, str]] = []
+        refresh_pending: list[str] = []
         for agent in document.get("agents", []):
             if not isinstance(agent, dict):
                 continue
@@ -2874,21 +3176,39 @@ class GoalStore(goal_access.AccessStoreMixin):
                 )
             )
             if not same:
+                held_identity = _held_route_identity(agent)
+                if held_identity is not None and str(expected.get("route") or "") == route \
+                        and held_identity == chat_lab.route_identity(self.config, route):
+                    # Same provider, account, endpoint and program: only a
+                    # tunable (model, effort, timeout, flags), the executable
+                    # version or an engine contract moved. Nexus refreshes the
+                    # saved binding before the next turn; the goal keeps going.
+                    refresh_pending.append(_short(agent.get("id"), 160))
+                    continue
                 changed.append({
                     "agent_id": _short(agent.get("id"), 160),
                     "name": name,
                     "route": route,
                     "reason": (
+                        "Its provider kind, account, endpoint or program changed."
+                        if held_identity is not None else
                         "Its resolved executable, executable version, provider configuration, "
                         "or transport contract changed."
                     ),
+                    **({"code": "route_identity_changed"} if held_identity is not None else {}),
                 })
         if not changed:
             return {
                 "changed": False,
                 "code": "current",
-                "message": "Every goal agent still matches the provider setup admitted for this goal.",
+                "message": (
+                    "Only provider settings such as the model or the program version changed; Nexus refreshes "
+                    "the saved binding before the next turn."
+                    if refresh_pending else
+                    "Every goal agent still matches the provider setup admitted for this goal."
+                ),
                 "agents": [],
+                "refresh_pending": refresh_pending,
                 "recovery_action": "",
             }
         names = ", ".join(one["name"] for one in changed[:6])
@@ -2970,7 +3290,8 @@ class GoalStore(goal_access.AccessStoreMixin):
         require_all_participants: bool | None = None,
     ) -> None:
         """Run every non-persistent admission check used by goal creation."""
-        access_mode = (policy or {}).get("agent_access_mode", "ask")
+        # An absent or empty mode means the user did not pick one.
+        access_mode = (policy or {}).get("agent_access_mode") or goal_access.DEFAULT_MODE
         if not isinstance(access_mode, str) or access_mode not in goal_access.MODES:
             raise HarnessError("Choose a supported agent access mode")
         execution_mode = (policy or {}).get("execution_mode", "isolated")
@@ -3004,7 +3325,7 @@ class GoalStore(goal_access.AccessStoreMixin):
         available_calls = goal_budget_policy.remaining(call_budget, "provider_calls")
         if require_all and available_calls is not None and available_calls < required_initial_tasks:
             raise HarnessError(
-                "The explicit provider-call budget is smaller than the required "
+                "The provider-call limit you set is smaller than the required "
                 "chat-participant contribution count. Increase max_provider_calls, "
                 "reduce the initial objectives, or choose adaptive collaboration; "
                 "Nexus did not silently reduce the named team."
@@ -3392,7 +3713,7 @@ class GoalStore(goal_access.AccessStoreMixin):
             "max_context_tool_calls": call_budget["max_context_tool_calls"],
             "review_risk": _short((policy or {}).get("review_risk") or "high", 20),
             "legacy_available": True,
-            "agent_access_mode": (policy or {}).get("agent_access_mode", "ask"),
+            "agent_access_mode": (policy or {}).get("agent_access_mode") or goal_access.DEFAULT_MODE,
         }
         execution_contract = _exclusive_project_contract(root, target_authority_id, facilitator_mode=facilitator_mode)
         collaboration_contract = _collaboration_contract(require_all)
@@ -3489,9 +3810,12 @@ class GoalStore(goal_access.AccessStoreMixin):
             document["closeout_contract"] = goal_closeout.CONTRACT
             collaboration.install(document, (policy or {}).get("collaboration"))
             document["workspace_publication"] = {"state": "pending"}
-            document["note"] = "Working in this chat's independent project copy."
+            document["note"] = "Working in this chat's independent project copy." + _dependency_copy_note(document)
         document["agent_access"] = {"schema_version": 1, "binding": goal_access.binding(document),
-            "mode": runtime_policy["agent_access_mode"], "grants": {}}
+            "mode": runtime_policy["agent_access_mode"], "grants": {},
+            # Whether the user chose the mode or the "Agents lead" default applied.
+            "default_contract": goal_access.DEFAULT_CONTRACT,
+            "chosen_by": "user" if (policy or {}).get("agent_access_mode") else "default"}
         with self.lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             try:
@@ -4253,6 +4577,8 @@ class GoalStore(goal_access.AccessStoreMixin):
         setup = self.provider_setup_status(value)
         value["provider_setup_changed"] = setup["changed"]
         value["provider_setup_status"] = setup
+        # Saved denials, and for each agent whether its CLI enforces them.
+        value["command_denials"] = facilitator.denial_report(document, self.config)
         collaboration = self.collaboration_setup_status(value)
         value["collaboration_contract_changed"] = collaboration["changed"]
         value["collaboration_contract_status"] = collaboration
@@ -4727,6 +5053,77 @@ class GoalStore(goal_access.AccessStoreMixin):
                 db.rollback()
                 raise
 
+    def _refresh_tunable_route_bindings(self, document: dict[str, Any], db: sqlite3.Connection) -> bool:
+        """Refresh saved route bindings whose provider identity is unchanged.
+
+        Runs inside an owned mutation at a quiet boundary (no running task or
+        unsettled effect), like a reviewed reconnect: the user's access record,
+        collaboration roles and private drafts are re-tied to the refreshed
+        binding. A changed identity is never refreshed here.
+        """
+        if any(task.get("state") == "running" or _task_has_unsettled_effect(task)
+               for task in document.get("tasks", [])):
+            return False
+        before = copy.deepcopy(document)
+        had_access = document.get("agent_access") is not None
+        saved_access = goal_access.state(document)
+        try:
+            saved_collaboration = collaboration.state(document)
+            collaboration_current = True
+        except HarnessError:
+            saved_collaboration, collaboration_current = None, False
+        touched = False
+        refreshed: list[dict[str, Any]] = []
+        for agent in document.get("agents", []):
+            expected = agent.get("route_binding") if isinstance(agent, dict) else None
+            if not isinstance(expected, dict) or expected.get("binding_schema_version") != AGENT_BINDING_SCHEMA_VERSION:
+                continue
+            route = _short(agent.get("who"), 300)
+            try:
+                _kind, context = chat_lab._route_failure_context(self.config, route)  # noqa: SLF001
+                identity = chat_lab.route_identity(self.config, route)
+            except Exception:
+                continue
+            current = {"binding_schema_version": AGENT_BINDING_SCHEMA_VERSION, "route": route, **context}
+            held_identity = _held_route_identity(agent)
+            if expected == current:
+                if held_identity != identity:
+                    # Unchanged binding proves the admitted identity; record it
+                    # so later tunable edits can be told apart from new providers.
+                    agent["route_identity"] = identity
+                    touched = True
+                continue
+            if held_identity is None or held_identity != identity or str(expected.get("route") or "") != route:
+                continue
+            agent["route_binding"] = current
+            refreshed.append({
+                "schema_version": ROUTE_TUNABLE_REFRESH_SCHEMA_VERSION,
+                "contract": ROUTE_TUNABLE_REFRESH_CONTRACT,
+                "agent_id": str(agent.get("id") or ""),
+                "route": route,
+                "route_identity_sha256": identity["route_identity_sha256"],
+                "from_binding_sha256": _binding_sha256(expected),
+                "to_binding_sha256": _binding_sha256(current),
+                "at_ms": _now(),
+            })
+        if refreshed:
+            if document.get("agent_workspace_contract") == agent_workspaces.CONTRACT:
+                for one in refreshed:
+                    agent_workspaces.preserve_reconnected_copy(before, document, one["agent_id"], self.root)
+            if had_access:
+                saved_access["binding"] = goal_access.binding(document)
+                document["agent_access"] = saved_access
+            if collaboration_current and saved_collaboration is not None:
+                collaboration.install(document, saved_collaboration)
+            history = document.get("route_tunable_refreshes")
+            document["route_tunable_refreshes"] = [*(history if isinstance(history, list) else []), *refreshed][-50:]
+            for one in refreshed:
+                self._event(db, document, "provider_binding_refreshed_for_tunable_change",
+                            agent_id=one["agent_id"], payload={key: one[key] for key in (
+                                "schema_version", "contract", "route", "route_identity_sha256",
+                                "from_binding_sha256", "to_binding_sha256")})
+        return touched or bool(refreshed)
+
     def claim_ready(self, goal_id: str, worker_id: str) -> list[dict[str, Any]]:
         def change(document: dict[str, Any], db: sqlite3.Connection):
             if document["status"] in TERMINAL_GOALS or document["status"] in {
@@ -4756,9 +5153,10 @@ class GoalStore(goal_access.AccessStoreMixin):
                     return []
                 document["worker"] = self._scheduler_record(worker_id, kind="claim")
             self._refresh_waiting(document)
+            self._refresh_tunable_route_bindings(document, db)
             if goal_budget_policy.exhausted(document["budget"], "provider_calls"):
                 document["status"] = "paused"
-                document["note"] = "The explicit provider-call budget was reached."
+                document["note"] = goal_budget_policy.exhausted_message(document["budget"], "provider_calls")
                 self._event(db, document, "goal_paused", payload={"reason": "provider_budget"})
                 return []
             available_calls = goal_budget_policy.remaining(document["budget"], "provider_calls")
@@ -4839,7 +5237,8 @@ class GoalStore(goal_access.AccessStoreMixin):
                     != int(document.get("objective_epoch") or 1):
                 raise HarnessError("The goal changed or paused before this provider continuation")
             if goal_budget_policy.exhausted(document["budget"], "provider_calls"):
-                raise HarnessError("The explicit provider-call budget was reached before dispatch")
+                raise HarnessError(goal_budget_policy.exhausted_message(document["budget"], "provider_calls")
+                                   + " The provider was not called.")
             if document.get("require_all_participants"):
                 # A context continuation or schema-repair turn for one member
                 # must not spend the final slot promised to a named member who
@@ -5156,7 +5555,7 @@ class GoalStore(goal_access.AccessStoreMixin):
                 return False
             used = int(document["budget"].get("context_tool_calls") or 0)
             if goal_budget_policy.exhausted(document["budget"], "context_tool_calls"):
-                raise HarnessError("The explicit context-tool call budget was reached")
+                raise HarnessError(goal_budget_policy.exhausted_message(document["budget"], "context_tool_calls"))
             document["budget"]["context_tool_calls"] = used + 1
             if steps:
                 steps[-1].setdefault("reserved_call_ids", []).append(call_id)
@@ -5251,7 +5650,8 @@ class GoalStore(goal_access.AccessStoreMixin):
                 goal_access.record_block(document, result, current["assigned_agent_id"])
             payload = {
                 "call_id": call.get("call_id"), "name": call.get("name"),
-                "result": _durable_evidence(result), "error": _short(error, 4_000),
+                "result": _durable_evidence(result, string_limit=_tool_result_string_limit(call.get("name"))),
+                "error": _short(error, 4_000),
                 "at_ms": _now(),
             }
             payload["semantic_result_sha256"] = hashlib.sha256(_canonical({
@@ -5294,14 +5694,28 @@ class GoalStore(goal_access.AccessStoreMixin):
                         normalize=_semantic_tool_result,
                     )
                     current["context_progress"] = progress
-                    if progress.get("state") == "paused" and progress != previous_progress \
+                    if progress.get("state") in {"paused", "repeating"} and progress != previous_progress \
                             and document["status"] not in {"cancelled", "cancelling", "waiting_for_user"}:
-                        advisory = facilitator.enabled(document)
-                        if not advisory:
-                            document["status"] = "paused"
-                            document["note"] = progress["reason"]
-                        self._event(db, document, "context_progress_observed" if advisory else "context_progress_paused", task_id=current["id"],
+                        # Repeated identical tool results are an observation
+                        # the agent sees in its context, never a harness-side
+                        # pause of the goal.
+                        self._event(db, document, "context_progress_observed", task_id=current["id"],
                                     agent_id=current["assigned_agent_id"], payload=progress)
+                    if int(progress.get("identical_repeats") or 0) >= MAX_IDENTICAL_TOOL_REPEATS \
+                            and document["status"] not in TERMINAL_GOALS | {"paused", "waiting_for_user", "cancelling"}:
+                        document["status"] = "paused"
+                        document["note"] = (
+                            f"{agent.get('name') or 'An agent'} received the identical tool result "
+                            f"{MAX_IDENTICAL_TOOL_REPEATS} times in a row, so Nexus paused to protect your "
+                            "provider usage. All work is kept. Resume to continue, or steer the agent first."
+                        )
+                        self._event(db, document, "goal_paused", task_id=current["id"],
+                                    agent_id=current["assigned_agent_id"], payload={
+                                        "reason": "identical_tool_repeat_guard",
+                                        "identical_repeats": progress.get("identical_repeats"),
+                                        "guard": MAX_IDENTICAL_TOOL_REPEATS,
+                                    })
+                    _trim_context_steps(current)
             if not error and str(call.get("name") or "") == "read_proposed_change":
                 arguments = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
                 relative = str(arguments.get("path") or "").replace("\\", "/").strip()
@@ -5642,17 +6056,54 @@ class GoalStore(goal_access.AccessStoreMixin):
             return True
         return self._mutate(goal_id, change)[1] is True
 
-    def reject_unapplied_proposal(self, goal_id: str, task: dict[str, Any], reason: str, *, coordination: bool = False) -> None:
-        """Return a known permission denial to its author without changing files."""
+    def record_held_back_deletions(self, goal_id: str, task: dict[str, Any], held_back: dict[str, Any]) -> None:
+        """Tell the agent and the user which ignored files Nexus kept.
+
+        An agent deleted gitignored baseline files (such as .env) in its copy;
+        Nexus deliberately does not publish those deletions. The agent sees
+        the notice in its next context, the user in the goal note, and the
+        goal state keeps the record.
+        """
+        paths = [str(one) for one in held_back.get("paths") or []][:200]
+        if not paths:
+            return
+        shown = ", ".join(paths[:10]) + (f" and {len(paths) - 10} more" if len(paths) > 10 else "")
+        message = (f"{len(paths)} ignored file{'s' if len(paths) != 1 else ''} you deleted in the copy "
+                   f"{'were' if len(paths) != 1 else 'was'} kept in the real project: {shown}.")
+
+        def change(document: dict[str, Any], db: sqlite3.Connection):
+            current = next(one for one in document["tasks"] if one["id"] == task["id"])
+            record = {"schema_version": 1, "task_id": current["id"], "agent_id": current["assigned_agent_id"],
+                      "paths": paths, "note": _short(held_back.get("note") or "", 1_000), "message": message,
+                      "at_ms": _now()}
+            history = document.get("held_back_deletions")
+            document["held_back_deletions"] = [*(history if isinstance(history, list) else []), record][-20:]
+            notice = "Nexus notice: " + message + " " + record["note"]
+            if notice not in current.setdefault("evidence", []):
+                current["evidence"].append(notice)
+            if document["status"] not in TERMINAL_GOALS:
+                document["note"] = message
+            self._event(db, document, "held_back_deletions", task_id=current["id"],
+                        agent_id=current["assigned_agent_id"], payload={"paths": paths, "message": message})
+        self._mutate(goal_id, change)
+
+    def reject_unapplied_proposal(self, goal_id: str, task: dict[str, Any], reason: str, *,
+                                  coordination: bool = False, correction: bool = False) -> None:
+        """Return a known denial or correctable observation to its author without changing files.
+
+        ``correction`` returns an action Nexus could not accept (for example a
+        closeout verdict that failed validation) to its author as feedback; it
+        never blocks the task or stops the goal.
+        """
         def change(document: dict[str, Any], db: sqlite3.Connection):
             current = next(one for one in document["tasks"] if one["id"] == task["id"])
             if current.get("lease_id") != task.get("lease_id") or current["state"] not in {"running", "pending_apply"} \
                     or current.get("pending_transaction") or current.get("outcome_unknown") \
                     or not current.get("pending_action"):
                 raise HarnessError("Only an exact unapplied proposal can be returned for correction")
-            if coordination and not facilitator.enabled(document):
+            if coordination and not correction and not facilitator.enabled(document):
                 raise HarnessError("Operation feedback requires facilitator mode")
-            if not coordination and goal_access.state(document)["mode"] != "read_only":
+            if not coordination and not correction and goal_access.state(document)["mode"] != "read_only":
                 raise HarnessError("The saved access decision changed before proposal rejection")
             binding = hashlib.sha256(_canonical({"contract": "denied-proposal-correction/v1",
                 "task_id": current["id"], "context": _context_binding(document)}).encode()).hexdigest()
@@ -5660,13 +6111,27 @@ class GoalStore(goal_access.AccessStoreMixin):
             attempts = int(previous.get("attempts") or 0) + 1 if previous.get("binding") == binding else 1
             current["proposal_corrections"] = {"schema_version": 1, "binding": binding, "attempts": attempts}
             current["evidence"].append("Nexus rejected the unapplied proposal: " + reason)
-            current.update({"state": "blocked" if attempts >= MAX_NO_PROGRESS and not coordination else "ready",
+            current.update({"state": "blocked" if attempts >= MAX_NO_PROGRESS and not (coordination or correction) else "ready",
                 "pending_action": {}, "lease_id": "", "owner_pid": 0, "owner_token": "",
                 "provider_effect_state": "proposal_rejected", "reconciliation_required": False,
                 "last_error": reason})
             if document["status"] in {"running", "queued"}:
                 document["status"] = "queued"
                 document["note"] = "The proposal was not applied. The team can continue within its saved access."
+            if correction:
+                packet = str((current.get("closeout_packet") or {}).get("fingerprint") or "")
+                held = current.get("closeout_corrections") or {}
+                count = int(held.get("count") or 0) + 1 if held.get("packet") == packet else 1
+                current["closeout_corrections"] = {"schema_version": 1, "packet": packet, "count": count}
+                if count >= MAX_CLOSEOUT_CORRECTIONS and document["status"] not in {"paused", "waiting_for_user", "cancelling"}:
+                    document["status"] = "paused"
+                    document["note"] = (
+                        f"The closeout judge's verdict could not be accepted {count} times in a row: {reason} "
+                        "Nexus paused so no further provider calls are spent. All work is kept; Resume retries."
+                    )
+                    self._event(db, document, "goal_paused", task_id=current["id"],
+                                agent_id=current["assigned_agent_id"], payload={
+                                    "reason": "closeout_correction_limit", "corrections": count})
             self._event(db, document, "proposal_rejected", task_id=current["id"],
                 agent_id=current["assigned_agent_id"], payload={"reason": reason, "attempts": attempts, "applied": False})
         self._mutate(goal_id, change)
@@ -6211,7 +6676,8 @@ class GoalStore(goal_access.AccessStoreMixin):
             ):
                 raise HarnessError("Risk review must be staged before applying the proposed action")
             elif kind == "blocked":
-                if current.get("kind") == "review":
+                # goal_closeout.validate_action owns a closeout judge's verdict format.
+                if current.get("kind") == "review" and not current.get("closeout_packet"):
                     packet_ref = "review-packet:" + str(current.get("review_packet_sha256") or "")
                     missing_paths = set(current.get("review_required_paths") or []) - set(
                         current.get("review_paths_inspected") or []
@@ -6284,7 +6750,7 @@ class GoalStore(goal_access.AccessStoreMixin):
                 and str(current.get("review_approved_effect_id") or "")
                 == str(current.get("provider_effect_id") or "")
             ):
-                if current.get("kind") == "review":
+                if current.get("kind") == "review" and not current.get("closeout_packet"):
                     packet_ref = "review-packet:" + str(current.get("review_packet_sha256") or "")
                     missing_paths = set(current.get("review_required_paths") or []) - set(
                         current.get("review_paths_inspected") or []
@@ -7111,6 +7577,14 @@ class GoalStore(goal_access.AccessStoreMixin):
                         "saved_work_preserved": True, "budgets_preserved": True})
                 if any((one.get("protocol_recovery") or {}).get("state") == "exhausted" for one in document["tasks"]):
                     raise HarnessError("The bounded action-protocol corrections were exhausted. Inspect the rejected replies before starting new work.")
+                # Resume is the user's decision to continue: the machine guards
+                # (identical results, closeout corrections) start counting again,
+                # so a single further event does not re-pause immediately.
+                for task in document["tasks"]:
+                    progress = task.get("context_progress")
+                    if isinstance(progress, dict) and progress.get("identical_repeats"):
+                        task.pop("context_progress", None)
+                    task.pop("closeout_corrections", None)
                 self._resume_interrupted_turns(document, db, payload.get("recovery"))
                 if any(
                     one["state"] in {"blocked", "failed"} and _task_has_unsettled_effect(one)
@@ -7769,12 +8243,20 @@ class GoalStore(goal_access.AccessStoreMixin):
             current_tree = ""
             current_manifest: dict[str, str] = {}
             if unconfigured:
-                if not _allows_unconfigured_checks(document):
+                shared_evidence = bool(document.get("require_all_participants"))
+                explicit_tests = requested_runtime_verification(str(document.get("objective") or ""))
+                if not explicit_tests and not _unconfigured_checks_acceptable(document):
+                    # The user explicitly added the deterministic-verification criterion.
                     checked.update({
                         "status": "unavailable", "basis": "required_checks_not_configured",
-                        "reason": "Required deterministic verification has no configured or discoverable command. "
-                                  "Explicit verification requirements and unproven legacy criterion origins remain required.",
+                        "reason": "The user explicitly asked for deterministic verification, so a test command is "
+                                  "required, but none is configured or discoverable. Add checks and expose their "
+                                  "command at the selected project root.",
                     })
+                elif not shared_evidence:
+                    # No checks: complete on authenticated evidence unless the
+                    # user explicitly asked for tests (handled just below).
+                    pass
                 elif result.get("basis") != "no_selected_checks" \
                         or result.get("verification_profile") != SHARED_GOAL_PROFILE \
                         or result.get("check_policy") != CHECK_POLICY \
@@ -7814,17 +8296,16 @@ class GoalStore(goal_access.AccessStoreMixin):
                         checked.update({
                             "status": "failed", "basis": "runtime_verification_required",
                             "runtime_paths": runtime_paths[:100],
-                            "reason": "Executable deliverables need actual execution evidence. Add meaningful "
-                                      "checks for launch and the requested behavior, expose their command at the "
-                                      "selected project root, and run selected verification. An authenticated "
-                                      "snapshot and team agreement alone cannot establish functional completion.",
+                            "reason": "The user explicitly asked for tests, and no executed checks exist yet. Add "
+                                      "meaningful checks for the requested behavior, expose their command at the "
+                                      "selected project root, and run selected verification.",
                         })
                     contributions = [one for one in document["tasks"] if one.get("required_contributor_id") and one["state"] != "cancelled"]
-                    if result.get("current_tree_merkle") != current_tree or not contributions or not all(
+                    if shared_evidence and (result.get("current_tree_merkle") != current_tree or not contributions or not all(
                         one["state"] == "complete" and one.get("artifacts")
                         and one["artifacts"][-1].get("tree_merkle") == current_tree
                         for one in contributions
-                    ):
+                    )):
                         checked.update({
                             "status": "failed",
                             "reason": "No-check completion requires every participant's authenticated current snapshot; "
@@ -7911,18 +8392,29 @@ class GoalStore(goal_access.AccessStoreMixin):
                     if publish_workspace is None:
                         raise HarnessError("An isolated goal cannot complete before its changes are safely applied to the selected project")
                     publication = publish_workspace(document)
+                    held_cache = int(publication.get("held_back_cache_count") or 0)
+                    cache_note = (
+                        f" {held_cache} new cache file{'s were' if held_cache != 1 else ' was'} not published "
+                        "(a .cache folder that was not in the project before); they stay in the goal's working copy."
+                        if held_cache else "")
                     document["workspace_publication"] = {
                         "state": "published", "transaction_id": publication.get("transaction_id", ""),
                         "changes": publication.get("changes", []),
-                        "message": "Verified changes applied to the selected project.",
+                        "message": "Verified changes applied to the selected project." + cache_note,
+                        **({"held_back_cache_files": publication.get("held_back_cache_files", []),
+                            "held_back_cache_count": held_cache} if held_cache else {}),
                     }
                     self._event(db, document, "workspace_published", payload=document["workspace_publication"])
                 document["delivery_receipt"] = goal_delivery.receipt(document, current_manifest)
                 document["status"] = "complete"
                 document["note"] = (
-                    "All required tasks have current artifact evidence and team agreement. No project tests were configured; no tests ran."
+                    ("All required tasks have current artifact evidence"
+                     + (" and team agreement" if document.get("require_all_participants") else "")
+                     + ". No project tests were configured; no tests ran.")
                     if unconfigured else "All required tasks and deterministic verification are complete."
-                )
+                ) + (str((document.get("workspace_publication") or {}).get("message") or "").removeprefix(
+                    "Verified changes applied to the selected project.")
+                    if (document.get("workspace_publication") or {}).get("held_back_cache_count") else "")
                 self._event(db, document, "goal_completed", payload={"basis": result.get("basis"), "success_criteria": document["success_criteria"]})
                 return
             reason = _short(checked.get("reason") or "Deterministic verification failed", 4_000)
@@ -8585,9 +9077,9 @@ class LongHorizonRuntime:
         )
         completion_guidance = (
             "The engine-generated criterion 'Configured deterministic verification passes' is conditional for this goal. "
-            "If run_selected_verification returns not_configured, no project checks are selected and no tests ran; "
-            "that can support only in-scope non-executable deliverables. Executable source, games and applications "
-            "need real execution evidence even when the user did not explicitly request tests. If verification returns "
+            "If run_selected_verification returns not_configured, no project checks are selected and no tests ran. "
+            "Tests are required only when the user explicitly asked for them; otherwise no tests is fine, report that "
+            "no tests ran. A reasoned no-change result is valid. If verification returns "
             "runtime_verification_required, author meaningful checks and expose a discoverable test command at the "
             "selected project root, including checks for a deliverable created in a new subfolder. Run "
             "run_selected_verification again after applying the files. Preserve command approval requirements; "
@@ -8598,7 +9090,9 @@ class LongHorizonRuntime:
             "authenticated snapshot and agreement before completion. Any explicitly requested testing still needs "
             "real execution evidence. Never claim that tests passed when no tests ran. "
             if _allows_unconfigured_checks(goal) else
-            "Nexus still requires deterministic project verification before completing this goal. "
+            "Tests are required only when the user explicitly asked for them; otherwise no tests is fine, report that "
+            "no tests ran. A reasoned no-change result is valid. Configured checks the user selected still run and "
+            "are reported honestly. Never claim that tests passed when no tests ran. "
         )
         return (
             "ORIGINAL USER PROMPT\n" + str(goal.get("original_objective") or goal["objective"])
@@ -8633,6 +9127,7 @@ class LongHorizonRuntime:
               "a screenshot or an earlier question. Never ask to reconfirm the saved destination merely because "
               "those paths differ. New authority must still use the existing project/access controls."
             + goal_decisions.prompt(goal, task["assigned_agent_id"])
+            + (AGENT_GIT_HISTORY_NOTE if workspace_root is not None and agent_workspaces.git_history_enabled() else "")
             + "\n\nPROJECT TREE\n" + swarm_work._tree(root)
             + "\n\nREQUESTED FILE CONTENTS\n" + files
             + "\n\nUSER STEERING / EVIDENCE\n" + "\n".join(evidence_by_task[task["id"]][-12:])
@@ -8688,6 +9183,12 @@ class LongHorizonRuntime:
             self.store.fail_task(goal_id, task, str(exc))
             return task, {"action": "failed", "summary": str(exc), "changes": []}
 
+    def _closeout_snapshot_unavailable(self, goal_id: str, error: Exception) -> None:
+        self.store.pause_deadlock(goal_id, (
+            "Nexus could not prepare the closeout judge's inspection snapshot: " + _short(error, 1_500)
+            + " All work and any saved verdict are kept. Resume retries once the project files are stable."
+        ), cause="closeout_snapshot_unavailable")
+
     def _execute_one_scoped(self, goal_id: str, task_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
         goal = self.store.get(goal_id)
         task = next(one for one in goal["tasks"] if one["id"] == task_id)
@@ -8695,7 +9196,16 @@ class LongHorizonRuntime:
             if goal_closeout.fingerprint(goal, _execution_root(goal)) != task["closeout_packet"]["fingerprint"]:
                 goal_closeout.supersede(self.store, goal_id, task)
                 return task, {"action": "superseded", "summary": "A fresh closeout review is required", "changes": []}
-            with goal_closeout.workspace(goal, task, self.store.root) as workspace:
+            from contextlib import ExitStack
+            with ExitStack() as stack:
+                try:
+                    workspace = stack.enter_context(goal_closeout.workspace(goal, task, self.store.root))
+                except HarnessError as exc:
+                    # Nexus could not build the judge's snapshot. That is a
+                    # harness problem: no provider call is spent on it.
+                    self._closeout_snapshot_unavailable(goal_id, exc)
+                    self.store.defer_context_continuation(goal_id, task)
+                    return task, {"action": "deferred", "summary": "The closeout snapshot is unavailable", "changes": []}
                 return self._execute_in_workspace(goal_id, task_id, agent_workspace=workspace)
         if task.get("review_of") and goal.get("agent_workspace_contract"):
             collaboration.prepare_review(self.store, goal, task)
@@ -8780,7 +9290,7 @@ class LongHorizonRuntime:
             # while earlier local file/context failures remain non-provider.
             provider_attempt_started = True
             native_profile = facilitator.native_profile(goal, collaboration.can_write(goal, task), self.config)
-            with project_operations.native_turn(self, goal, agent["who"], native_profile if facilitator.enabled(goal) else "inspect", direct_observations) as (coordinated_profile, operation_note):
+            with project_operations.native_turn(self, goal, agent["who"], native_profile if facilitator.enabled(goal) else "inspect", direct_observations, task=task) as (coordinated_profile, operation_note):
                 if facilitator.enabled(goal):
                     native_profile = coordinated_profile
                 if operation_note:
@@ -8789,7 +9299,10 @@ class LongHorizonRuntime:
                     self.config, agent["who"], request_text, context=request_context,
                     workspace_context=ProviderWorkspaceContext(project_id=str(goal["project"]["id"]),
                         project_path=str(goal["project"]["path"]), execution_path=str(root),
-                        execution_mode="facilitator" if facilitator.enabled(goal) else "isolated"),
+                        execution_mode="facilitator" if facilitator.enabled(goal) else "isolated",
+                        denied_commands=tuple(tuple(str(part) for part in command)
+                            for one in facilitator.denied_commands(goal) for command in one["commands"]
+                            if isinstance(command, list) and command)),
                     provider_attachments=provider_attachments,
                     **({"native_execution": native_profile,
                         "working_directory": str(root)} if agent_workspace or facilitator.enabled(goal) else {}),
@@ -8883,6 +9396,9 @@ class LongHorizonRuntime:
                     self.store._mutate(goal_id, record_prose)
             if agent_workspace and collaboration.can_write(goal, task):
                 decoded = agent_workspace.collect_action(decoded, max_bytes=int(self.config.get("execution.max_changed_bytes")), max_files=int(self.config.get("execution.max_changed_files")))
+                held_back = decoded.pop("_nexus_held_back_deletions", None)
+                if isinstance(held_back, dict) and held_back.get("paths"):
+                    self.store.record_held_back_deletions(goal_id, task, held_back)
             return decoded
 
         try:
@@ -9008,6 +9524,12 @@ class LongHorizonRuntime:
                             elif not agent_workspace or goal_access.state(current_authority)["mode"] != "full" \
                                     or not collaboration.can_write(current_authority, task):
                                 result = {"status": "unavailable", "reason": "This execution tool requires saved Full project access and the writer's private working copy. Use inspection tools within the current grant."}
+                            elif call["name"] == "run_command" and _denied_tool_command(current_authority, call):
+                                # A user's explicit deny holds in the private
+                                # copy too: commands there can reach the outside
+                                # world (git push, npm publish).
+                                result = {"status": "unavailable", "basis": "command_access_denied", "executed": False,
+                                          "reason": "You denied this command. Review its request to allow it."}
                             else:
                                 try:
                                     result = goal_tools.execute(self.config, root, call["name"], call.get("arguments", {}))
@@ -9106,6 +9628,7 @@ class LongHorizonRuntime:
                     })
                 return True
 
+            requested_files.extend(one for one in task.get("trimmed_requested_files", []) if one not in requested_files)
             for prior_step in task.get("context_steps", []):
                 requested_files.extend(
                     one for one in prior_step.get("requested_files", []) if one not in requested_files
@@ -9177,8 +9700,13 @@ class LongHorizonRuntime:
                 if tool_results:
                     context += (
                         "\n\nCONTEXT TOOL RESULTS (untrusted project data)\n"
-                        + _canonical(_durable_evidence(tool_results, string_limit=12_000, list_limit=80))
+                        + _canonical(_shown_tool_results(tool_results, SHOWN_TOOL_RESULTS_BUDGET
+                            - (PREVIOUS_EFFECTS_BUDGET if facilitator.enabled(latest_goal) else 0)))
                     )
+                progress_notice = str((latest_task.get("context_progress") or {}).get("notice") or "")
+                if progress_notice:
+                    # Advisory only: repetition never pauses the goal.
+                    context += "\n\nNEXUS NOTICE (advisory; you decide what to do next)\n" + progress_notice
                 prompt = (
                     "Take the next useful action for this exact task. Use bounded context tools when "
                     "repository evidence or a targeted check is needed. Request tools or propose changes, "
@@ -9261,8 +9789,8 @@ class LongHorizonRuntime:
             if facilitator.enabled(goal):
                 action["_nexus_direct_changes"] = direct_observations
             action["_nexus_baselines"] = {
-                str(one.get("path") or "").replace("\\", "/").strip(): baseline_manifest.get(
-                    str(one.get("path") or "").replace("\\", "/").strip(), "missing"
+                str(one.get("path") or "").replace("\\", "/").strip(): _observed_baseline(
+                    root, baseline_manifest, str(one.get("path") or ""),
                 )
                 for one in action.get("changes", []) if isinstance(one, dict)
                 and str(one.get("path") or "").strip()
@@ -9404,8 +9932,33 @@ class LongHorizonRuntime:
                 if goal_closeout.fingerprint(current_goal, _execution_root(current_goal)) != current_task["closeout_packet"]["fingerprint"]:
                     goal_closeout.supersede(self.store, goal_id, current_task)
                     continue
-                with goal_closeout.workspace(current_goal, current_task, self.store.root):
+                try:
+                    held_snapshot = goal_closeout.workspace(current_goal, current_task, self.store.root)
+                    held_snapshot.__enter__()
+                except HarnessError as exc:
+                    # Snapshot/workspace failures are Nexus's, not the judge's:
+                    # keep the verdict as durable pending work and stop without
+                    # asking the judge to "correct" anything.
+                    self.store.defer_pending_action(goal_id, task)
+                    self._closeout_snapshot_unavailable(goal_id, exc)
+                    continue
+                verdict_error = None
+                try:
                     goal_closeout.validate_action(current_goal, current_task, action, _execution_root(current_goal))
+                except HarnessError as exc:
+                    verdict_error = exc
+                finally:
+                    try:
+                        held_snapshot.__exit__(None, None, None)
+                    except HarnessError as exc:  # The judge edited its read-only snapshot.
+                        verdict_error = verdict_error or exc
+                if verdict_error is not None:
+                    # A judge's verdict that Nexus cannot accept is feedback
+                    # for that judge, never a reason to stop the whole goal.
+                    self.store.reject_unapplied_proposal(goal_id, task,
+                        "The closeout verdict was not accepted: " + _short(verdict_error, 2_000)
+                        + " Correct the verdict and submit it again.", correction=True)
+                    continue
             if current_task.get("review_of") and current_goal.get("agent_workspace_contract") and current_task.get("review_submission"):
                 try:
                     with collaboration.review_workspace(current_goal, current_task, self.store.root):
@@ -9444,6 +9997,13 @@ class LongHorizonRuntime:
                     except (project_operations.OperationBusy, project_operations.ProposalConflict) as exc:
                         if pending:
                             raise  # Never discard an unsettled transaction during recovery.
+                        if isinstance(exc, project_operations.OperationBusy) and self.store.get(goal_id)["status"] in {
+                            "paused", "waiting_for_user", "cancelling",
+                        }:
+                            # The user paused while this edit queued for the
+                            # project lease: keep it as durable pending work.
+                            self.store.defer_pending_action(goal_id, task)
+                            continue
                         self.store.reject_unapplied_proposal(goal_id, task, str(exc), coordination=True)
                         continue
                 else:
@@ -9595,8 +10155,17 @@ class LongHorizonRuntime:
                 **({"verification_profile": "shared_goal_v1", "context_check": True}
                    if goal.get("require_all_participants") else {}),
             )
+            if not goal.get("require_all_participants") and result.get("status") == "unavailable" \
+                    and result.get("commands") == [] \
+                    and result.get("basis") in {"discovered", "project_config", "selected_project"}:
+                # The non-shared runner reports "no test command" as
+                # unavailable. That is "no tests ran", reported honestly (the
+                # shared profile already says not_configured). The final gate
+                # decides whether the user asked for tests; no pause here.
+                result = {**result, "status": "not_configured", "basis": "no_selected_checks",
+                          "reason": "No project tests are configured or discoverable; no tests ran."}
         if goal_closeout.enabled(goal) and (result.get("status") == "passed" or
-                result.get("status") == "not_configured" and _allows_unconfigured_checks(goal)):
+                result.get("status") == "not_configured" and _unconfigured_checks_acceptable(goal)):
             decision = goal_closeout.stage(self.store, goal["goal_id"], result, _providers_independent,
                 expected_revision=project["_nexus_command_access"].revision or int(goal["revision"]),
                 expected_fingerprint=closeout_fingerprint)

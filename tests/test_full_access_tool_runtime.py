@@ -176,5 +176,99 @@ class FullAccessToolRuntimeTests(unittest.TestCase):
         self.assertIn("outcome_unknown", contexts[-1])
 
 
+    def test_denied_command_is_refused_in_the_private_copy_too(self):
+        # The private copy can reach the outside world (git push, npm publish);
+        # an explicit deny holds there as it does in the selected project.
+        goal = self.create(isolated=True, solo=True)
+        marker = self.base / "pushed.txt"
+        denied_argv = [sys.executable, "-c", f"open({str(marker)!r}, 'w').write('pushed')"]
+        def deny(document, _db):
+            document["agent_access"]["grants"]["d" * 64] = {"decision": "deny", "remaining": 0, "commands": [denied_argv]}
+        runtime = long_horizon.LongHorizonRuntime(self.config)
+        self.addCleanup(runtime.close)
+        runtime.store._mutate(goal["goal_id"], deny)
+        task = runtime.store.claim_ready(goal["goal_id"], "tool-worker")[0]
+        replies = [fixtures.action("work", tool_calls=[
+            {"call_id": "push", "name": "run_command", "arguments": {"argv": denied_argv, "timeout_seconds": 90}},
+            {"call_id": "ok", "name": "run_command", "arguments": {"argv": [sys.executable, "-c", "print('allowed')"]}},
+        ]), fixtures.action("complete", evidence=["verified-no-change"])]
+        contexts = []
+        def ask(*args, **kwargs):
+            contexts.append(kwargs["context"])
+            return {"text": json.dumps(replies.pop(0))}
+        with mock.patch.object(long_horizon.chat_lab, "ask_once", side_effect=ask):
+            runtime._execute_one(goal["goal_id"], task["id"])
+        self.assertFalse(marker.exists(), "a denied command ran from the private copy")
+        self.assertIn("command_access_denied", contexts[-1])
+        self.assertIn("allowed", contexts[-1])
+
+    def test_default_access_is_full_and_explicit_choices_are_kept(self):
+        store = self.store()
+        default = store.create(self.board, "project", ["Use the default access"], "default-access")
+        self.assertEqual(goal_access.state(default)["mode"], "full")
+        self.assertEqual(default["agent_access"]["chosen_by"], "default")
+        self.assertEqual(default["agent_access"]["default_contract"], goal_access.DEFAULT_CONTRACT)
+        for mode in ("ask", "read_only"):
+            chosen = self.create(mode=mode, request="chosen-" + mode)
+            self.assertEqual(goal_access.state(chosen)["mode"], mode)
+            self.assertEqual(chosen["agent_access"]["chosen_by"], "user")
+            reopened = long_horizon.GoalStore(self.config).get(chosen["goal_id"])
+            self.assertEqual(goal_access.state(reopened)["mode"], mode)
+        # A goal without a record predates the Full default: it keeps Ask.
+        legacy = {"goal_id": "legacy", "project": {"id": "p", "path": str(self.project)}, "agents": []}
+        self.assertEqual(goal_access.state(legacy)["mode"], "ask")
+
+    def test_goals_created_before_the_full_default_keep_ask_and_are_told_once(self):
+        store = self.store()
+        goal = store.create(self.board, "project", ["An older goal"], "pre-default-goal")
+        def older(document, _db):
+            document.pop("agent_access", None)  # as saved before access records existed
+        store._mutate(goal["goal_id"], older)
+        self.assertEqual(goal_access.state(store.get(goal["goal_id"]))["mode"], "ask")
+        reopened = long_horizon.GoalStore(self.config)
+        held = reopened.get(goal["goal_id"])
+        self.assertEqual(goal_access.state(held)["mode"], "ask")
+        self.assertEqual(held["agent_access"]["mode"], "ask")
+        self.assertIn("created before Full access was the default; it keeps Ask", held["note"])
+        self.assertEqual(held["legacy_access_notice"]["mode"], "ask")
+        # One time: a later restart does not repeat or change it.
+        again = long_horizon.GoalStore(self.config).get(goal["goal_id"])
+        self.assertEqual(again["revision"], held["revision"])
+        self.assertEqual(again["note"].count("it keeps Ask"), 1)
+        # A new goal still defaults to Full, recorded as the default.
+        fresh = store.create(self.board, "project", ["A new goal"], "post-default-goal")
+        self.assertEqual((fresh["agent_access"]["mode"], fresh["agent_access"]["chosen_by"]), ("full", "default"))
+        empty = store.create(self.board, "project", ["UI sent no choice"], "empty-choice", policy={"agent_access_mode": ""})
+        self.assertEqual((empty["agent_access"]["mode"], empty["agent_access"]["chosen_by"]), ("full", "default"))
+
+    def test_held_back_deletions_reach_the_agent_the_user_and_the_record(self):
+        goal = self.create(isolated=True, solo=True)
+        runtime = long_horizon.LongHorizonRuntime(self.config)
+        self.addCleanup(runtime.close)
+        task = runtime.store.claim_ready(goal["goal_id"], "tool-worker")[0]
+        runtime.store.record_held_back_deletions(goal["goal_id"], task, {
+            "paths": [".env", "local/settings.ini"], "note": "They were ignored and never committed."})
+        held = runtime.store.get(goal["goal_id"])
+        self.assertIn("2 ignored files you deleted in the copy were kept in the real project: .env, local/settings.ini", held["note"])
+        self.assertEqual(held["held_back_deletions"][-1]["paths"], [".env", "local/settings.ini"])
+        current = next(one for one in held["tasks"] if one["id"] == task["id"])
+        self.assertTrue(any(".env" in one for one in current["evidence"]))
+        self.assertIn(".env", runtime._agent_context(held, current))
+        reopened = long_horizon.GoalStore(self.config).get(goal["goal_id"])
+        self.assertEqual(reopened["held_back_deletions"], held["held_back_deletions"])
+
+    def test_git_history_note_only_when_the_flag_is_on(self):
+        from our_harness import agent_workspaces
+        goal = self.create(isolated=True, solo=True)
+        task = goal["tasks"][0]
+        runtime = long_horizon.LongHorizonRuntime(self.config)
+        self.addCleanup(runtime.close)
+        root = long_horizon._execution_root(goal)
+        with mock.patch.dict("os.environ", {agent_workspaces.GIT_HISTORY_ENV: "1"}):
+            self.assertIn("nexus/accepted-baseline", runtime._agent_context(goal, task, workspace_root=root))
+        with mock.patch.dict("os.environ", {agent_workspaces.GIT_HISTORY_ENV: ""}):
+            self.assertNotIn("nexus/accepted-baseline", runtime._agent_context(goal, task, workspace_root=root))
+
+
 if __name__ == "__main__":
     unittest.main()

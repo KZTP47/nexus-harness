@@ -305,7 +305,7 @@ class LongHorizonDialogueTests(unittest.TestCase):
     def test_resume_adopts_only_current_discovery_approval_and_rejects_changed_manifest(self):
         manifest = self.project / "package.json"
         manifest.write_text(json.dumps({"name": "fixture", "scripts": {"test": "node --test game.test.js"}}))
-        goal = self.create("approve-checks")
+        goal = self.create("approve-checks", policy={"agent_access_mode": "ask"})
         self.runtime.store.control(goal["goal_id"], "pause")
         selected = copy.deepcopy(self.board["projects"][0])
         commands, source = long_horizon.swarm_work._verification_commands(self.config, self.project, selected)
@@ -341,10 +341,13 @@ class LongHorizonDialogueTests(unittest.TestCase):
         for wrong in ({**selected, "id": "other"}, {**selected, "path": str(other)}):
             with self.assertRaisesRegex(HarnessError, "exact selected project"):
                 self.runtime.resume(goal["goal_id"], project_verification_settings=wrong)
-        self.config.data["providers"]["builder-route"]["model"] = "changed-provider"
+        # A different provider identity (here its endpoint) is a boundary; a
+        # tunable such as the model is not (see the route-identity tests).
+        saved_route = copy.deepcopy(self.config.data["providers"]["builder-route"])
+        self.config.data["providers"]["builder-route"]["endpoint"] = "https://another-provider.invalid/v1"
         with self.assertRaises(HarnessError):
             self.runtime.resume(goal["goal_id"], project_verification_settings=selected)
-        self.config.data["providers"]["builder-route"]["model"] = "fixture"
+        self.config.data["providers"]["builder-route"] = saved_route
         self.runtime.store.control(goal["goal_id"], "resume")
         self.runtime.store.claim_ready(goal["goal_id"], "still-working")
         self.runtime.store.control(goal["goal_id"], "pause")

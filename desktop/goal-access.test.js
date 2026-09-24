@@ -99,12 +99,14 @@ test("visible permissions support deny, once, always, mode changes and stale err
       source.slice(source.indexOf("function selectedLongGoalAgentIds"), source.indexOf("function saveLongGoalComposerDraft"))});
     await page.evaluate(()=>document.getElementById('longGoalDialog').showModal());
     assert.equal(await page.locator('#longGoalAccess').inputValue(), 'full', 'new project goal default');
-    assert.equal(await page.evaluate(()=>JSON.parse(longGoalIntent(longGoalComposerDraft())).policy.agent_access_mode), 'full');
+    // Left at the default, no mode is sent: the server applies (and records) its Full default.
+    assert.equal(await page.evaluate(()=>'agent_access_mode' in JSON.parse(longGoalIntent(longGoalComposerDraft())).policy), false);
     for (const mode of ['read_only', 'full', 'ask']) {
       await page.locator("#longGoalAccess").selectOption(mode);
       const selected = await page.evaluate(()=>({draft:longGoalComposerDraft(),intent:JSON.parse(longGoalIntent(longGoalComposerDraft()))}));
       assert.equal(selected.draft.access_mode, mode);
-      assert.equal(selected.intent.policy.agent_access_mode, mode);
+      // A picked mode is sent; picking the default Full again leaves it to the server default.
+      assert.equal(selected.intent.policy.agent_access_mode, mode === 'full' ? undefined : mode);
     }
     for (const execution of ['isolated', 'facilitator']) {
       await page.locator("#longGoalExecution").selectOption(execution);

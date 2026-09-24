@@ -36,6 +36,20 @@ class LongHorizonCallLimitTests(unittest.TestCase):
         self.assertEqual(["builder-route", "builder-route", "peer-route"], [route for route, _ in seen])
         self.assertIsNone(goal_budget_policy.remaining(result["budget"], "provider_calls"))
 
+    def test_adaptive_goal_has_no_hidden_lifetime_caps(self):
+        goal = self.create("adaptive-past-old-limits", require_all_participants=False)
+        self.assertFalse(goal["require_all_participants"])
+        self.assertEqual(0, goal["budget"]["max_provider_calls"])
+        self.assertEqual(0, goal["budget"]["max_context_tool_calls"])
+        self.runtime.store._mutate(goal["goal_id"], lambda current, db: current["budget"].update(
+            provider_calls=5_000, context_tool_calls=2_500,
+        ))
+        saved = self.runtime.store.get(goal["goal_id"])
+        for counter in ("provider_calls", "context_tool_calls"):
+            self.assertIsNone(goal_budget_policy.remaining(saved["budget"], counter))
+        self.assertTrue(self.runtime.store.claim_ready(goal["goal_id"], "adaptive-worker"))
+        self.assertNotEqual("paused", self.runtime.store.get(goal["goal_id"])["status"])
+
     def test_explicit_provider_budget_stops_at_exact_limit(self):
         goal = self.create("finite-calls", policy={"max_provider_calls": 2})
         result, seen = self.run_replies(goal, [
@@ -45,7 +59,7 @@ class LongHorizonCallLimitTests(unittest.TestCase):
         self.assertEqual("paused", result["status"])
         self.assertEqual(2, len(seen))
         self.assertEqual(2, result["budget"]["provider_calls"])
-        self.assertIn("provider-call budget", result["note"])
+        self.assertIn("provider-call limit you set", result["note"])
 
     def test_legacy_budget_remains_finite_and_explicit_large_limits_are_not_clamped(self):
         goal = self.create("legacy-calls", policy={"max_provider_calls": 5_000, "max_context_tool_calls": 9_000})

@@ -274,7 +274,9 @@ class WorkflowEngineTests(unittest.TestCase):
         with self.assertRaises(HarnessError):
             self.runtime.fork(goal["goal_id"], "dirty-child")
         (self.project / "dirty.txt").unlink()
-        self.config.data["providers"]["builder-route"]["model"] = "changed-model"
+        # A different provider identity (its endpoint); a model edit is a
+        # tunable and no longer counts as provider drift.
+        self.config.data["providers"]["builder-route"]["endpoint"] = "https://another-provider.invalid/v1"
         with self.assertRaises(HarnessError):
             self.runtime.fork(goal["goal_id"], "drift-child")
 

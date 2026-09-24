@@ -50,19 +50,29 @@ fresh verification. This is cooperative yielding at tool boundaries, not concurr
 access by independent writers.
 
 Repeated discussion and tool observations are advisory in facilitator mode.
-Agents receive repetition counts and tool errors and decide what to do next.
-Nexus still observes cancellation, explicit call budgets, provider failures,
-and access permissions. Private-copy mode retains its progress guards.
+Agents receive repetition counts, a notice after identical tool results, and
+tool errors, and decide what to do next. Identical tool results never pause a
+goal in either mode; private-copy agents receive the same notice in their task
+evidence. Nexus still observes cancellation, explicit call budgets, provider
+failures, and access permissions. Private-copy mode retains its separate guard
+for repeated turns that produce no new evidence.
 Routing survives restart in the authenticated conversation archive, and
 continuation fingerprints invalidate comparison state from earlier behavior.
 
 Read only, Ask before commands, and Full project access remain user choices.
 Explicit fixed writer/reviewer roles still apply. New commands in Ask mode use
 the existing Deny / Run once / Always allow controls, bound to the project,
-working directory, arguments, and timeout. Full mode allows native CLI work;
-saved command denials switch native work to inspection so command requests go
-through the permission controls. Ordinary explicit shell commands and nested
-working directories are supported. Exit failures and timeouts are recorded.
+working directory, arguments, and timeout. Full mode allows native CLI work.
+A saved **Deny** answers exactly the denied command, whatever its timeout or
+spelling: Nexus refuses it for its own tools, Claude Code receives it as a
+`--disallowedTools` rule, and a CLI that cannot enforce it is told not to run it
+(shown to the user as advisory for that CLI). The rest of the agents' native
+work keeps its access. Ordinary explicit shell commands and nested working
+directories are supported. Exit failures and timeouts are recorded.
+`run_command` timeouts default to 10 minutes and may be requested up to 60
+minutes; up to 200 KB of output is returned, stored and shown to the agent,
+keeping the beginning and the end around a clear truncation marker. `write_file` accepts files up to 10 million
+characters. These are machine protections only.
 Nexus-run commands retain configured executable/argument denials, built-in
 prohibitions, and the chosen process or Docker backend. Changing this execution
 policy invalidates native-command grants. Docker mode uses native inspection
@@ -75,15 +85,32 @@ facilitator goals queued behind project ownership become eligible automatically;
 explicit pauses and cancellations are preserved.
 
 Nexus coordinates mutations with short cross-process leases covering overlapping
-project roots. File proposals check their observed baseline under the transaction
-lock. A busy operation or stale proposal returns feedback to the agent for
-inspection and replanning. It does not open a project-permission request.
-Read-only context tools and agent messages do not require this lease.
+project roots, so two writers never change the same files at the same instant.
+A writer that finds the lease held **waits for it** instead of being refused,
+in arrival order: Nexus tool writes and commands queue for up to 2 minutes,
+proposals for up to 5 minutes. A cancelled or handed-off turn leaves the queue
+at once. Only if the lease is still held after that wait does the agent get a
+"busy" observation to retry; a proposal queued while the user pauses stays
+durable pending work. File proposals check their observed baseline under the
+transaction lock; a stale proposal returns feedback to the agent for replanning.
+Neither opens a project-permission request. Read-only context tools and agent
+messages do not require this lease. A proposal may change up to 500 files at
+once (a safety bound only). Baselines for proposals and `write_file` are
+hashed afresh every turn; a target inside a location the scan skips (build
+outputs, caches, virtual environments) is hashed directly, so it is never
+mistaken for a missing file. The change record around a command, tool or native
+turn skips only dependency and cache trees, so edits to build outputs are
+recorded, and it re-hashes every file after the effect. The per-turn scan skips
+dependency and build trees (`node_modules`, virtual environments, `__pycache__`,
+`target`, `.next`, `dist`, `build` and similar) and reuses hashes of unchanged
+files.
 
 A native CLI can modify files anywhere during its invocation, so writable native
-invocations hold the operation lease until they return. If another writer is
-active, that invocation uses native inspection and can continue communicating or
-propose edits through Nexus. Saved permissions are unchanged. API/browser replies
+invocations hold the operation lease until they return. Concurrent agents both
+keep write access: a second writable invocation waits for the first to finish
+(serializing their writes) rather than dropping to inspection. Only after a very
+long wait (30 minutes) or a user pause does that invocation fall back to native
+inspection, with a note; saved permissions are unchanged. API/browser replies
 do not hold a native lease. Direct goal writers and private-copy publication
 also participate in write coordination. Older external execution engines retain
 their admission fence because they cannot participate in operation leases. Only changes observed during protected

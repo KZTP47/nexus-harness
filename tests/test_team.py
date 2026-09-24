@@ -349,10 +349,25 @@ class KeepingThemTests(TeamTestCase):
             team.remove_team(self.config, "Two seats")
             self.assertEqual(team.teams(self.config), [])
 
-    def test_a_team_that_could_not_run_is_never_saved(self) -> None:
+    def test_a_member_that_is_not_ready_yet_is_saved_with_a_warning(self) -> None:
+        # Readiness is temporary (signed out, still installing). It is said as
+        # a warning and never stops the user keeping their team.
         with self.only_one():
             graph = team.a_starting_team(self.config)
             graph["nodes"][2]["config"] = {"provider_route": "copilot"}
+            saved = team.save_team(self.config, "Waiting on one", graph)
+            self.assertTrue(any("not ready yet" in one for one in saved["warnings"]), saved)
+            self.assertEqual([one["name"] for one in team.teams(self.config)], ["Waiting on one"])
+        with self.both():
+            # Once the member is ready the same saved team has nothing in the way.
+            listed = team.teams(self.config)
+            self.assertTrue(listed[0]["valid"], listed)
+            self.assertEqual(team.save_team(self.config, "Waiting on one", graph)["warnings"], [])
+
+    def test_a_team_that_names_nobody_real_is_never_saved(self) -> None:
+        with self.both():
+            graph = team.a_starting_team(self.config)
+            graph["nodes"][2]["config"] = {"provider_route": "made-up"}
             with self.assertRaises(team.TeamError) as caught:
                 team.save_team(self.config, "Broken", graph)
         self.assertIn("cannot be saved", str(caught.exception))

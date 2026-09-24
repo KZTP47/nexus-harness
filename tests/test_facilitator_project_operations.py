@@ -58,9 +58,52 @@ class OperationLeaseTests(unittest.TestCase):
             pass
 
 
+class LeaseQueueTests(unittest.TestCase):
+    """A second writer waits for the lease instead of being refused."""
+    setUp = OperationLeaseTests.setUp
+
+    def test_waiting_claim_is_admitted_when_the_holder_finishes(self):
+        entered, released = threading.Event(), threading.Event()
+        def holder():
+            with ops.claim(self.root, self.state):
+                entered.set()
+                released.wait(10)
+        thread = threading.Thread(target=holder)
+        thread.start()
+        self.assertTrue(entered.wait(10))
+        threading.Timer(0.3, released.set).start()
+        with ops.transaction(self.root, self.state, wait_seconds=10):
+            self.assertTrue(released.is_set(), "The waiter was admitted while the first writer held the lease")
+        thread.join(10)
+
+    def test_wait_is_bounded_and_says_how_long_it_waited(self):
+        with ops.claim(self.root, self.state):
+            with self.assertRaisesRegex(ops.OperationBusy, "still using this project. Nexus waited 1 seconds"):
+                with ops.claim(self.root, self.state, wait_seconds=1.2):
+                    self.fail("Overlapping writer admitted")
+
+    def test_waiting_stops_when_the_goal_is_paused(self):
+        calls = []
+        def stopped():
+            calls.append(1)
+            return True
+        with ops.claim(self.root, self.state), self.assertRaises(ops.OperationBusy):
+            with ops.claim(self.root, self.state, wait_seconds=60, should_stop=stopped):
+                self.fail("Overlapping writer admitted")
+        self.assertTrue(calls)
+
+
 class FacilitatorOperationTests(unittest.TestCase):
-    setUp = access.FacilitatorModeTests.setUp
     create = access.FacilitatorModeTests.create
+
+    def setUp(self):
+        access.FacilitatorModeTests.setUp(self)
+        # Contention tests hold a lease for their whole body; keep the queue
+        # short so "still busy after waiting" is observable quickly.
+        for name in ("TOOL_LEASE_WAIT_SECONDS", "APPLY_LEASE_WAIT_SECONDS", "NATIVE_LEASE_WAIT_SECONDS"):
+            patcher = mock.patch.object(ops, name, 0.3)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def proposal(self, goal, path, content):
         task = self.store.claim_ready(goal["goal_id"], "writer")[0]
@@ -105,6 +148,23 @@ class FacilitatorOperationTests(unittest.TestCase):
         self.apply(goal, self.proposal(goal, "new.txt", "new"))
         self.assertEqual((self.project / "new.txt").read_text(), "new")
 
+    def test_tool_write_queues_behind_a_teammate_instead_of_failing(self):
+        with mock.patch.object(ops, "TOOL_LEASE_WAIT_SECONDS", 10):
+            entered, released = threading.Event(), threading.Event()
+            def teammate():
+                with ops.transaction(self.project, self.store.root):
+                    entered.set()
+                    released.wait(10)
+            thread = threading.Thread(target=teammate)
+            thread.start()
+            self.assertTrue(entered.wait(10))
+            threading.Timer(0.3, released.set).start()
+            result = goal_tools.execute(self.config, self.project, "write_file", {"path": "queued.txt", "content": "queued"},
+                                        facilitator=True, runtime_root=self.store.root)
+            thread.join(10)
+        self.assertEqual(result["applied_to"], "selected_project")
+        self.assertEqual((self.project / "queued.txt").read_text(), "queued")
+
     def test_busy_tools_and_stale_tool_writes_have_truthful_nonexecuted_results(self):
         original = long_horizon._project_baseline_manifest(self.project)
         with ops.claim(self.project, self.store.root):
@@ -116,7 +176,7 @@ class FacilitatorOperationTests(unittest.TestCase):
         self.assertEqual(result["status"], "conflict")
         self.assertEqual((self.project / "new.txt").read_text(), "sibling")
 
-    def test_native_busy_falls_back_to_inspection_and_keeps_permissions(self):
+    def test_native_turn_falls_back_to_inspection_only_after_a_long_wait(self):
         goal = self.create(mode="full")
         task = self.store.claim_ready(goal["goal_id"], "writer")[0]
         def provider(*args, **kwargs):
@@ -171,40 +231,46 @@ class FacilitatorOperationTests(unittest.TestCase):
         with ops.transaction(self.project, self.store.root):
             pass
 
-    def test_two_native_conversations_overlap_without_two_writable_invocations(self):
+    def test_two_native_conversations_both_keep_write_access_and_serialize(self):
         first, second = self.create(request="native-a", mode="full"), self.create(request="native-b", mode="full")
         a = self.store.claim_ready(first["goal_id"], "a")[0]
         b = self.store.claim_ready(second["goal_id"], "b")[0]
         entered, release = threading.Event(), threading.Event()
-        errors, results = [], []
+        errors, results, profiles, order = [], {}, {}, []
         def provider(*args, **kwargs):
-            if threading.current_thread().name == "native-a":
-                self.assertEqual(kwargs["native_execution"], "work")
+            name = threading.current_thread().name
+            profiles[name] = kwargs["native_execution"]
+            order.append(name + ":start")
+            if name == "native-a":
                 entered.set()
-                self.assertTrue(release.wait(10), "Second conversation never replied")
-                (self.project / "native-a.txt").write_text("a")
-            else:
-                self.assertEqual(kwargs["native_execution"], "inspect")
+                self.assertTrue(release.wait(10), "The first conversation was never released")
+            (self.project / (name + ".txt")).write_text(name)
+            order.append(name + ":end")
             return {"text": json.dumps(access.fixtures.completion())}
-        def run_first():
+        def run(goal, task, name):
             try:
-                results.append(self.runtime._execute_one(first["goal_id"], a["id"]))
+                results[name] = self.runtime._execute_one(goal["goal_id"], task["id"])
             except BaseException as exc:
                 errors.append(exc)
-        with mock.patch.object(ops, "native_capable", return_value=True), mock.patch.object(long_horizon.chat_lab, "ask_once", side_effect=provider):
-            thread = threading.Thread(target=run_first, name="native-a")
-            thread.start()
-            try:
-                self.assertTrue(entered.wait(10))
-                _, action = self.runtime._execute_one(second["goal_id"], b["id"])
-                self.assertEqual(action["_nexus_direct_changes"], [])
-            finally:
-                release.set()
-                thread.join(10)
-            self.assertFalse(thread.is_alive())
+        with mock.patch.object(ops, "NATIVE_LEASE_WAIT_SECONDS", 20), \
+                mock.patch.object(ops, "native_capable", return_value=True), \
+                mock.patch.object(long_horizon.chat_lab, "ask_once", side_effect=provider):
+            one = threading.Thread(target=run, args=(first, a, "native-a"), name="native-a")
+            one.start()
+            self.assertTrue(entered.wait(10))
+            two = threading.Thread(target=run, args=(second, b, "native-b"), name="native-b")
+            two.start()
+            two.join(0.5)
+            self.assertNotIn("native-b:start", order, "Two writable native sessions overlapped")
+            release.set()
+            one.join(20)
+            two.join(20)
         if errors:
             raise errors[0]
-        self.assertEqual([x["path"] for x in results[0][1]["_nexus_direct_changes"]], ["native-a.txt"])
+        self.assertEqual(profiles, {"native-a": "work", "native-b": "work"})
+        self.assertEqual(order, ["native-a:start", "native-a:end", "native-b:start", "native-b:end"])
+        self.assertEqual([x["path"] for x in results["native-a"][1]["_nexus_direct_changes"]], ["native-a.txt"])
+        self.assertEqual([x["path"] for x in results["native-b"][1]["_nexus_direct_changes"]], ["native-b.txt"])
 
     def test_private_publication_respects_facilitator_operation_lease(self):
         goal = self.create(isolated=True)

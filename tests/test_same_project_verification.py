@@ -290,6 +290,7 @@ class WorkspaceApprovalHTTPTests(unittest.TestCase):
             self.fixture.board, "tiny-game", ["Build a game with a scoring check"], request,
             lead_id="creator", participant_ids=["creator", "reviewer"],
             conversation_id="chat-" + request, isolated_workspace=True,
+            policy={"agent_access_mode": "ask"},  # Ask-mode approval behaviour; goals default to Full.
         )
         workspace = goal_workspaces.root(goal, self.runtime.store.root)
         (workspace / "package.json").write_text(json.dumps({

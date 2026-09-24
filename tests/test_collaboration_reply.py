@@ -110,7 +110,9 @@ class CollaborationReplyTests(unittest.TestCase):
         goal = self.create('force-boundary')
         self.runtime.store.control(goal['goal_id'], 'pause')
         before = self.runtime.store.get(goal['goal_id'])
-        self.config.data['providers']['builder-route']['model'] = 'changed-model'
+        # A different provider identity (its endpoint); a model edit is a
+        # tunable that no longer needs a reconnect.
+        self.config.data['providers']['builder-route']['endpoint'] = 'https://another-provider.invalid/v1'
         with self.assertRaises(HarnessError):
             self.runtime.store.control(goal['goal_id'], 'resume', {'expected_revision': before['revision'], 'force_proceed': True})
         self.assertEqual(self.runtime.store.get(goal['goal_id']), before)

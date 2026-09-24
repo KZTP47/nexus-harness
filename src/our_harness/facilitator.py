@@ -44,14 +44,78 @@ def reply_requested(action, delivery):
 
 
 def native_profile(goal, writable, config=None):
+    """Native write access follows the saved mode and the user's role choice.
+
+    A saved "deny" answers one command and never downgrades the rest of the
+    agent's native work. Nexus refuses that command (in any spelling or
+    timeout) for its own tools; a native CLI that supports command rules
+    (Claude Code) receives it as a real deny rule, and any other CLI is told
+    the command is denied, which the user sees as advisory for that CLI (see
+    ``deny_enforcement``). Concurrent writable sessions queue for the project
+    lease instead of dropping to inspection.
+    """
     access = goal_access.state(goal)
-    denied = any(grant.get("decision") == "deny" for grant in access["grants"].values())
     host_execution = config is None or config.get("execution.mode") == "process"
-    return "work" if access["mode"] == "full" and writable and not denied and host_execution else "inspect"
+    return "work" if access["mode"] == "full" and writable and host_execution else "inspect"
+
+
+def deny_enforcement(config, route):
+    """How a saved deny reaches this agent's native CLI.
+
+    ``cli_rule`` when the CLI enforces it as a permission rule, ``advisory``
+    when the CLI cannot and the agent is only told. Nexus's own tools refuse
+    denied commands in every case.
+    """
+    from .providers import ProviderRegistry
+    try:
+        routed = ProviderRegistry(config).provider_config(route) if route and not str(route).startswith("web:") else None
+    except Exception:
+        routed = None
+    if routed is not None and routed.get("provider.name") == "claude-cli" and routed.get("provider.arguments") is None:
+        return "cli_rule"
+    return "advisory"
+
+
+def denial_report(goal, config):
+    """What the user sees about saved denials: where each is enforced."""
+    from .providers.native_execution import claude_deny_rules
+    denied = denied_commands(goal)
+    if not denied:
+        return []
+    report = []
+    for one in denied:
+        # A command whose text no exact rule can carry (spaces, quotes or
+        # wildcards in an argument) stays advisory even for Claude Code.
+        _rules, unenforceable = claude_deny_rules([tuple(command) for command in one["commands"]])
+        agents = []
+        for agent in goal.get("agents", []):
+            enforcement = deny_enforcement(config, agent.get("who"))
+            if enforcement == "cli_rule" and unenforceable:
+                enforcement = "advisory"
+            agents.append({"agent_id": agent.get("id", ""), "name": agent.get("name") or agent.get("id") or "Agent",
+                           "enforcement": enforcement})
+        advisory = [agent["name"] for agent in agents if agent["enforcement"] == "advisory"]
+        report.append({**one, "agents": agents, "unenforceable_by_cli_rules": unenforceable,
+                       "note": ("Nexus refuses this command for its own tools. "
+                                + ("For " + ", ".join(advisory) + " the CLI cannot block it natively, so the denial is "
+                                   "advisory there: the agent is told not to run it." if advisory else
+                                   "Every agent's CLI also enforces it as a permission rule."))})
+    return report
+
+
+def denied_commands(goal):
+    """Commands the user explicitly denied, as the agent must be told of them."""
+    access = goal_access.state(goal)
+    denied = []
+    for digest, grant in sorted(access.get("grants", {}).items()):
+        if isinstance(grant, dict) and grant.get("decision") == "deny":
+            denied.append({"approval_digest": digest, "commands": copy.deepcopy(grant.get("commands") or [])})
+    return denied
 
 
 def context(goal, task, root, ledger, evidence, files, definitions):
     from . import action_protocol, goal_decisions, swarm_work
+    from .long_horizon import PREVIOUS_EFFECTS_BUDGET, _shown_tool_results
     projected_task = {key: task.get(key) for key in (
         "id", "title", "description", "kind", "state", "assigned_agent_id", "depends_on")}
     messages = [{key: message.get(key) for key in (
@@ -93,19 +157,26 @@ def context(goal, task, root, ledger, evidence, files, definitions):
                       "conversation": messages, "roles": goal.get("workspace_collaboration"),
                       "team": goal["agents"], "tasks": ledger,
                       "user_evidence": evidence, "verification": goal.get("verification"),
-                      "previous_tool_effects": [
+                      # Bounded by its share of the one tool-result budget.
+                      "previous_tool_effects": _shown_tool_results([
                           {key: result.get(key) for key in ("call_id", "name", "result", "error")}
                           for step in task.get("context_steps", [])
                           for result in step.get("results", [])
                           if result.get("name") in {"write_file", "run_command"}
-                      ][-4:],
+                      ][-4:], PREVIOUS_EFFECTS_BUDGET),
                       "continuation_observations": {
                           "advisory": True,
                           "repeated_turns": task.get("no_progress", 0),
                           "repeated_tool_results": (task.get("context_progress") or {}).get("identical_repeats", 0),
+                          "notice": (task.get("context_progress") or {}).get("notice", ""),
                           "tool_errors": (task.get("context_progress") or {}).get("recoverable_failures", {}),
                       },
-                      "access": goal_access.state(goal), "tools": definitions}, default=str)
+                      "access": goal_access.state(goal),
+                      "user_denied_commands": {
+                          "rule": "The user denied exactly these commands. Do not run them, natively or through tools; everything else in your access mode stays available.",
+                          "denied": denied_commands(goal),
+                      },
+                      "tools": definitions}, default=str)
         + goal_decisions.prompt(goal, task["assigned_agent_id"])
         + "\n\nPROJECT TREE\n" + swarm_work._tree(root)
         + "\n\nREQUESTED FILE CONTENTS\n" + files

@@ -87,6 +87,11 @@ class FacilitatorModeTests(unittest.TestCase):
         self.assertEqual(finished["status"], "complete")
         self.assertEqual(finished["verification"]["basis"], "command_access_denied")
         self.assertEqual(finished["verification"]["commands"], [])
+        # The denial names exactly what was denied and survives restart; it is
+        # not a reason to drop the rest of the agent's native work.
+        reopened = long_horizon.GoalStore(self.config).get(goal["goal_id"])
+        self.assertEqual(facilitator.denied_commands(reopened),
+                         [{"approval_digest": preview["approval_digest"], "commands": preview["commands"]}])
 
     def test_failed_checks_keep_saved_files_and_report_unverified_criteria(self):
         goal = self.create(mode="full")
@@ -268,8 +273,10 @@ class GoalAccessTests(unittest.TestCase):
         self.addCleanup(self.fixture.doCleanups)
         self.runtime = self.fixture.runtime
         self.store = self.runtime.store
+        # These tests exercise Ask-mode command approval; goals now default to Full.
         self.goal = self.store.create(self.fixture.board, "tiny-game", ["Inspect the current project"], "permissions",
-            participant_ids=["creator", "reviewer"], conversation_id="permission-chat", isolated_workspace=True)
+            participant_ids=["creator", "reviewer"], conversation_id="permission-chat", isolated_workspace=True,
+            policy={"agent_access_mode": "ask"})
         self.root = goal_workspaces.root(self.goal, self.store.root)
         self.package = {"name": "portable-permission-fixture", "scripts": {"test": "node --test sample.test.cjs"}}
         (self.root / "package.json").write_text(json.dumps(self.package), encoding="utf-8")
@@ -473,6 +480,40 @@ class GoalAccessTests(unittest.TestCase):
         start.assert_called_once()
         self.assertEqual(self.verify(real=True)["status"], "passed")
         self.assertEqual(self.verify()[0]["basis"], "discovered_command_approval_required")
+
+    def test_http_access_change_is_allowed_while_provider_setup_changed(self):
+        # A changed provider setup is reviewed separately (reconnect). It must
+        # never stop the user from changing this chat's access mode.
+        from our_harness.server import HarnessHTTPServer
+        panel = HarnessHTTPServer(("127.0.0.1", 0), self.fixture.config)
+        panel._long_horizon = self.runtime
+        self.addCleanup(panel.server_close)
+        threading.Thread(target=panel.serve_forever, daemon=True).start()
+        self.addCleanup(panel.shutdown)
+        def post(body):
+            request = urllib.request.Request(f"http://127.0.0.1:{panel.server_address[1]}/api/long-horizon/access",
+                data=json.dumps(body).encode(), headers={"Content-Type": "application/json", "X-Harness-Token": panel.token})
+            try:
+                with urllib.request.urlopen(request) as response:
+                    return response.status, json.load(response)
+            except urllib.error.HTTPError as error:
+                return error.code, json.load(error)
+        changed = {"changed": True, "message": "The saved provider setup changed."}
+        body = {"goal_id": self.goal["goal_id"], "chat_id": "permission-chat", "project_id": "tiny-game",
+                "participant_ids": ["creator", "reviewer"], "expected_revision": self.current()["revision"], "mode": "full"}
+        with mock.patch.object(self.runtime.store, "provider_setup_status", return_value=changed):
+            status, saved = post(body)
+        self.assertEqual(status, 200, saved)
+        current = long_horizon.GoalStore(self.fixture.config).get(self.goal["goal_id"])
+        self.assertEqual(goal_access.state(current)["mode"], "full")
+        self.assertEqual(current["agent_access"]["binding"], goal_access.binding(current))
+        # The user's explicit read-only choice is honoured the same way.
+        body["expected_revision"] = current["revision"]
+        body["mode"] = "read_only"
+        with mock.patch.object(self.runtime.store, "provider_setup_status", return_value=changed):
+            status, saved = post(body)
+        self.assertEqual(status, 200, saved)
+        self.assertEqual(goal_access.state(self.current())["mode"], "read_only")
 
     def test_context_result_pauses_before_another_agent_turn_and_survives_reload(self):
         with mock.patch.object(self.runtime, "start_background"):

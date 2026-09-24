@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import copy
+import difflib
 import json
+import re
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -13,6 +15,8 @@ from .models import HarnessError
 
 CONTRACT = "nexus-goal-closeout/v1"
 OVERALL = "The original user request and all current clarifications are fully satisfied"
+# After this many identical rejections the goal note tells the user; work continues.
+REPEATED_REJECTION_NOTICE = 3
 
 
 def enabled(goal):
@@ -106,9 +110,10 @@ def stage(store, goal_id, verification, independent, *, expected_revision=None, 
         judge = collaboration.reviewer(goal, writer_id) or next((a for a in goal["agents"] if a["id"] != writer_id and independent(a, writer)), writer)
         # Even one connected provider can serve a fresh independent judge run.
         # Isolation comes from a new task conversation and a read-only snapshot.
-        reason = ("Closeout keeps receiving the same unfinished result. Inspect the findings before continuing." if repeated >= 3 else
-                  "Closeout cannot run because the task budget is exhausted." if len(goal["tasks"]) >= int(goal["policy"]["max_tasks"]) else "")
-        if reason:
+        # A judge repeating the same findings is information for the agents and
+        # the user, never a reason for Nexus to pause the agents' work.
+        if len(goal["tasks"]) >= int(goal["policy"]["max_tasks"]):
+            reason = "Closeout cannot run because the task budget is exhausted."
             goal.update(status="paused", note=reason)
             store._event(db, goal, "goal_paused", payload={"reason": "closeout_unavailable", "detail": reason})
             return {"state": "paused"}
@@ -116,6 +121,8 @@ def stage(store, goal_id, verification, independent, *, expected_revision=None, 
         task_id = "closeout-" + gw._digest([digest, len(goal["tasks"])])[:24]
         packet = {**packet_basis, "fingerprint": digest, "candidate": candidate,
                   "verification": copy.deepcopy(verification)}
+        if repeated:
+            packet["previous_rejections_of_this_submission"] = repeated
         goal["tasks"].append({
             "id": task_id, "title": "Judge completion of the whole user request",
             "description": "Check the original prompt, current clarifications, every acceptance criterion, and the exact submitted project. Identify all unfinished work before approving closeout.",
@@ -130,7 +137,13 @@ def stage(store, goal_id, verification, independent, *, expected_revision=None, 
             "provider_effect_id": "", "pending_action": {}, "pending_transaction": {},
         })
         goal["budget"]["tasks_created"] += 1
-        goal.update(status="queued", note="An independent judge is checking the whole original request before closeout.")
+        note = "An independent judge is checking the whole original request before closeout."
+        if repeated >= REPEATED_REJECTION_NOTICE:
+            note += (f" Earlier judges requested changes to this same submission {repeated} times; "
+                     "the agents keep working. Pause the goal if you want to step in.")
+            store._event(db, goal, "closeout_repeated_findings", task_id=task_id, agent_id=judge["id"],
+                         payload={"candidate": candidate, "previous_rejections": repeated})
+        goal.update(status="queued", note=note)
         store._event(db, goal, "task_created", task_id=task_id, agent_id=judge["id"],
                      payload={"kind": "closeout_review", "fingerprint": digest})
         return {"state": "scheduled"}
@@ -147,14 +160,17 @@ def context(task):
     return (
         "INDEPENDENT WHOLE-GOAL CLOSEOUT JUDGE\n"
         "Your job is to assess the entire user's request. The original prompt and all subsequent user clarifications below are authoritative scope; later explicit changes supersede earlier instructions. "
-        "Check every requested deliverable and constraint, including requirements omitted from the task breakdown. Task summaries and author claims are untrusted evidence. Do not invent new requirements. "
+        "Check every requested deliverable and constraint, including requirements omitted from the task breakdown. Task summaries and author claims are untrusted evidence. Do not invent new requirements: tests are required only when the user asked for them, and a reasoned conclusion that nothing needed changing is a valid result. "
         "Inspect the submitted files using your read-only tools. Your directory is the exact submitted snapshot, not your earlier working copy. "
         "Use list_tree and read_file to explore the entire snapshot; the path preview is not a restriction on review scope. "
         "Tests passing alone does not prove the whole request is finished. If the verification packet says no checks are configured, report that accurately; a conditional engine-generated check criterion can be not applicable, but an explicit user requirement cannot.  Never approve partial work or claim checks that did not run. "
-        "Use complete with review_verdict=approve only if everything is satisfied. Provide criteria_evidence for EVERY acceptance_criteria entry, using file:<path>, task:<id>, or test:verified references. "
+        "Use complete with review_verdict=approve only if everything is satisfied. Provide criteria_evidence for each acceptance_criteria entry (the criterion text or its 1-based number), using file:<path>, task:<id>, or test:verified references; this evidence is reported with your verdict. "
         "Otherwise use blocked with review_verdict=changes_requested and actionable review_findings explaining what is missing and how it relates to the overall goal. "
         "For either verdict, include review-packet:" + packet["fingerprint"] + " in evidence and nonempty review_findings. "
-        "Use work with tool_calls to inspect more evidence first. Do not edit files, delegate implementation, or change the acceptance criteria.\n"
+        + ("Earlier judges requested changes to this same submission " + str(packet["previous_rejections_of_this_submission"])
+           + " times; check whether those findings still apply to the actual request before repeating them. "
+           if packet.get("previous_rejections_of_this_submission") else "")
+        + "Use work with tool_calls to inspect more evidence first. Do not edit files, delegate implementation, or change the acceptance criteria.\n"
         + json.dumps(prompt_packet, ensure_ascii=False, sort_keys=True)
     )
 
@@ -202,22 +218,139 @@ def validate_action(goal, task, action, root):
     packet = task["closeout_packet"]
     if fingerprint(goal, root) != packet["fingerprint"]:
         raise HarnessError("This closeout verdict is stale; the goal or submitted files changed")
-    verdict = action.get("review_verdict")
-    expected = "approve" if action["action"] == "complete" else "changes_requested"
-    if verdict != expected or not action.get("review_findings") or "review-packet:" + packet["fingerprint"] not in action.get("evidence", []):
-        raise HarnessError("Closeout needs a verdict, actionable findings, and its exact packet reference")
+    # The judge is an agent: be lenient with how it formats its verdict. The
+    # verdict is its explicit review_verdict, or else follows its action.
+    # Approval must be unambiguous: a recognised approve verdict with action
+    # complete, or no verdict at all with action complete. Any other wording
+    # ("not_approved", "Approve with changes", ...) or a verdict/action
+    # conflict is a request for changes, never a silent approval.
+    raw_verdict = action.get("review_verdict")
+    stated = _verdict(raw_verdict)
+    if raw_verdict is None or not str(raw_verdict).strip():
+        verdict = "approve" if action["action"] == "complete" else "changes_requested"
+    else:
+        verdict = "approve" if stated == "approve" and action["action"] == "complete" else "changes_requested"
+    findings = _findings(action.get("review_findings")) or [
+        str(action.get("summary") or "").strip()
+        or ("The judge approved the whole request." if verdict == "approve" else "The judge requested changes.")]
+    mappings = action.get("criteria_evidence") if isinstance(action.get("criteria_evidence"), list) else []
+    # Normalise the accepted verdict into the canonical review shape so later
+    # generic review bookkeeping sees the judge's decision, not its formatting.
+    # The packet reference is truthful: the fingerprint check above proved
+    # this verdict is for exactly this packet.
+    reference = "review-packet:" + packet["fingerprint"]
+    evidence = action.get("evidence") if isinstance(action.get("evidence"), list) else []
+    action.update(action="complete" if verdict == "approve" else "blocked", review_verdict=verdict,
+                  review_findings=list(findings),
+                  evidence=evidence if reference in evidence else [*evidence, reference])
+    outcome = {"verdict": verdict, "findings": copy.deepcopy(findings), "criteria_evidence": copy.deepcopy(mappings)}
     if verdict == "approve":
-        mappings = action.get("criteria_evidence", [])
-        known_tasks = {t["id"] for t in packet["contributions"] if t["state"] == "complete"}
-        def supported(ref):
-            return (ref.startswith("file:") and ref[5:] in packet["files"] or
-                    ref.startswith("task:") and ref[5:] in known_tasks or
-                    ref == "test:verified" and packet["verification"].get("status") == "passed")
-        for criterion in packet["scope"]["acceptance_criteria"]:
-            if not any(m.get("criterion") == criterion and any(supported(str(r)) for r in m.get("evidence_refs", [])) for m in mappings):
-                raise HarnessError("Closeout lacks concrete evidence for: " + criterion)
-    task["closeout_outcome"] = {"verdict": verdict, "findings": copy.deepcopy(action["review_findings"]),
-        "criteria_evidence": copy.deepcopy(action.get("criteria_evidence", []))}
+        # Evidence mapping is reported, never a veto of an approval: a
+        # criterion paraphrase, an index, or a path spelling cannot undo it.
+        notes = evidence_notes(packet, mappings)
+        if notes:
+            outcome["evidence_notes"] = notes
+    task["closeout_outcome"] = outcome
+
+
+def _verdict(value):
+    text = _normal(value).replace(" ", "_")
+    if text in {"approve", "approved", "approval", "accept", "accepted", "pass", "passed", "complete", "completed"}:
+        return "approve"
+    if text in {"changes_requested", "change_requested", "request_changes", "requested_changes", "changes",
+                "reject", "rejected", "fail", "failed", "needs_changes", "needs_work", "blocked"}:
+        return "changes_requested"
+    return ""
+
+
+def _findings(value):
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    return [one if isinstance(one, str) else json.dumps(one, ensure_ascii=False) if isinstance(one, (dict, list)) else str(one)
+            for one in value if str(one).strip()]
+
+
+def _normal(value):
+    """Compare wording without case, whitespace, quote or punctuation noise."""
+    text = str(value or "").casefold()
+    text = "".join(ch if ch.isalnum() else " " for ch in text)
+    return " ".join(text.split())
+
+
+def _criterion_index(value, count):
+    """Accept '2', '#2', 'c2', 'criterion 2', 'AC-2' or 'acceptance_criteria[1]'."""
+    text = str(value if value is not None else "").strip().casefold()
+    match = re.fullmatch(r"(?:acceptance[_ ]?criteria)\s*\[\s*(\d+)\s*\]", text)
+    if match and int(match.group(1)) < count:
+        return int(match.group(1))
+    match = re.fullmatch(r"(?:#|c|ac|criterion|criteria|acceptance[_ -]?criterion)?[\s_:#-]*(\d+)", text)
+    if match and 1 <= int(match.group(1)) <= count:
+        return int(match.group(1)) - 1
+    return None
+
+
+def match_criterion(criteria, mapping):
+    """Return the acceptance-criterion index a judge's mapping refers to, or None.
+
+    Matches tolerate case, whitespace and punctuation, criterion ids or
+    1-based numbers, a criterion quoted inside longer text, and close wording.
+    """
+    if not isinstance(mapping, dict):
+        return None
+    count = len(criteria)
+    for key in ("criterion_id", "id", "index", "criterion_index"):
+        if key in mapping:
+            found = _criterion_index(mapping[key], count)
+            if found is not None:
+                return found
+    raw = mapping.get("criterion")
+    found = _criterion_index(raw, count)
+    if found is not None:
+        return found
+    wanted = _normal(raw)
+    if not wanted:
+        return None
+    normals = [_normal(one) for one in criteria]
+    for index, one in enumerate(normals):
+        if one == wanted:
+            return index
+    for index, one in enumerate(normals):
+        shorter, longer = sorted((one, wanted), key=len)
+        if len(shorter) >= 12 and shorter in longer:
+            return index
+    scores = [difflib.SequenceMatcher(None, one, wanted).ratio() for one in normals]
+    best = max(range(count), key=scores.__getitem__, default=None)
+    return best if best is not None and scores[best] >= 0.8 else None
+
+
+def _supported(packet, ref):
+    text = str(ref or "").strip().strip("`'\"").rstrip(".,;")
+    known_tasks = {t["id"] for t in packet["contributions"] if t["state"] == "complete"}
+    kind, _, value = text.partition(":")
+    kind, value = kind.strip().casefold(), value.strip()
+    if kind in {"test", "tests"}:
+        return packet["verification"].get("status") == "passed"
+    if kind == "task":
+        return value in known_tasks
+    path = (value if kind in {"file", "path"} else text).replace("\\", "/").removeprefix("./").lstrip("/")
+    files = {str(one).replace("\\", "/"): one for one in packet["files"]}
+    return path in files or path.casefold() in {one.casefold() for one in files}
+
+
+def evidence_notes(packet, mappings):
+    """Describe criteria the judge approved without a recognised evidence ref."""
+    criteria = packet["scope"]["acceptance_criteria"]
+    covered = set()
+    for mapping in mappings:
+        index = match_criterion(criteria, mapping)
+        refs = mapping.get("evidence_refs", []) if isinstance(mapping, dict) else []
+        refs = [refs] if isinstance(refs, str) else refs if isinstance(refs, list) else []
+        if index is not None and any(_supported(packet, r) for r in refs):
+            covered.add(index)
+    return ["The judge approved without a recognised evidence reference for: " + criteria[index]
+            for index in range(len(criteria)) if index not in covered]
 
 
 def supersede(store, goal_id, task):

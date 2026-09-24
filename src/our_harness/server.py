@@ -5392,7 +5392,10 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     held_goal = runtime.store.get(goal_id)
                     self.server.require_long_horizon_chat_binding(held_goal, body)
                     runtime._require_goal_authority(held_goal)
-                    runtime._require_agent_setup(held_goal)
+                    # Access is the user's decision. A changed provider setup
+                    # is reviewed separately (reconnect) and must never stop
+                    # the user from changing access; update_access ties the
+                    # new record to the goal's current agent bindings.
                     goal = runtime.store.update_access(goal_id,
                         expected_revision=body.get("expected_revision"), mode=body.get("mode"),
                         decision=body.get("decision"), command_digest=str(body.get("command_digest") or ""))

@@ -107,15 +107,25 @@ class SharedGoalVerificationTests(unittest.TestCase):
                 self.assertEqual(len(result["commands"]), 1)
 
     def test_plural_read_only_requests_cannot_inherit_mutation_authority(self):
+        # Only explicit read-only wording forbids changes.
         with mock.patch.object(swarm_work, "_run_disposable_verification_command") as run:
-            for objective in (
-                "Can you guys explain how the rewards work? Do not change any files.",
-                "Could you both inspect game.py and report whether a shop is needed?",
-            ):
-                with self.subTest(objective=objective):
-                    result = self.verify(goal=objective)
-                    self.assertEqual(result["status"], "failed", result)
+            result = self.verify(
+                goal="Can you guys explain how the rewards work? Do not change any files.",
+            )
+            self.assertEqual(result["status"], "failed", result)
             run.assert_not_called()
+
+    def test_a_question_is_not_a_read_only_run(self):
+        # "Agents lead; Nexus only supports": a question never forbids a
+        # change the agents decide to make.
+        with mock.patch.object(
+            swarm_work, "_run_disposable_verification_command", return_value=self.result(),
+        ) as run:
+            result = self.verify(
+                goal="Could you both inspect game.py and report whether a shop is needed?",
+            )
+            self.assertEqual(result["status"], "passed", result)
+            run.assert_called_once()
 
     def test_real_native_node_tests_execute_in_disposable_project_and_reject_bad_game(self):
         node = shutil.which("node")
@@ -205,26 +215,98 @@ class SharedGoalVerificationTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed", result)
         self.assertIn("escape", result["basis"])
 
-    def test_no_selected_checks_for_runtime_source_require_actual_execution(self):
+    def test_runtime_source_without_a_test_request_reports_optional_test_evidence(self):
+        # Changed .py files in a project with no tests must still be able to
+        # complete: executable source alone never makes tests mandatory.
         self.project["test_commands"] = []
         with mock.patch.object(
             swarm_work, "_verification_commands", return_value=([], "discovered"),
         ), mock.patch.object(swarm_work, "_run_disposable_verification_command") as run:
             result = self.verify()
-            self.assertEqual(result["status"], "failed", result)
-            self.assertEqual(result["basis"], "runtime_verification_required")
+            self.assertEqual(result["status"], "not_configured", result)
+            self.assertEqual(result["basis"], "no_selected_checks")
+            self.assertFalse(result["tests_requested"])
+            self.assertEqual(result["runtime_paths"], ["game.py", "test_game.py"])
             self.assertEqual(result["commands"], [])
             self.assertIn("no tests ran", result["reason"])
             self.assertEqual(result["current_tree_merkle"], swarm_work._project_tree_merkle(self.root)[0])
             self.assertEqual(result["check_policy"], goal_verification.CHECK_POLICY)
             self.assertNotIn("verification_analysis", result)
+            for goal in ("Make the website footer text say 2026", "Write a script that renames photos"):
+                with self.subTest(goal=goal):
+                    self.assertEqual(self.verify(goal=goal, changed=["game.py"])["status"], "not_configured")
             context = self.verify(changed=[], require_changes=False)
-            self.assertEqual(context["status"], "failed", context)
+            self.assertEqual(context["status"], "not_configured", context)
             run.assert_not_called()
             # A changed project must receive fresh snapshot evidence.
             (self.root / "game.py").write_text("def winner(score): return None\n", encoding="utf-8")
             changed = self.verify(changed=[], require_changes=False)
             self.assertNotEqual(result["current_tree_merkle"], changed["current_tree_merkle"])
+
+    def test_explicit_user_test_request_still_needs_executed_checks(self):
+        self.project["test_commands"] = []
+        with mock.patch.object(
+            swarm_work, "_verification_commands", return_value=([], "discovered"),
+        ), mock.patch.object(swarm_work, "_run_disposable_verification_command") as run:
+            for goal in (
+                "Create the amber game and add unit tests for its scoring.",
+                "Update game.py and make sure the tests pass.",
+                "Build the game, then test it.",
+            ):
+                with self.subTest(goal=goal):
+                    result = self.verify(goal=goal)
+                    self.assertEqual(result["status"], "failed", result)
+                    self.assertEqual(result["basis"], "runtime_verification_required")
+                    self.assertTrue(result["tests_requested"])
+                    self.assertIn("explicitly asked for tests", result["reason"])
+            run.assert_not_called()
+
+    def test_explicit_test_request_detection_is_literal_not_inferred(self):
+        requested = (
+            "Add unit tests for the parser", "Make sure the tests pass", "Run the test suite and fix failures",
+            "Build the game and test it", "Write tests for game.py", "Implement login with automated tests",
+            "Fix the bug; make sure it is well tested", "Add pytest coverage", "Update app.py so all tests pass",
+        )
+        not_requested = (
+            "Make the website footer text say 2026", "Write a script that renames photos",
+            "Create a game where players can win the amber arena and verify its scoring.",
+            "Write a typing test game", "Create a test plan document", "Build a website where readers can search entries",
+            "Make a working browser game", "Fix the latest bug", "No tests needed, just update the README",
+            "Update app.py; don't write tests", "Refactor main.py without adding tests", "Update the footer, tests are optional",
+        )
+        for goal in requested:
+            with self.subTest(goal=goal):
+                self.assertTrue(goal_verification.tests_explicitly_requested(goal))
+                self.assertTrue(goal_verification.requested_runtime_verification(goal))
+        for goal in not_requested:
+            with self.subTest(goal=goal):
+                self.assertFalse(goal_verification.tests_explicitly_requested(goal))
+                self.assertFalse(goal_verification.requested_runtime_verification(goal))
+        # Read-only intent never turns into a test requirement.
+        self.assertFalse(goal_verification.requested_runtime_verification(
+            "Read the tests and explain them; do not change any files."))
+
+    def test_explicit_test_requests_are_classified_as_write_or_run(self):
+        # The one shared classifier (also used by the work-together engine).
+        for goal, kind in (
+            ("Fix app.py. Tests are required.", "write"), ("Fix app.py. It must have tests.", "write"),
+            ("Fix app.py and write one test for it", "write"), ("Fix app.py. Don't forget tests!", "write"),
+            ("Fix app.py. Tests: mandatory.", "write"), ("Fix app.py and add another test", "write"),
+            ("Add unit tests for the parser", "write"), ("Make sure the tests pass", "run"),
+            ("Run the test suite", "run"), ("Fix the failing tests", "run"),
+        ):
+            with self.subTest(goal=goal):
+                self.assertTrue(goal_verification.tests_explicitly_requested(goal))
+                self.assertEqual(kind, goal_verification.explicit_test_requests(goal)[0]["kind"])
+                self.assertEqual(kind == "write", goal_verification.tests_write_requested(goal))
+        for goal in ("Do not add tests; just fix app.py", "Fix app.py without adding tests",
+                     "Fix app.py. No need to add tests.", "Tests are not required"):
+            with self.subTest(negated=goal):
+                self.assertFalse(goal_verification.tests_explicitly_requested(goal))
+                self.assertEqual([], goal_verification.explicit_test_requests(goal))
+        phrase = goal_verification.explicit_test_requests("Add unit, API and E2E tests for checkout")[0]["phrase"]
+        self.assertIn("unit", phrase)
+        self.assertIn("API", phrase)
 
     def test_unapproved_discovery_still_requires_approval(self):
         with mock.patch.object(
@@ -256,7 +338,9 @@ class SharedGoalVerificationTests(unittest.TestCase):
 
     def test_policy_is_versioned_fingerprinted_and_legacy_command_authority_survives(self):
         current = goal_verification.capture_verification_contract(self.config, self.project, self.root)
-        self.assertEqual(current["schema_version"], 4)
+        self.assertEqual(current["schema_version"], 5)
+        self.assertEqual(current["check_policy"]["runtime_deliverables"],
+                         "executed-checks-only-when-user-requested-tests/v2")
         self.assertEqual(current["check_policy"], goal_verification.CHECK_POLICY)
         saved = {"project": self.project, "objective": "Inspect the game", "verification_contract": current}
         self.assertEqual(goal_verification.verification_project(self.config, saved)["test_commands"], [self.command])
@@ -273,6 +357,20 @@ class SharedGoalVerificationTests(unittest.TestCase):
         saved["verification_contract"] = legacy_v2
         self.assertEqual(goal_verification.verification_project(self.config, saved)["test_commands"], [self.command])
         self.assertNotEqual(current["fingerprint_sha256"], legacy_v2["fingerprint_sha256"])
+        # Schema-4 goals keep their command authority and get the new policy.
+        legacy_v4 = copy.deepcopy(current)
+        legacy_v4.pop("fingerprint_sha256")
+        legacy_v4.update({"schema_version": 4, "check_policy": goal_verification.RUNTIME_REQUIRED_CHECK_POLICY})
+        legacy_v4["fingerprint_sha256"] = goal_verification._fingerprint(legacy_v4)
+        saved["verification_contract"] = legacy_v4
+        self.assertEqual(goal_verification.verification_project(self.config, saved)["test_commands"], [self.command])
+        mismatched = copy.deepcopy(legacy_v4)
+        mismatched.pop("fingerprint_sha256")
+        mismatched["check_policy"] = goal_verification.CHECK_POLICY
+        mismatched["fingerprint_sha256"] = goal_verification._fingerprint(mismatched)
+        saved["verification_contract"] = mismatched
+        with self.assertRaisesRegex(HarnessError, "verification contract changed"):
+            goal_verification.verification_project(self.config, saved)
         altered = copy.deepcopy(current)
         altered["check_policy"]["configured_or_discovered_checks"] = "optional"
         altered["fingerprint_sha256"] = goal_verification._fingerprint({key: value for key, value in altered.items() if key != "fingerprint_sha256"})
@@ -420,16 +518,32 @@ class SharedGoalVerificationTests(unittest.TestCase):
             self.assertEqual(prohibited["basis"], "protected_path", prohibited)
             run.assert_not_called()
 
-    def test_baseline_checks_can_run_before_edits_but_final_verification_requires_changes(self):
+    def test_reasoned_no_change_result_is_a_valid_final_completion(self):
         before, _ = swarm_work._project_tree_merkle(self.root)
         baseline = self.verify(changed=[], require_changes=False)
         self.assertEqual(baseline["status"], "passed", baseline)
         self.assertTrue(baseline["verification_analysis"]["passed"])
+        self.assertNotIn("no_file_changes_recorded", baseline)
         self.assertEqual(before, swarm_work._project_tree_merkle(self.root)[0])
-        with mock.patch.object(swarm_work, "_run_disposable_verification_command") as run:
-            final = self.verify(changed=[])
-        self.assertEqual(final["basis"], "goal_effect", final)
+        # Final verification with nothing changed runs the user's checks and
+        # passes; the empty change set is reported, never a goal_effect veto.
+        final = self.verify(changed=[])
+        self.assertEqual(final["status"], "passed", final)
+        self.assertNotEqual(final["basis"], "goal_effect")
+        self.assertTrue(final["no_file_changes_recorded"])
+        self.project["test_commands"] = []
+        with mock.patch.object(
+            swarm_work, "_verification_commands", return_value=([], "discovered"),
+        ), mock.patch.object(swarm_work, "_run_disposable_verification_command") as run:
+            unconfigured = self.verify(goal="Check game.py already awards amber at three points; fix it if needed.", changed=[])
+        self.assertEqual(unconfigured["status"], "not_configured", unconfigured)
+        self.assertTrue(unconfigured["no_file_changes_recorded"])
+        self.assertIn("no-change conclusion is a valid result", unconfigured["reason"])
         run.assert_not_called()
+        # A failing user-configured check is still a real failure.
+        self.project["test_commands"] = [self.command]
+        (self.root / "game.py").write_text("def winner(score):\n    return None\n", encoding="utf-8")
+        self.assertEqual(self.verify(changed=[])["status"], "failed")
 
     def test_read_only_goal_with_no_changes_preserves_zero_write_verification(self):
         with mock.patch.object(swarm_work, "_run_disposable_verification_command") as run:

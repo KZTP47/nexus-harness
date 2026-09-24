@@ -336,9 +336,18 @@ class GoalWorkspaces(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
         else:
             linked.symlink_to(outside, target_is_directory=True)
-        with self.assertRaisesRegex(HarnessError, "Linked path"):
-            self.goal("linked-source")
+        # A link is skipped with a note rather than failing the goal, and it
+        # is never followed: nothing outside the project is copied or touched.
+        linked_goal = self.goal("linked-source")
+        copy_root = workspaces.root(linked_goal, self.runtime)
+        self.assertFalse((copy_root / "linked-directory").exists())
+        self.assertFalse(any(path.name == "private.txt" for path in copy_root.rglob("*")))
+        self.assertEqual(linked_goal["execution_workspace"]["skipped_links"]["paths"], ["linked-directory"])
+        (copy_root / "app.txt").write_text("changed beside a link")
+        self.publish(linked_goal)
+        self.assertEqual((self.source / "app.txt").read_text(), "changed beside a link")
         self.assertEqual((outside / "private.txt").read_text(), "outside data")
+        self.assertEqual(sorted(path.name for path in outside.iterdir()), ["private.txt"])
 
     def test_legacy_root_and_nested_publication_creation(self) -> None:
         document = {"goal_id": "legacy-goal", "project": {"path": str(self.source)}}
@@ -350,20 +359,119 @@ class GoalWorkspaces(unittest.TestCase):
         with self.assertRaisesRegex(HarnessError, "context"):
             workspaces.create(document, self.runtime, publication_locked=True)
 
-    def test_links_aliases_and_inside_project_runtime_are_rejected(self) -> None:
+    def test_inside_project_runtime_is_rejected_and_hard_links_are_tolerated(self) -> None:
+        # uv and pnpm install by hard link. A hard-linked file is an ordinary
+        # file to Nexus: it validates and publishes. Only writing *through* a
+        # hard-linked project file stays refused, because the other names of
+        # that file can live outside the project.
+        store = self.folder / "package-store.txt"
+        store.write_text("store bytes")
+        try:
+            os.link(store, self.source / "source-linked.txt")
+        except OSError:
+            self.skipTest("Hard links unavailable on this filesystem")
         document = self.goal()
         with self.assertRaises(HarnessError):
             workspaces.create({"goal_id": "escape", "project": {"path": str(self.source)}}, self.source / "runtime")
-        outside = self.folder / "outside.txt"
-        outside.write_text("outside bytes")
-        linked = workspaces.root(document, self.runtime) / "linked.txt"
+        os.link(store, workspaces.root(document, self.runtime) / "linked.txt")
+        workspaces.validate(document, self.runtime, full=True)
+        self.publish(document)
+        self.assertEqual((self.source / "linked.txt").read_text(), "store bytes")
+        self.assertEqual(store.read_text(), "store bytes")
+        document = self.goal("writes-through-a-link")
+        (workspaces.root(document, self.runtime) / "source-linked.txt").write_text("goal bytes")
+        with self.assertRaisesRegex(workspaces.WorkspaceConflict, "hard-linked project file"):
+            self.publish(document)
+        self.assertEqual(store.read_text(), "store bytes")
+        self.assertEqual((self.source / "source-linked.txt").read_text(), "store bytes")
+        self.assertEqual((workspaces.root(document, self.runtime) / "source-linked.txt").read_text(), "goal bytes")
+
+    def test_dependencies_are_provided_but_never_compared_or_published_and_caches_are_absent(self) -> None:
+        for relative in ["node_modules/pkg/index.js", ".venv/Lib/site.py", "src/__pycache__/app.cpython-313.pyc",
+                         "custom-env/Lib/tool.py", ".pytest_cache/v/cache/nodeids"]:
+            (self.source / relative).parent.mkdir(parents=True, exist_ok=True)
+            (self.source / relative).write_text("generated " + relative)
+        (self.source / "custom-env" / "pyvenv.cfg").write_text("home = anywhere")
+        (self.source / "stray.pyc").write_bytes(b"\x00bytecode")
+        (self.source / "dist").mkdir()
+        (self.source / "dist" / "bundle.js").write_text("deliverable")
+        (self.source / "tools" / ".cache").mkdir(parents=True)
+        (self.source / "tools" / ".cache" / "fixture.json").write_text("{}")
+        document = self.goal()
+        copy_root = workspaces.root(document, self.runtime)
+        # Checks in the copy need installed dependencies: they are provided.
+        for provided in ["node_modules/pkg/index.js", ".venv/Lib/site.py", "custom-env/Lib/tool.py"]:
+            self.assertEqual((copy_root / provided).read_text(), "generated " + provided, provided)
+        # Regenerable caches and bytecode are absent.
+        for skipped in [".pytest_cache", "src/__pycache__", "stray.pyc"]:
+            self.assertFalse((copy_root / skipped).exists(), skipped)
+        self.assertEqual((copy_root / "dist" / "bundle.js").read_text(), "deliverable")
+        self.assertEqual((copy_root / "tools" / ".cache" / "fixture.json").read_text(), "{}")
+        (copy_root / "tools" / ".cache" / "fixture.json").write_text('{"updated": true}')
+        # The agent's own installs and bytecode in the copy never become a
+        # publication delta or a false conflict; real outputs still publish.
+        (copy_root / "node_modules" / "new").mkdir(parents=True)
+        (copy_root / "node_modules" / "new" / "index.js").write_text("installed by the agent")
+        (copy_root / "app.pyc").write_bytes(b"\x01different bytecode")
+        (self.source / "stray.pyc").write_bytes(b"\x02the user's bytecode changed")
+        (copy_root / "dist" / "bundle.js").write_text("rebuilt deliverable")
+        self.assertEqual(workspaces.differing_files(document, self.runtime), ["dist/bundle.js", "tools/.cache/fixture.json"])
+        manifest = self.publish(document)
+        self.assertEqual(sorted(one["path"] for one in manifest["changes"]), ["dist/bundle.js", "tools/.cache/fixture.json"])
+        self.assertEqual((self.source / "tools" / ".cache" / "fixture.json").read_text(), '{"updated": true}')
+        self.assertFalse((self.source / "node_modules" / "new").exists())
+        self.assertEqual((self.source / "dist" / "bundle.js").read_text(), "rebuilt deliverable")
+        self.assertEqual((self.source / "node_modules" / "pkg" / "index.js").read_text(), "generated node_modules/pkg/index.js")
+
+    def test_new_cache_folders_in_the_copy_are_not_published_but_reported(self) -> None:
+        # A .cache folder that already existed in the project is content; one
+        # that only appears in the copy is tool output: kept there, reported,
+        # never published into the user's project.
+        (self.source / "tools" / ".cache").mkdir(parents=True)
+        (self.source / "tools" / ".cache" / "fixture.json").write_text("{}")
+        document = self.goal()
+        copy_root = workspaces.root(document, self.runtime)
+        (copy_root / "tools" / ".cache" / "second.json").write_text("new fixture in an existing folder")
+        for litter in (".cache/tool/state.bin", "pkg/.cache/entry"):
+            (copy_root / litter).parent.mkdir(parents=True, exist_ok=True)
+            (copy_root / litter).write_text("tool litter")
+        (copy_root / "app.txt").write_text("real change")
+        self.assertEqual(workspaces.differing_files(document, self.runtime), ["app.txt", "tools/.cache/second.json"])
+        with workspaces.publication(document, self.runtime):
+            receipt = workspaces.prepare_publish(document, self.runtime)
+            self.assertEqual(receipt["held_back_cache_count"], 2)
+            self.assertEqual(receipt["held_back_cache_files"], [".cache/tool/state.bin", "pkg/.cache/entry"])
+            manifest = workspaces.publish(document, self.runtime, receipt)
+        self.assertEqual(sorted(one["path"] for one in manifest["changes"]), ["app.txt", "tools/.cache/second.json"])
+        self.assertEqual(manifest["held_back_cache_count"], 2)
+        self.assertFalse((self.source / ".cache").exists())
+        self.assertFalse((self.source / "pkg" / ".cache").exists())
+        self.assertEqual((self.source / "tools" / ".cache" / "second.json").read_text(), "new fixture in an existing folder")
+        self.assertTrue((copy_root / ".cache" / "tool" / "state.bin").exists())  # kept in the copy
+
+    def test_cache_folder_tracked_in_git_head_is_content_even_if_missing_locally(self) -> None:
         try:
-            os.link(outside, linked)
-        except OSError:
-            self.skipTest("Hard links unavailable on this filesystem")
-        with self.assertRaisesRegex(HarnessError, "hard-linked"):
-            workspaces.validate(document, self.runtime, full=True)
-        self.assertEqual(outside.read_text(), "outside bytes")
+            subprocess.run(["git", "init", "-q"], cwd=self.source, check=True, capture_output=True)
+        except (OSError, subprocess.CalledProcessError):
+            self.skipTest("git is unavailable")
+        (self.source / "assets" / ".cache").mkdir(parents=True)
+        (self.source / "assets" / ".cache" / "tracked.json").write_text('{"v": 1}')
+        environment = {key: value for key, value in os.environ.items() if not key.upper().startswith("GIT_")}
+        environment.update(GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
+                           GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
+        subprocess.run(["git", "add", "-A"], cwd=self.source, check=True, capture_output=True, env=environment)
+        subprocess.run(["git", "commit", "-q", "-m", "fixture"], cwd=self.source, check=True, capture_output=True, env=environment)
+        # Deleted from the working tree, still tracked in HEAD.
+        (self.source / "assets" / ".cache" / "tracked.json").unlink()
+        (self.source / "assets" / ".cache").rmdir()
+        document = self.goal("tracked-cache")
+        copy_root = workspaces.root(document, self.runtime)
+        (copy_root / "assets" / ".cache").mkdir(parents=True)
+        (copy_root / "assets" / ".cache" / "tracked.json").write_text('{"v": 2}')
+        manifest = self.publish(document)
+        self.assertEqual([one["path"] for one in manifest["changes"]], ["assets/.cache/tracked.json"])
+        self.assertEqual((self.source / "assets" / ".cache" / "tracked.json").read_text(), '{"v": 2}')
+        self.assertNotIn("held_back_cache_count", manifest)
 
     def test_publication_lock_serializes_nested_selected_roots_across_processes(self) -> None:
         document = self.goal()
@@ -423,7 +531,7 @@ class GoalWorkspaces(unittest.TestCase):
                 try:
                     self.assertTrue(acquired.wait(3), failures)
                     began = time.monotonic()
-                    with self.assertRaisesRegex(HarnessError, "Another harness process holds the project transaction lock|Another write operation is using this project"):
+                    with self.assertRaisesRegex(HarnessError, "Another harness process holds the project transaction lock|Another write operation is (still )?using this project"):
                         with workspaces.publication(document, self.runtime, timeout_seconds=0):
                             self.fail("A contended publication lock was acquired")
                     self.assertLess(time.monotonic() - began, 0.5)

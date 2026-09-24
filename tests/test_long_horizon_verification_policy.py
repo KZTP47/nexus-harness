@@ -51,10 +51,11 @@ class LongHorizonVerificationPolicyTests(unittest.TestCase):
         self.runtime = long_horizon.LongHorizonRuntime(self.config)
         self.addCleanup(self.runtime.close)
 
-    def create(self, request="verification-policy", *, criteria=None):
+    def create(self, request="verification-policy", *, criteria=None, policy=None):
         options = {
             "lead_id": "creator", "participant_ids": ["creator", "reviewer"],
             "conversation_id": "chat-" + request, "success_criteria": criteria,
+            **({"policy": policy} if policy is not None else {}),
         }
         objective = ["Make an illustrated field guide together and agree on the finished result"]
         admitted = self.runtime.store.inspect_runtime_admission(self.board, "tiny-game", objective, request, **options)
@@ -239,7 +240,7 @@ class LongHorizonVerificationPolicyTests(unittest.TestCase):
         self.assertEqual(transaction["tree_merkle"], result["verification"]["current_tree_merkle"])
 
     def test_discovered_checks_after_goal_creation_still_require_approval(self):
-        goal = self.create()
+        goal = self.create(policy={"agent_access_mode": "ask"})
         (self.project / "package.json").write_text('{"scripts":{"test":"node --test"}}', encoding="utf-8")
         result = self.verify(self.finish_tasks(goal))
         self.assertEqual(result["status"], "paused", result["note"])

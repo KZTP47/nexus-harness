@@ -68,16 +68,20 @@ class LongHorizonToolRecoveryTests(unittest.TestCase):
         self.assertTrue(recovered["tasks"][0]["outcome_unknown"])
         self.assertNotIn("provider_wait", self.runtime.store.public(recovered)["tasks"][0])
 
-    def test_wrong_skill_variants_stop_without_exhausting_provider_calls(self):
+    def test_wrong_skill_variants_get_a_notice_and_the_agent_keeps_control(self):
+        # Agents lead: repeated recoverable tool errors produce a notice that
+        # points at the right tool. Nexus does not pause the goal for them.
         goal = self.create("wrong-skill-loop")
         responses = [reply("work", "Inspecting the project", tool_calls=[{
             "call_id": f"call-{n}", "name": "read_local_skill", "arguments": {"path": f"missing-{n}"}
         }]) for n in range(5)]
-        result, seen = self.run_replies(goal, responses)
-        self.assertEqual(result["status"], "paused", result.get("note"))
-        self.assertEqual(len(seen), 5)
-        self.assertIn("Repeated recoverable tool errors", result["note"])
+        result, seen = self.run_replies(goal, [*responses, reply(), reply()])
+        self.assertEqual(result["status"], "complete", result.get("note"))
+        self.assertEqual(len(seen), 7)
         self.assertIn('"name":"read_file"', seen[0][1])
+        self.assertTrue(any("Use read_file for ordinary files" in context for _route, context in seen[5:]))
+        events = self.runtime.store.events(goal["goal_id"])["events"]
+        self.assertFalse(any(one["type"] in {"context_progress_paused", "goal_paused"} for one in events))
 
     def pending(self, request="pending-tools", calls=None):
         goal = self.create(request)
