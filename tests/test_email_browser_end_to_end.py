@@ -78,6 +78,7 @@ class BrowserEndToEndTests(unittest.TestCase):
                         self.assertFalse(receipt_file.exists())
                         with self.assertRaises(HarnessError):
                             studio.finalize_draft(draft['id'])
+                        self.assertTrue(service.dispatch('prepare_draft', dict(account_id=account['id'], draft_id=draft['id'], revision=draft['revision'], intent='revise', text='My UI edit.'))['ready'])
                         revised = studio.revise_draft(dict(account_id=account['id'], draft_id=draft['id'],
                             revision=draft['revision'], text='My UI edit.', instruction='Make it concise.'))['draft']
                         revision_context = next(context for task, context in reversed(calls) if task.startswith('Revise'))
@@ -86,6 +87,8 @@ class BrowserEndToEndTests(unittest.TestCase):
                         self.assertEqual(studio.snapshot()['automatic_memories'][0]['recipient'], fixture['recipient'])
                         self.assertFalse(receipt_file.exists(), 'Automatic learning never sends the reply')
                         approved_body = 'Exactly approved first line.\nConcise second line.'
+                        self.assertTrue(service.dispatch('prepare_draft', dict(account_id=account['id'], draft_id=draft['id'], revision=revised['revision'], intent='send', text=approved_body))['ready'])
+                        self.assertFalse(receipt_file.exists(), 'Readiness must never dispatch')
                         studio.dispatch('approve_draft', dict(account_id=account['id'], draft_id=draft['id'],
                             revision=revised['revision'], text=approved_body, learn=True, approval_contract='browser-send/v1'))
                         sent = studio.finalize_draft(draft['id'])['draft']

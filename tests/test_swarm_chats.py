@@ -901,6 +901,206 @@ class PairScopedChatsTests(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "no longer current"):
             stale.record_state("late", {"status": "wrong"})
 
+    def _three_agent_board(self) -> dict:
+        board = copy.deepcopy(self.board)
+        board["agents"].append(
+            {"id": "agent-3", "name": "Reviewer", "who": "codex", "ready": True}
+        )
+        board["works_on"].append({"agent": "agent-3", "project": "project-1"})
+        board["talks_to"].append({"one": "agent-1", "other": "agent-3"})
+        return board
+
+    def test_unrelated_board_saves_leave_a_running_pair_chat_current(self) -> None:
+        board_path = self.root / "swarm.json"
+        with mock.patch.object(swarm, "where_it_lives", return_value=board_path):
+            saved = swarm.save(self._three_agent_board(), self.config).to_dict()
+            listed = swarm_chats.list_for_agent(self.config, saved, "agent-1")
+            pair_chat = next(
+                one for one in listed["chats"] if one["pair"] == ["agent-1", "agent-2"]
+            )
+            other_chat = next(
+                one for one in listed["chats"] if one["pair"] == ["agent-1", "agent-3"]
+            )
+            running = CollaborationLedger(
+                self.config, "claude", pair_chat["filed_as"], session_id="running"
+            ).begin("pair work", saved["agents"][:2], mode="project_work")
+            other = CollaborationLedger(
+                self.config, "claude", other_chat["filed_as"], session_id="other"
+            ).begin("other work", [saved["agents"][0], saved["agents"][2]],
+                    mode="project_work")
+
+            def edit_and_save(change) -> dict:
+                board = copy.deepcopy(saved)
+                change(board)
+                return swarm.save(board, self.config).to_dict()
+
+            # Each of these is an ordinary autosave that the A-B chat does not
+            # depend on: an unrelated agent renamed, an agent added, an
+            # unrelated line ticked, a project renamed or added, a box moved.
+            saved = edit_and_save(lambda board: board["agents"][2].update(
+                name="Renamed reviewer"
+            ))
+            saved = edit_and_save(lambda board: board["agents"].append(
+                {"id": "agent-4", "name": "Newcomer", "who": "claude"}
+            ))
+            saved = edit_and_save(lambda board: board["talks_to"].append(
+                {"one": "agent-2", "other": "agent-4"}
+            ))
+            saved = edit_and_save(lambda board: board["works_on"].append(
+                {"agent": "agent-3", "project": "project-2"}
+            ))
+            saved = edit_and_save(lambda board: board["projects"][0].update(
+                name="First, renamed"
+            ))
+            third = self.root / "third"
+            third.mkdir()
+            saved = edit_and_save(lambda board: board["projects"].append(
+                {"id": "project-3", "name": "Third", "path": str(third)}
+            ))
+            saved = edit_and_save(lambda board: board["agents"][0].update(
+                at={"x": 300, "y": 200}
+            ))
+
+            running.record_state("progress", {"status": "still current"})
+            # A restarted server sees the same on-disk generation.
+            restarted = LoadedConfig(copy.deepcopy(self.config.data), self.root, [], {})
+            self.assertEqual(
+                swarm_chats.resolve(
+                    restarted, saved, "agent-1", pair_chat["id"]
+                )["id"],
+                pair_chat["id"],
+            )
+            running.record_state("progress", {"status": "current after restart"})
+            # The A-C chat's own member was renamed, so it alone was fenced.
+            with self.assertRaisesRegex(Exception, "no longer current"):
+                other.record_state("late", {"status": "wrong"})
+
+    def test_direct_chat_is_fenced_when_a_helper_line_or_route_changes(self) -> None:
+        # A direct chat in collaborate/auto mode also asks every ready agent its
+        # lead may talk to; those helpers are part of that chat's authority.
+        board_path = self.root / "swarm.json"
+        edits = {
+            "helper line cut": lambda board: board.update(talks_to=[
+                one for one in board["talks_to"] if one["other"] != "agent-3"
+            ]),
+            "helper route changed": lambda board: board["agents"][2].update(who="claude"),
+        }
+        for label, change in edits.items():
+            with self.subTest(label), mock.patch.object(
+                swarm, "where_it_lives", return_value=board_path
+            ):
+                if board_path.exists():
+                    board_path.unlink()
+                saved = swarm.save(self._three_agent_board(), self.config).to_dict()
+                direct = next(
+                    one for one in swarm_chats.list_for_agent(
+                        self.config, saved, "agent-1"
+                    )["chats"] if one["pair"] == ["agent-1"]
+                )
+                stale = CollaborationLedger(
+                    self.config, "claude", direct["filed_as"], session_id=label
+                ).begin("team question", saved["agents"], mode="goal_collaboration")
+                changed = copy.deepcopy(saved)
+                change(changed)
+                swarm.save(changed, self.config)
+                with self.assertRaisesRegex(Exception, "no longer current"):
+                    stale.record_state("late", {"status": "wrong"})
+
+    def test_direct_chat_survives_a_save_that_does_not_touch_its_helpers(self) -> None:
+        board_path = self.root / "swarm.json"
+        with mock.patch.object(swarm, "where_it_lives", return_value=board_path):
+            saved = swarm.save(self._three_agent_board(), self.config).to_dict()
+            direct = next(
+                one for one in swarm_chats.list_for_agent(
+                    self.config, saved, "agent-1"
+                )["chats"] if one["pair"] == ["agent-1"]
+            )
+            running = CollaborationLedger(
+                self.config, "claude", direct["filed_as"], session_id="running"
+            ).begin("team question", saved["agents"], mode="goal_collaboration")
+            changed = copy.deepcopy(saved)
+            changed["agents"].append({"id": "agent-4", "name": "Newcomer", "who": "codex"})
+            changed["agents"][0]["at"] = {"x": 10, "y": 20}
+            swarm.save(changed, self.config)
+            running.record_state("progress", {"status": "still current"})
+
+    def test_pair_chat_led_by_its_second_member_is_fenced_too(self) -> None:
+        board_path = self.root / "swarm.json"
+        moved = self.root / "moved-first"
+        moved.mkdir()
+        with mock.patch.object(swarm, "where_it_lives", return_value=board_path):
+            saved = swarm.save(copy.deepcopy(self.board), self.config).to_dict()
+            pair_chat = next(
+                one for one in swarm_chats.list_for_agent(
+                    self.config, saved, "agent-2"
+                )["chats"] if one["pair"] == ["agent-1", "agent-2"]
+            )
+            # agent-2 (route codex) leads this turn; the ledger is keyed on it.
+            stale = CollaborationLedger(
+                self.config, "codex", pair_chat["filed_as"], session_id="second-lead"
+            ).begin("pair work", [saved["agents"][1], saved["agents"][0]],
+                    mode="goal_collaboration")
+            changed = copy.deepcopy(saved)
+            project = next(
+                one for one in changed["projects"] if one["id"] == pair_chat["project"]
+            )
+            project["path"] = str(moved)
+            self.assertGreaterEqual(
+                swarm_chats.fence_for_board_change(self.config, saved, changed), 1,
+            )
+        with self.assertRaisesRegex(Exception, "no longer current"):
+            stale.record_state("late", {"status": "wrong"})
+
+    def test_board_save_still_fences_a_chat_whose_own_inputs_change(self) -> None:
+        board_path = self.root / "swarm.json"
+        moved = self.root / "moved-first"
+        moved.mkdir()
+        edits = {
+            "member renamed": lambda board: board["agents"][1].update(name="Codex 2"),
+            "member route": lambda board: board["agents"][1].update(who="claude"),
+            "member removed": lambda board: (
+                board.update(agents=board["agents"][:1] + board["agents"][2:]),
+                board.update(works_on=[
+                    one for one in board["works_on"] if one["agent"] != "agent-2"
+                ]),
+                board.update(talks_to=[
+                    one for one in board["talks_to"]
+                    if "agent-2" not in (one["one"], one["other"])
+                ]),
+            ),
+            "talk line removed": lambda board: board.update(talks_to=[
+                one for one in board["talks_to"] if one["other"] != "agent-2"
+            ]),
+            "selected project moved": lambda board: board["projects"][0].update(
+                path=str(moved)
+            ),
+            "works-on line removed": lambda board: board.update(works_on=[
+                one for one in board["works_on"]
+                if (one["agent"], one["project"]) != ("agent-2", "project-1")
+            ]),
+        }
+        for label, change in edits.items():
+            with self.subTest(label), mock.patch.object(
+                swarm, "where_it_lives", return_value=board_path
+            ):
+                if board_path.exists():
+                    board_path.unlink()
+                saved = swarm.save(self._three_agent_board(), self.config).to_dict()
+                pair_chat = next(
+                    one for one in swarm_chats.list_for_agent(
+                        self.config, saved, "agent-1"
+                    )["chats"] if one["pair"] == ["agent-1", "agent-2"]
+                )
+                self.assertEqual(pair_chat["project"], "project-1")
+                stale = CollaborationLedger(
+                    self.config, "claude", pair_chat["filed_as"], session_id=label
+                ).begin("pair work", saved["agents"][:2], mode="project_work")
+                changed = copy.deepcopy(saved)
+                change(changed)
+                swarm.save(changed, self.config)
+                with self.assertRaisesRegex(Exception, "no longer current"):
+                    stale.record_state("late", {"status": "wrong"})
+
     def test_corrupt_registry_recovers_from_last_good_copy_without_loss(self) -> None:
         first = swarm_chats.list_for_agent(self.config, self.board, "agent-1")
         made = swarm_chats.create(self.config, self.board, "agent-1", "agent-2")

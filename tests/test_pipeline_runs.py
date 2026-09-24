@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 import shutil
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -264,6 +266,41 @@ class PipelineRunStoreTests(unittest.TestCase):
         self.assertEqual(recovered["state"], "interrupted")
         self.assertFalse(recovered["result"]["passed"])
         self.assertIn("owner stopped", recovered["result"]["said"])
+
+    @unittest.skipUnless(os.name == "nt", "Windows access-denied process handles")
+    def test_access_denied_live_owner_keeps_its_lease_and_dead_owner_is_recovered(self) -> None:
+        # The System process (PID 4) always exists and refuses a normal
+        # user's query handle. That must read as "alive", never as dead.
+        self.assertTrue(pipeline_runs._owner_is_alive(4, "unverifiable-birth-token"))
+        finished = subprocess.Popen([sys.executable, "-c", "pass"])
+        finished.wait(10)
+        self.assertFalse(pipeline_runs._owner_is_alive(finished.pid, ""))
+
+    @unittest.skipUnless(os.name == "nt", "Windows access-denied process handles")
+    def test_an_access_denied_pid_keeps_only_a_recent_lease(self) -> None:
+        # A PID reused by csrss/lsass refuses the query handle, so its birth
+        # token cannot be checked. It may hold a lease only while the run was
+        # recently updated; an old lease is recovered instead of kept forever.
+        now = pipeline_runs._now_ms()
+        self.assertTrue(pipeline_runs._owner_is_alive(4, "token", last_seen_ms=now))
+        self.assertFalse(pipeline_runs._owner_is_alive(
+            4, "token", last_seen_ms=now - pipeline_runs.ACCESS_DENIED_LEASE_MS - 1,
+        ))
+        self.assertTrue(pipeline_runs._owner_is_alive(os.getpid(), "", last_seen_ms=0))
+
+    def test_a_waiting_owner_keeps_its_lease_fresh_while_it_polls(self) -> None:
+        store = PipelineRunStore(self.config)
+        accepted, _ = store.accept(_definition(), source="heartbeat-test", request_id="heartbeat")
+        run_id = accepted["run_id"]
+        store.start(run_id, accepted["attempt_id"])
+        store.set_waiting(run_id, accepted["attempt_id"], "approve")
+        before = store.get(run_id)["updated_at_ms"]
+        with mock.patch.object(pipeline_runs, "_now_ms", return_value=before + pipeline_runs.HEARTBEAT_INTERVAL_MS + 5):
+            self.assertFalse(store.should_stop(run_id))
+            self.assertIsNone(store.decision(run_id, "approve"))
+        self.assertEqual(
+            store.get(run_id)["updated_at_ms"], before + pipeline_runs.HEARTBEAT_INTERVAL_MS + 5,
+        )
 
     def test_runtime_path_inside_project_is_rejected(self) -> None:
         os.environ["OUR_HARNESS_PIPELINE_RUN_DIR"] = str(self.root / ".runtime")

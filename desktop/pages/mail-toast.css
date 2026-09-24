@@ -1,0 +1,137 @@
+/* Corner notification cards, in the spirit of Steam's friend pop-ups: a dark
+   card slides up from the screen corner, a square avatar on the left, the
+   name in bold, a quiet line of what happened, and the detail in colour. */
+:root {
+  color-scheme: dark;
+  --card-top: #2a475e;
+  --card-bottom: #1b2838;
+  --ink: #ffffff;
+  --muted: #b8c6d1;
+  --accent: #a4d007;
+  --edge: rgba(102, 192, 244, 0.45);
+  --avatar-top: #66c0f4;
+  --avatar-bottom: #1a6ea0;
+}
+* { box-sizing: border-box; }
+html, body {
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  overflow: hidden;
+  font: 13px/1.35 "Segoe UI", system-ui, -apple-system, sans-serif;
+  color: var(--ink);
+  user-select: none;
+}
+/* The window grows from the corner, so while it catches up with a new card
+   the newest (bottom) card stays visible and any clipping happens at the top. */
+html, body { height: 100%; }
+body { display: flex; flex-direction: column; justify-content: flex-end; }
+.mail-toast-stack {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 0;
+}
+.mail-toast {
+  position: relative;
+  display: grid;
+  grid-template-columns: 56px 1fr;
+  gap: 12px;
+  align-items: center;
+  width: 100%;
+  min-height: 84px;
+  padding: 12px 34px 12px 12px;
+  border: 1px solid var(--edge);
+  border-radius: 4px;
+  background: linear-gradient(180deg, var(--card-top) 0%, var(--card-bottom) 100%);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.55);
+  color: inherit;
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+  animation: mail-toast-in 320ms cubic-bezier(0.2, 0.9, 0.3, 1) both;
+}
+.mail-toast:hover { border-color: var(--avatar-top); }
+.mail-toast.leaving { animation: mail-toast-out 240ms ease-in both; }
+.mail-toast-avatar {
+  display: grid;
+  place-items: center;
+  width: 56px;
+  height: 56px;
+  border: 2px solid var(--accent);
+  border-radius: 2px;
+  background: linear-gradient(160deg, var(--avatar-top), var(--avatar-bottom));
+  font-size: 24px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+.mail-toast-text { min-width: 0; }
+.mail-toast-title,
+.mail-toast-action,
+.mail-toast-detail {
+  display: block;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.mail-toast-title { font-weight: 700; font-size: 14px; }
+.mail-toast-action { color: var(--muted); }
+.mail-toast-detail { color: var(--accent); font-weight: 600; }
+.mail-toast-working::after {
+  content: "";
+  display: inline-block;
+  width: 1.2em;
+  text-align: left;
+  animation: mail-toast-dots 1.2s steps(4, end) infinite;
+}
+.mail-toast-close {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--muted);
+  font: 16px/22px "Segoe UI", system-ui, sans-serif;
+  cursor: pointer;
+}
+.mail-toast-close:hover { background: rgba(255, 255, 255, 0.12); color: var(--ink); }
+.mail-toast-progress {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  height: 2px;
+  width: 100%;
+  transform-origin: left center;
+  background: var(--avatar-top);
+  opacity: 0.7;
+  animation: mail-toast-timer var(--mail-toast-duration, 7000ms) linear both;
+}
+.mail-toast:hover .mail-toast-progress { animation-play-state: paused; }
+
+@keyframes mail-toast-in {
+  from { transform: translateY(110%); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+@keyframes mail-toast-out {
+  from { transform: translateY(0); opacity: 1; }
+  to { transform: translateX(40%); opacity: 0; }
+}
+@keyframes mail-toast-timer {
+  from { transform: scaleX(1); }
+  to { transform: scaleX(0); }
+}
+@keyframes mail-toast-dots {
+  0% { content: ""; }
+  25% { content: "."; }
+  50% { content: ".."; }
+  75% { content: "..."; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .mail-toast, .mail-toast.leaving { animation-duration: 1ms; }
+  .mail-toast-working::after { animation: none; content: "..."; }
+}

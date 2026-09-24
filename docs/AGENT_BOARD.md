@@ -48,6 +48,69 @@ both agents work on. That selection is included in their authoritative board
 context and is the only folder the Work action can change; with no shared
 project selected, file work is refused.
 
+Each saved chat also remembers which provider each agent was talking to. That
+record has two parts. The *identity* is the route name, the provider kind, its
+endpoint, its credential slot and account settings, its whole command line
+(program, wrappers such as `ssh`, `wsl` or `npx`, and every flag) and its
+environment settings. For the local provider it also includes the execution
+container. The *tunables* are the model, reasoning effort, timeouts, output
+limits and concurrency, and the flags known to set exactly those for that
+provider kind. They also include where PATH finds the program, its file
+identity and the version it reports. Changing a tunable never pauses a chat. The new settings apply from
+the next turn, and the saved record is updated to match. This includes a CLI
+that updated itself or a slow `--version` probe. If the identity changes (a
+different kind, account slot or selector, endpoint or program), the chat
+pauses and offers
+**Reconnect saved chat**. You review the change, then the chat continues with
+its history. Nexus never switches a chat to another provider silently.
+Pointing an agent at a different named route leaves the old transcript with
+the old route; start a fresh chat for the new one. Chats saved before this
+record existed are upgraded automatically when their saved setup still matches.
+A chat that had already drifted before the upgrade offers the reviewed
+reconnect instead of only a fresh start. See `docs/PROVIDER_RECONNECT.md`.
+
+When several agents use the same CLI profile, their turns run in parallel.
+Each CLI profile gets 4 slots unless `max_concurrency` says otherwise. A turn
+that is waiting for a slot, or for a web conversation that is already
+answering, queues until it is free. It never fails for waiting too long, and
+Stop still cancels it. A second send to the same chat while a turn is still
+running is refused, so a message is never delivered twice.
+
+Git history in an agent's private working copy is **off by default**. Set
+`NEXUS_AGENT_GIT_HISTORY=1` in the environment Nexus starts with to turn it on.
+With it off, Nexus runs no git command on a copy at all. If a copy still has
+a `.git` from an earlier opt-in (recognised by reading its config as plain
+text), Nexus removes that `.git`. Its baseline would otherwise stop
+refreshing, and restoring a file from it would revert a teammate's accepted
+work. A `.git` the agent created itself is left alone. Deletions are then
+published as ordinary deletions.
+When it is on and the project folder is the top of a git work tree, the copy
+gets an independent clone (`--no-hardlinks`: no shared objects, no
+alternates). Its `origin` is removed, and if any remote, alternate or config
+entry still refers to the project's repository, the whole `.git` is dropped.
+Every git command Nexus runs names its repository explicitly and ignores
+`GIT_DIR`, `GIT_INDEX_FILE` and the other `GIT_*` variables, so the project's
+index, config and refs are only read. The accepted files are hashed in a
+Nexus-owned bare repository beside the copy, not in the copy's `.git`. That
+repository takes the project's line-ending and filter settings (and system
+and global git config, such as Git for Windows' `core.autocrlf` and git-lfs),
+so text files match the user's HEAD. Filters, attributes, hooks or an
+fsmonitor that an agent writes into the copy's `.git` therefore never run
+inside Nexus. Every call on that `.git` disables hooks and fsmonitor. The
+private index is kept between syncs, so unchanged files are not re-hashed.
+
+The accepted team files are committed as `nexus/accepted-baseline`, which is
+checked out, and that commit is refreshed on every sync. `git status` and
+`git diff` therefore show only this agent's changes, and restoring or cleaning
+back to the baseline publishes nothing. Publication never deletes a file that
+was in the accepted baseline, is gitignored and was never committed by the
+user, such as `.env`, even after `git clean -fdx`. Such held-back deletions
+are returned with the collected action as `_nexus_held_back_deletions`, with
+a note. Deleting a tracked file that matches an ignore rule (one the user
+added with `git add -f`) is published normally. The copy's `.git` is never collected or published.
+If git is missing, or the folder is inside a larger repository, the copy
+simply has no history. The workspace still works.
+
 ## Nobody talks to anybody unless you say so
 
 A pair that has no line between them is a pair that will not hear from each
@@ -268,6 +331,15 @@ asked about each assigned project independently. Then each agent that may talk
 to another agent on the same project is shown those agents' answers and asked
 again, including where it disagrees. This is useful for opinions and planning,
 but it does not inspect, edit, or test project files.
+
+The advice prompt says what the round is. It does not claim that an agent
+cannot do things. Nexus sends only the job list and the project path, without
+attaching files, and asks for a plan. An agent that can read the folder from
+where it runs is welcome to look. In the second round, a message whose exact
+words already appear as a part of the shared page is listed by name and part
+number instead of being repeated. That message is still delivered and
+acknowledged as before, and a message that is not on the page keeps its full
+text.
 
 Advice runs one assistant at a time to avoid avoidable subscription throttling.
 **Stop advice run** lets the already-started turn finish and asks nothing after

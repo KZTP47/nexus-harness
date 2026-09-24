@@ -8,7 +8,24 @@ const runtime = path.resolve(__dirname, 'build-output/win-unpacked/resources/run
 const manifestPath = path.join(runtime, 'NEXUS_RUNTIME.json');
 const manifest = fs.existsSync(manifestPath) ? JSON.parse(fs.readFileSync(manifestPath, 'utf8')) : {};
 const executablePath = process.env.NEXUS_TEST_CHROMIUM || (manifest.playwright?.chromium_executable && path.join(runtime, 'playwright', manifest.playwright.chromium_executable));
-const source = fs.readFileSync(path.join(ui, 'email.js'), 'utf8');
+const productionSource = fs.readFileSync(path.join(ui, 'email.js'), 'utf8');
+// Shared readiness endpoint for the existing offline UI fixtures. Dedicated
+// preflight tests below use productionSource and assert the complete sequence.
+const source = `{
+  const requestBeforePreparation = window.request;
+  window.request = async (url, options) => {
+    if (url.endsWith('/prepare_draft')) {
+      const payload = JSON.parse(options.body);
+      const draft = window.snapshot?.drafts?.find(d => d.id === payload.draft_id);
+      if (draft) {
+        if (draft.status === 'approved' && draft.error) { draft.status = 'review'; draft.error = ''; delete draft.approved_at; }
+        return {ready: true, draft: structuredClone(draft)};
+      }
+    }
+    return requestBeforePreparation(url, options);
+  };
+}
+` + productionSource;
 
 test('Polling settings distinguish unsaved and saved intervals, show scan timing and refresh at a short cadence', {skip: !executablePath, timeout: 45000}, async () => {
   const browser = await chromium.launch({executablePath, headless: true});
@@ -182,7 +199,7 @@ test('Draft controls distinguish queue, live callback, stale activity, send fail
     await page.evaluate(() => { window.snapshot.drafts[0].error = ''; window.snapshot.drafts[0].status = 'sending'; window.snapshot.operations[1] = {id: 'finalize:d', state: 'running', started_at: new Date().toISOString()}; });
     await page.evaluate(() => window.nexusEmail.refresh());
     assert.equal(await page.locator('#emailSendStatus').getAttribute('data-phase'), 'running');
-    await page.evaluate(() => { document.querySelector('#emailApprove').click(); document.querySelector('#emailApprove').click(); });
+    await page.evaluate(() => { document.querySelector('#emailApprove').click(); document.querySelector('#emailComposeSend').click(); document.querySelector('#emailComposeSend').click(); });
     assert.equal(await page.evaluate(() => window.calls.length), 0);
     await page.evaluate(() => { window.snapshot.drafts[0].status = 'delivery_unknown'; });
     await page.evaluate(() => window.nexusEmail.refresh());
@@ -236,8 +253,9 @@ test('EmailEngine service setup protects token, selects discovered account, and 
     assert.equal(await page.locator('#emailDisconnect').isVisible(), true);
     assert.equal(await page.locator('#emailSync').isDisabled(), false);
     await page.locator('.email-message').click();
-    assert.equal(await page.locator('#emailApprove').textContent(), 'Approve & send reply');
+    assert.equal(await page.locator('#emailApprove').textContent(), 'Review & send reply');
     await page.locator('#emailApprove').click();
+    await page.locator('#emailComposeSend').click();
     await page.waitForFunction(() => document.querySelector('#emailDraftStatus').textContent.includes('Queued with'));
     assert.equal(await page.locator('#emailApprove').isDisabled(), true);
     await page.locator('#emailCheckDelivery').click();
@@ -341,16 +359,24 @@ test('Quarantined message summaries are escaped and scoped to the current mailbo
     await page.evaluate(() => {
       window.snapshot = {accounts: [{id: 'a', name: 'Mailbox A', kind: 'emailengine', fingerprint: 'fp-a'}, {id: 'b', name: 'Mailbox B', kind: 'emailengine', fingerprint: 'fp-b'}], providers: [], messages: [], drafts: [], memories: [],
         failed_imports: [
-          {account_id: 'a', account_fingerprint: 'fp-a', error: 'Oversized message <img src=x onerror="window.injected=true">'},
-          {account_id: 'a', account_fingerprint: 'obsolete', error: 'Obsolete connection failure'},
-          {account_id: 'b', account_fingerprint: 'fp-b', error: 'Mailbox B private failure'}]};
-      window.request = async () => structuredClone(window.snapshot);
+          {id: 'f-a', account_id: 'a', account_fingerprint: 'fp-a', error: 'Oversized message <img src=x onerror="window.injected=true">'},
+          {id: 'f-old', account_id: 'a', account_fingerprint: 'obsolete', error: 'Obsolete connection failure'},
+          {id: 'f-b', account_id: 'b', account_fingerprint: 'fp-b', error: 'Mailbox B private failure'}]};
+      window.calls = [];
+      window.request = async (url, options) => {
+        if (!options) return structuredClone(window.snapshot);
+        const data = JSON.parse(options.body); window.calls.push({action: url.split('/').pop(), data});
+        window.snapshot.failed_imports = window.snapshot.failed_imports.filter(f => f.id !== data.failure_id);
+        return {dismissed: data.failure_id};
+      };
     });
     await page.addScriptTag({content: source}); await page.evaluate(() => window.nexusEmail.refresh());
     await page.locator('#emailAccount').selectOption('a');
     let summary = await page.locator('#emailQueue').textContent();
     assert.match(summary, /Message could not be imported: Oversized message/);
-    assert.match(summary, /retry on a later inbox scan/);
+    // Checks move past a message they could not import, so nothing promises a retry.
+    assert.match(summary, /still in your mailbox/);
+    assert.doesNotMatch(summary, /retry on a later inbox scan/);
     assert.doesNotMatch(summary, /Obsolete connection|Mailbox B private/);
     assert.equal(await page.locator('#emailQueue img').count(), 0);
     assert.equal(await page.evaluate(() => !!window.injected), false);
@@ -358,6 +384,11 @@ test('Quarantined message summaries are escaped and scoped to the current mailbo
     summary = await page.locator('#emailQueue').textContent();
     assert.match(summary, /Mailbox B private failure/);
     assert.doesNotMatch(summary, /Oversized message|Obsolete connection/);
+    // The note can be cleared; it asks for exactly that mailbox's record.
+    await page.locator('#emailQueue summary').click();
+    await page.locator('#emailQueue button', {hasText: 'Dismiss'}).click();
+    await page.waitForFunction(() => !document.querySelector('#emailQueue').textContent.includes('Mailbox B private failure'));
+    assert.deepEqual(await page.evaluate(() => window.calls), [{action: 'dismiss_failed_import', data: {account_id: 'b', failure_id: 'f-b'}}]);
   } finally { await browser.close(); }
 });
 
@@ -392,6 +423,7 @@ test('Email review escapes mail, preserves edits during refresh, and has a disti
     await page.waitForFunction(() => !document.querySelector('#emailApprove').disabled);
     await page.locator('#emailLearn').uncheck();
     await page.locator('#emailApprove').click();
+    await page.locator('#emailComposeSend').click();
     await page.waitForFunction(() => window.calls.some(c => c.url.endsWith('approve_draft')));
     const approval = await page.evaluate(() => window.calls.find(c => c.url.endsWith('approve_draft')).data);
     assert.equal(approval.learn, false);
@@ -748,9 +780,10 @@ test('Browser mode persists without recreating mailbox, sign-in stays visible, a
     assert.equal(reconnect.connection_id, 'c');
     await page.locator('.email-message').click();
     assert.match(await page.locator('#emailReplyRecipient').textContent(), /Reply to: reply@example.test/);
-    assert.equal(await page.locator('#emailApprove').textContent(), 'Approve & send reply');
+    assert.equal(await page.locator('#emailApprove').textContent(), 'Review & send reply');
     await page.locator('#emailReply').fill('My exact reviewed wording.');
     await page.locator('#emailApprove').click();
+    await page.locator('#emailComposeSend').click();
     await page.waitForFunction(() => document.querySelector('#emailDraftStatus').textContent.includes('uncertain'));
     const approval = await page.evaluate(() => window.calls.find(call => call.url.endsWith('approve_draft')).data);
     assert.equal(approval.text, 'My exact reviewed wording.'); assert.equal(approval.revision, 1);
@@ -1011,6 +1044,57 @@ test('Automatic learning outcomes explain empty results per recipient and retry 
   } finally {await browser.close();}
 });
 
+test('A draft the assistant starts after an email was opened appears in that open email', {skip: !executablePath, timeout: 45000}, async () => {
+  const browser = await chromium.launch({executablePath, headless: true});
+  try {
+    const page = await browser.newPage(); await page.setContent('<main id="emailView"></main>');
+    await page.evaluate(() => {
+      window.snapshot = {accounts: [{id: 'a', kind: 'browser_outlook'}], providers: [], memories: [], drafts: [], messages: [
+        {id: 'm1', account_id: 'a', sender: 'hans@example.test', subject: 'Budget', body: 'Numbers?', imported_at: '2026-01-01T10:00:00Z'}]};
+      window.request = async () => structuredClone(window.snapshot);
+    });
+    await page.addScriptTag({content: source}); await page.evaluate(() => window.nexusEmail.refresh());
+    await page.locator('#emailQueue button.email-message').click();
+    assert.match(await page.locator('#emailDraftStatus').textContent(), /No draft yet/);
+    await page.evaluate(() => { window.snapshot.drafts.push({id: 'd1', account_id: 'a', message_id: 'm1', status: 'review', original: 'Here they are.', edited: 'Here they are.', revision: 1}); return window.nexusEmail.refresh(); });
+    assert.equal(await page.locator('#emailReply').inputValue(), 'Here they are.');
+    assert.match(await page.locator('#emailDraftStatus').textContent(), /review/);
+  } finally { await browser.close(); }
+});
+
+test('New-mail notices become corner cards on any tab, group a burst, and are not replayed after a restart', {skip: !executablePath, timeout: 45000}, async () => {
+  const browser = await chromium.launch({executablePath, headless: true});
+  try {
+    const page = await browser.newPage(); await page.setContent('<main id="emailView" hidden></main>');
+    await page.evaluate(() => {
+      window.feed = {contract: 'email-notifications/v1', boot: 'b1', seq: 1, replay_seconds: 120, items: [
+        {seq: 1, id: 'b1-1', kind: 'drafting', account_id: 'a', message_id: 'm1', draft_id: 'd1', sender: 'Hans Müller', subject: 'Q3 budget', account: 'Work', private: false, age_seconds: 3}]};
+      window.asked = [];
+      window.request = async path => { window.asked.push(path); if (path.startsWith('/api/email/notifications')) { const after = Number(new URL(path, 'http://x').searchParams.get('after') ?? -1); return {...window.feed, items: window.feed.items.filter(i => i.seq > after)}; } return {accounts: [], messages: [], drafts: []}; };
+    });
+    await page.addScriptTag({content: source});
+    const watcher = await page.evaluateHandle(() => window.nexusEmail.watch());
+    await page.waitForSelector('.nexus-mail-toast');
+    assert.equal(await page.locator('.nexus-mail-toast-title').textContent(), 'Hans Müller');
+    assert.equal(await page.locator('.nexus-mail-toast-detail').textContent(), 'Q3 budget');
+    assert.match(await page.locator('.nexus-mail-toast-action').textContent(), /drafting a reply/);
+    // Four at once become one summary card instead of a wall of pop-ups.
+    await page.evaluate(() => { for (let n = 2; n <= 5; n++) window.feed.items.push({seq: n, id: 'b1-' + n, kind: 'drafting', account_id: 'a', message_id: 'm' + n, draft_id: 'd' + n, sender: 'S' + n, subject: 'x', account: 'Work', age_seconds: 1}); window.feed.seq = 5; });
+    await watcher.evaluate(w => w.tick());
+    assert.deepEqual(await page.locator('.nexus-mail-toast-title').allTextContents(), ['Hans Müller', '4 new emails']);
+    // A restarted server: old notices are not shown again, fresh ones are.
+    await page.evaluate(() => { window.feed = {contract: 'email-notifications/v1', boot: 'b2', seq: 2, replay_seconds: 120, items: [
+      {seq: 1, id: 'b2-1', kind: 'drafting', sender: 'Old', subject: 'old', age_seconds: 900},
+      {seq: 2, id: 'b2-2', kind: 'drafting', sender: '', subject: '', private: true, age_seconds: 2}]}; document.getElementById('nexusMailToasts').replaceChildren(); });
+    await watcher.evaluate(w => w.tick());
+    await page.waitForFunction(() => document.querySelectorAll('.nexus-mail-toast').length === 1);
+    assert.deepEqual(await page.locator('.nexus-mail-toast-title').allTextContents(), ['New email']);
+    assert.equal(await page.locator('.nexus-mail-toast-detail').textContent(), 'Open Nexus Harness to read it');
+    assert.equal(await page.evaluate(() => document.body.innerHTML.includes('<script')), false);
+    await watcher.evaluate(w => w.stop());
+  } finally { await browser.close(); }
+});
+
 test('Every control explains itself on hover and the AI session is repaired only after a confirmed diagnosis', {skip: !executablePath, timeout: 45000}, async () => {
   const browser = await chromium.launch({executablePath, headless: true});
   try {
@@ -1152,5 +1236,412 @@ test('The inbox can be searched and reordered, and a long inbox scrolls in place
     assert.equal(await page.locator('.email-message').count(), 1);
     await page.locator('.email-message').first().click();
     assert.match(await page.locator('#emailIncoming').textContent(), /Please pay/);
+  } finally { await browser.close(); }
+});
+
+test('mail draft window reviews headers, cancels without approval, preserves edits and guards stale revisions', {skip: !executablePath, timeout:45000}, async()=>{
+  const browser=await chromium.launch({executablePath,headless:true});
+  try {
+    const page=await browser.newPage();await page.setContent('<main id="emailView" class="email-workspace"></main>');
+    await page.addStyleTag({content:fs.readFileSync(path.join(ui,'styles.css'),'utf8')});
+    await page.addStyleTag({content:fs.readFileSync(path.join(ui,'email.css'),'utf8')});
+    await page.evaluate(()=>{
+      window.calls=[];
+      window.snapshot={accounts:[{id:'a',kind:'browser_outlook',email:'owner@example.test'}],providers:[],messages:[{id:'m',account_id:'a',sender:'sender@example.test',reply_to:'reply@example.test',subject:'Question',body:'Original'}],drafts:[{id:'d',account_id:'a',message_id:'m',status:'review',original:'Draft',edited:'Draft',revision:1}],memories:[]};
+      window.request=async(url,options)=>{if(!options)return structuredClone(window.snapshot);window.calls.push({url,data:JSON.parse(options.body)});window.snapshot.drafts[0].status='approved';return {};};
+    });
+    await page.addScriptTag({content:source});await page.evaluate(()=>window.nexusEmail.refresh());
+    await page.locator('.email-message').click();await page.locator('#emailApprove').click();
+    assert.equal(await page.locator('#emailComposeFrom').inputValue(),'owner@example.test');
+    assert.equal(await page.locator('#emailComposeTo').inputValue(),'reply@example.test');
+    assert.equal(await page.locator('#emailComposeSubject').inputValue(),'Re: Question');
+    assert.equal(await page.locator('#emailComposeBody').inputValue(),'Draft');
+    await page.locator('#emailComposeBody').fill('Keep this edit');
+    await page.locator('#emailComposeCancel').click();assert.equal(await page.evaluate(()=>window.calls.length),0);
+    assert.equal(await page.locator('#emailReply').inputValue(),'Keep this edit');
+    await page.locator('#emailApprove').click();
+    await page.evaluate(()=>{window.snapshot.drafts[0].revision=2;});await page.evaluate(()=>window.nexusEmail.refresh());
+    await page.locator('#emailComposeSend').click();assert.match(await page.locator('#emailCompose [role=alert]').textContent(),/draft changed/);
+    assert.equal(await page.evaluate(()=>window.calls.length),0);
+    await page.locator('#emailComposeCancel').click();await page.locator('#emailApprove').click();
+    await page.locator('#emailComposeBody').fill('Exact reviewed edit');
+    await page.locator('#emailCompose').evaluate(e=>{e.scrollTop=0;});
+    await page.screenshot({path:path.join(require('node:os').tmpdir(),'nexus-email-compose-desktop.png')});
+    await page.setViewportSize({width:390,height:850});
+    assert.equal(await page.locator('#emailCompose').evaluate(e=>e.scrollWidth<=e.clientWidth),true);
+    await page.locator('#emailComposeSend').click();
+    await page.waitForFunction(()=>!document.querySelector('#emailCompose').open);
+    const calls=await page.evaluate(()=>window.calls);assert.equal(calls.length,1);assert.equal(calls[0].data.text,'Exact reviewed edit');assert.equal(calls[0].data.approval_contract,'browser-send/v1');
+  }finally{await browser.close();}
+});
+
+test('one send button reopens a failed approval and explicit version choice controls the exact approved text', {skip: !executablePath, timeout:45000}, async()=>{
+  const browser=await chromium.launch({executablePath,headless:true});
+  try {
+    const page=await browser.newPage();await page.setContent('<main id="emailView" class="email-workspace"></main>');
+    await page.addStyleTag({content:fs.readFileSync(path.join(ui,'styles.css'),'utf8')});await page.addStyleTag({content:fs.readFileSync(path.join(ui,'email.css'),'utf8')});
+    await page.evaluate(()=>{
+      window.calls=[];
+      window.snapshot={accounts:[{id:'a',kind:'browser_outlook',email:'owner@example.test'}],providers:[],messages:[{id:'m',account_id:'a',sender:'sender@example.test',subject:'Question',body:'Original incoming'}],drafts:[{id:'d',account_id:'a',message_id:'m',status:'approved',original:'Original AI version',edited:'My edited version',revision:2,error:'A unique Reply control is not available in the original message.'}],memories:[],operations:[{id:'finalize:d',state:'failed',error:'Reply unavailable'}]};
+      window.request=async(url,options)=>{if(!options)return structuredClone(window.snapshot);const data=JSON.parse(options.body);window.calls.push({url,data});Object.assign(window.snapshot.drafts[0],{edited:data.text,revision:data.revision+1,status:'approved',error:'Reply temporarily unavailable'});return {draft:structuredClone(window.snapshot.drafts[0])};};
+    });
+    await page.addScriptTag({content:source});await page.evaluate(()=>window.nexusEmail.refresh());await page.locator('.email-message').click();
+    assert.equal(await page.locator('#emailApprove').isEnabled(),true);assert.equal(await page.locator('#emailResume').isVisible(),false);
+    await page.locator('#emailUseOriginal').check();assert.match(await page.locator('#emailSendVersionNotice').textContent(),/Original AI draft/);
+    await page.locator('#emailApprove').click();assert.equal(await page.locator('#emailComposeBody').inputValue(),'Original AI version');
+    await page.locator('#emailComposeVersion').selectOption('edited');assert.equal(await page.locator('#emailComposeBody').inputValue(),'My edited version');
+    await page.locator('#emailComposeCancel').click();assert.equal(await page.evaluate(()=>window.calls.length),0);
+    await page.locator('#emailUseOriginal').check();await page.locator('#emailApprove').click();await page.locator('#emailComposeSend').click();
+    await page.waitForFunction(()=>!document.querySelector('#emailCompose').open);
+    assert.equal(await page.evaluate(()=>window.calls[0].data.text),'Original AI version');
+    assert.equal(await page.locator('#emailApprove').isEnabled(),true);
+    await page.locator('#emailUseEdited').check();await page.locator('#emailReply').fill('New edited version after failure');
+    await page.locator('#emailApprove').click();assert.equal(await page.locator('#emailComposeBody').inputValue(),'New edited version after failure');
+    await page.locator('#emailComposeSend').click();await page.waitForFunction(()=>window.calls.length===2);
+    assert.equal(await page.evaluate(()=>window.calls[1].data.text),'New edited version after failure');
+    await page.waitForFunction(()=>!document.querySelector('#emailCompose').open);
+    await page.evaluate(()=>{window.snapshot.drafts[0].status='delivery_unknown';});await page.evaluate(()=>window.nexusEmail.refresh());assert.equal(await page.locator('#emailApprove').isDisabled(),true);
+  }finally{await browser.close();}
+});
+
+test('readiness precedes revision and compose, rebases metadata-only changes, and preserves local edits', {skip: !executablePath, timeout:45000}, async()=>{
+  const browser=await chromium.launch({executablePath,headless:true});
+  try {
+    const page=await browser.newPage();await page.setContent('<main id="emailView"></main>');
+    await page.evaluate(()=>{
+      window.calls=[];window.holdPreparation=false;
+      window.snapshot={accounts:[{id:'a',kind:'browser_outlook',email:'owner@example.test'}],providers:[],messages:[{id:'m',account_id:'a',sender:'sender@example.test',subject:'Question',body:'Incoming'}],drafts:[{id:'d',account_id:'a',message_id:'m',status:'approved',original:'Original',edited:'Saved version',revision:2,error:'Old send failure'}],memories:[],operations:[{id:'finalize:d',state:'failed',error:'Old send failure'}]};
+      window.request=async(url,options)=>{
+        if(!options)return structuredClone(window.snapshot);
+        const data=JSON.parse(options.body);window.calls.push({url,data});const draft=window.snapshot.drafts[0];
+        if(url.endsWith('prepare_draft')) {
+          if(window.holdPreparation)await new Promise(resolve=>window.finishPreparation=resolve);
+          if(window.preparationError)throw new Error(window.preparationError);
+          draft.status='review';draft.error='';delete draft.approved_at;window.snapshot.operations=[];
+          return {ready:true,draft:structuredClone(draft)};
+        }
+        if(url.endsWith('revise_draft')) {draft.edited='AI revised local text';draft.revision=data.revision+2;return {started:true};}
+        if(url.endsWith('approve_draft')) {draft.status='sent';return {draft:structuredClone(draft)};}
+        throw new Error('Unexpected action '+url);
+      };
+    });
+    await page.addScriptTag({content:productionSource});await page.evaluate(()=>window.nexusEmail.refresh());await page.locator('.email-message').click();
+    await page.locator('#emailReply').fill('My local unsaved text');await page.locator('#emailRevisionRequest').fill('Make it shorter');
+    await page.evaluate(()=>{window.snapshot.drafts[0].revision=3;});
+    await page.locator('#emailRevise').click();await page.waitForFunction(()=>window.calls.length===2);
+    assert.deepEqual(await page.evaluate(()=>window.calls.map(c=>c.url.split('/').pop())),['prepare_draft','revise_draft']);
+    assert.equal(await page.evaluate(()=>window.calls[1].data.revision),3);assert.equal(await page.evaluate(()=>window.calls[1].data.text),'My local unsaved text');
+    await page.waitForFunction(()=>document.querySelector('#emailReply').value==='AI revised local text');
+    await page.evaluate(()=>{window.holdPreparation=true;});await page.locator('#emailApprove').click();
+    await page.waitForFunction(()=>!!window.finishPreparation);
+    assert.equal(await page.locator('#emailCompose').isVisible(),false);assert.equal(await page.locator('#emailApprove').isDisabled(),true);
+    assert.match(await page.locator('#emailSendStatus').textContent(),/Checking mailbox/);
+    await page.evaluate(()=>window.finishPreparation());await page.locator('#emailCompose').waitFor({state:'visible'});
+    assert.equal(await page.locator('#emailComposeBody').inputValue(),'AI revised local text');
+    assert.equal(await page.evaluate(()=>window.calls.some(c=>c.url.endsWith('approve_draft'))),false);
+    await page.locator('#emailComposeCancel').click();
+    await page.evaluate(()=>{window.holdPreparation=false;window.preparationError='Mailbox still loading. Try again.';});
+    await page.locator('#emailApprove').click();await page.waitForFunction(()=>document.querySelector('#emailSendStatus').textContent.includes('Mailbox still loading'));
+    assert.equal(await page.locator('#emailCompose').isVisible(),false);assert.equal(await page.locator('#emailApprove').isEnabled(),true);
+    assert.equal(await page.locator('#emailReply').inputValue(),'AI revised local text');
+    await page.evaluate(()=>{window.preparationError='';});await page.locator('#emailApprove').click();await page.locator('#emailCompose').waitFor({state:'visible'});
+    await page.locator('#emailComposeSend').click();await page.waitForFunction(()=>window.calls.some(c=>c.url.endsWith('approve_draft')));
+  }finally{await browser.close();}
+});
+
+test('Refreshing the inbox keeps where the reader scrolled even while a message keeps focus', {skip: !executablePath, timeout: 45000}, async () => {
+  const browser = await chromium.launch({executablePath, headless: true});
+  try {
+    const page = await browser.newPage(); await page.setViewportSize({width: 1300, height: 900});
+    await page.setContent('<main id="emailView" class="email-workspace"></main>');
+    await page.addStyleTag({content: fs.readFileSync(path.join(ui, 'styles.css'), 'utf8')});
+    await page.addStyleTag({content: fs.readFileSync(path.join(ui, 'email.css'), 'utf8')});
+    await page.evaluate(() => {
+      window.setInterval = () => 1;
+      const messages = Array.from({length: 60}, (_, i) => ({id: 'm' + i, account_id: 'a', sender: 's' + i + '@x.test', subject: 'Subject ' + i, body: 'Body ' + i, received_at: 1000 + i}));
+      window.snapshot = {accounts: [{id: 'a', kind: 'imap', email: 'o@x.test'}], providers: [], messages, drafts: [], memories: []};
+      window.request = async (url, options) => options ? {} : structuredClone(window.snapshot);
+    });
+    await page.addScriptTag({content: source}); await page.evaluate(() => window.nexusEmail.refresh());
+    await page.locator('.email-message[data-message-id="m59"]').click();
+    // The focused message scrolls out of view as the reader moves down the list.
+    await page.locator('.email-queue-scroll').evaluate(node => { node.scrollTop = node.scrollHeight; });
+    const scrolled = await page.locator('.email-queue-scroll').evaluate(node => node.scrollTop);
+    assert.ok(scrolled > 500, 'the fixture list must be long enough to scroll');
+    await page.evaluate(() => window.nexusEmail.refresh());
+    assert.equal(await page.evaluate(() => document.activeElement.dataset.messageId), 'm59', 'keyboard focus stays on the same message');
+    assert.equal(await page.locator('.email-queue-scroll').evaluate(node => node.scrollTop), scrolled, 'a refresh must not scroll the list back to the focused message');
+  } finally { await browser.close(); }
+});
+
+test('A notice cursor survives a reload, a restarted server resets it, and blocked storage still works', {timeout: 20000}, async () => {
+  const {watchNotifications} = require(path.join(ui, 'email.js'));
+  const store = new Map();
+  const storage = {getItem: key => store.get(key) ?? null, setItem: (key, value) => store.set(key, String(value))};
+  let feed = {boot: 'b1', seq: 2, replay_seconds: 120, items: [
+    {seq: 1, id: 'b1-1', kind: 'drafting', sender: 'Ada', subject: 'One', age_seconds: 3},
+    {seq: 2, id: 'b1-2', kind: 'drafting', sender: 'Bob', subject: 'Two', age_seconds: 2}]};
+  const api = async url => { const after = Number(new URL(url, 'http://x').searchParams.get('after') ?? -1); return {...feed, items: feed.items.filter(item => item.seq > after)}; };
+  const watch = async (use) => { const shown = []; const watcher = watchNotifications(api, card => { shown.push(card.id); }, {every: 60000, storage: use}); await new Promise(resolve => setTimeout(resolve, 20)); watcher.stop(); return {shown, watcher}; };
+  assert.deepEqual((await watch(storage)).shown, ['b1-1', 'b1-2'], 'a first page shows what arrived in the last two minutes');
+  assert.deepEqual((await watch(storage)).shown, [], 'a reloaded page does not replay the same cards');
+  feed = {...feed, seq: 3, items: [...feed.items, {seq: 3, id: 'b1-3', kind: 'drafting', sender: 'Cy', subject: 'Three', age_seconds: 1}]};
+  assert.deepEqual((await watch(storage)).shown, ['b1-3'], 'only what is new since the saved cursor');
+  feed = {boot: 'b2', seq: 1, replay_seconds: 120, items: [{seq: 1, id: 'b2-1', kind: 'drafting', sender: 'Di', subject: 'Four', age_seconds: 1}]};
+  assert.deepEqual((await watch(storage)).shown, ['b2-1'], 'a cursor saved under an earlier server run never hides a restarted server’s mail');
+  // The cursor is saved only after every card went somewhere: a reload while the
+  // desktop pop-up still decides offers the card again instead of losing it.
+  const slowStore = new Map(); let release = null;
+  const slowStorage = {getItem: key => slowStore.get(key) ?? null, setItem: (key, value) => slowStore.set(key, String(value))};
+  const pending = watchNotifications(api, () => new Promise(resolve => { release = resolve; }), {every: 60000, storage: slowStorage});
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.ok(release, 'the card is being shown');
+  assert.equal(slowStore.size, 0, 'nothing is remembered while the card has not been shown');
+  release(true); await new Promise(resolve => setTimeout(resolve, 20)); pending.stop();
+  assert.deepEqual(JSON.parse(slowStore.get('nexus-mail-notice-cursor')), {boot: 'b2', seq: 1});
+  const blocked = {getItem() { throw new Error('SecurityError'); }, setItem() { throw new Error('QuotaExceeded'); }};
+  assert.deepEqual((await watch(blocked)).shown, ['b2-1'], 'storage that throws only loses the reload memory');
+});
+
+test('A reloaded page does not show the same corner card twice', {skip: !executablePath, timeout: 45000}, async () => {
+  const browser = await chromium.launch({executablePath, headless: true});
+  try {
+    const page = await browser.newPage();
+    // A real origin, so this tab has session storage as the panel does.
+    await page.route('http://nexus.test/**', route => route.fulfill({contentType: 'text/html', body: '<main id="emailView" hidden></main>'}));
+    const load = async () => {
+      await page.goto('http://nexus.test/panel');
+      await page.evaluate(() => {
+        window.request = async path => path.startsWith('/api/email/notifications')
+          ? {contract: 'email-notifications/v1', boot: 'b1', seq: 1, replay_seconds: 120, items: new URL(path, 'http://x').searchParams.get('after') ? [] : [
+              {seq: 1, id: 'b1-1', kind: 'drafting', account_id: 'a', message_id: 'm1', draft_id: 'd1', sender: 'Ada', subject: 'Once', age_seconds: 2}]}
+          : {accounts: [], messages: [], drafts: []};
+      });
+      await page.addScriptTag({content: source});
+      await page.evaluate(() => { window.watcher = window.nexusEmail.watch(); });
+      await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 100)));
+      return page.locator('.nexus-mail-toast').count();
+    };
+    assert.equal(await load(), 1);
+    assert.equal(await load(), 0, 'the reload keeps this tab’s cursor');
+  } finally { await browser.close(); }
+});
+
+test('Opening a notified email never discards setup or review work and respects hidden details', {skip: !executablePath, timeout: 45000}, async () => {
+  const browser = await chromium.launch({executablePath, headless: true});
+  try {
+    const page = await browser.newPage(); await page.setContent('<main id="emailView"></main>');
+    await page.evaluate(() => {
+      window.setInterval = () => 1;
+      window.snapshot = {accounts: [{id: 'a', kind: 'imap', email: 'o@x.test'}, {id: 'b', kind: 'imap', email: 'p@x.test'}], providers: [], memories: [],
+        notifications: {enabled: true, show_details: false},
+        messages: [{id: 'm', account_id: 'a', sender: 'Private Person <pp@x.test>', subject: 'Secret', body: 'In'}, {id: 'n', account_id: 'b', sender: 'Other <o2@x.test>', subject: 'Other', body: 'In'}],
+        drafts: [{id: 'd', account_id: 'a', message_id: 'm', status: 'review', original: 'A', edited: 'A', revision: 1}]};
+      window.request = async (url, options) => options ? {ready: true, draft: structuredClone(window.snapshot.drafts[0])} : structuredClone(window.snapshot);
+    });
+    await page.addScriptTag({content: source}); await page.evaluate(() => window.nexusEmail.refresh());
+    // Unsaved edits: the sender stays hidden while details are off.
+    await page.locator('#emailAccount').selectOption('a');
+    await page.locator('.email-message').click(); await page.locator('#emailReply').fill('Unsaved');
+    assert.equal(await page.evaluate(() => window.nexusEmail.open({account_id: 'b', message_id: 'n'})), false);
+    const notice = await page.locator('#emailNotice').textContent();
+    assert.match(notice, /A new email is waiting\. Save or discard/);
+    assert.doesNotMatch(notice, /Other|o2@x\.test/);
+    await page.locator('#emailRevert').click();
+    // The review window is open: the email is not switched underneath it.
+    await page.locator('#emailApprove').click(); await page.locator('#emailCompose').waitFor({state: 'visible'});
+    assert.equal(await page.evaluate(() => window.nexusEmail.open({account_id: 'b', message_id: 'n'})), false);
+    assert.match(await page.locator('#emailNotice').textContent(), /Finish or cancel the reply you are reviewing/);
+    assert.equal(await page.locator('#emailComposeTo').inputValue(), 'Private Person <pp@x.test>');
+    await page.locator('#emailComposeCancel').click();
+    // A new-mailbox form being filled in is kept.
+    await page.locator('#emailNewAccount').click(); await page.locator('#emailAccountName').fill('Half-typed mailbox');
+    assert.equal(await page.evaluate(() => window.nexusEmail.open({account_id: 'b', message_id: 'n'})), false);
+    assert.match(await page.locator('#emailNotice').textContent(), /mailbox setup you are editing/);
+    assert.equal(await page.locator('#emailAccountName').inputValue(), 'Half-typed mailbox');
+    assert.equal(await page.locator('#emailAccount').inputValue(), '');
+    // With nothing in the way the email opens, in its own mailbox.
+    await page.locator('#emailAccount').selectOption('a');
+    assert.equal(await page.evaluate(() => window.nexusEmail.open({account_id: 'b', message_id: 'n'})), true);
+    assert.equal(await page.locator('#emailAccount').inputValue(), 'b');
+    assert.match(await page.locator('#emailIncoming').textContent(), /Subject: Other/);
+  } finally { await browser.close(); }
+});
+
+test('The review window shows the exact text each send path sends and never overwrites Your reply with the original', {skip: !executablePath, timeout: 45000}, async () => {
+  const browser = await chromium.launch({executablePath, headless: true});
+  try {
+    const page = await browser.newPage(); await page.setContent('<main id="emailView"></main>');
+    await page.evaluate(() => {
+      window.setInterval = () => 1; window.calls = []; window.failApprove = false;
+      window.snapshot = {accounts: [{id: 'a', kind: 'imap', email: 'o@x.test'}], providers: [], memories: [],
+        messages: [{id: 'm', account_id: 'a', sender: 's@x.test', subject: 'Q', body: 'In'}],
+        drafts: [{id: 'd', account_id: 'a', message_id: 'm', status: 'review', original: 'AI original', edited: 'AI original', revision: 1}]};
+      window.request = async (url, options) => {
+        if (!options) return structuredClone(window.snapshot);
+        const data = JSON.parse(options.body); window.calls.push({action: url.split('/').pop(), data});
+        if (url.endsWith('prepare_draft')) return {ready: true, draft: structuredClone(window.snapshot.drafts[0])};
+        if (url.endsWith('approve_draft') && window.failApprove) throw new Error('The mailbox refused this for now.');
+        return {draft: structuredClone(window.snapshot.drafts[0])};
+      };
+    });
+    await page.addScriptTag({content: productionSource}); await page.evaluate(() => window.nexusEmail.refresh());
+    await page.locator('.email-message').click(); await page.locator('#emailReply').fill('My careful edits');
+    // Choosing and editing the original in the window, then cancelling, keeps Your reply.
+    await page.locator('#emailApprove').click(); await page.locator('#emailCompose').waitFor({state: 'visible'});
+    await page.locator('#emailComposeVersion').selectOption('original');
+    await page.locator('#emailComposeBody').press('End'); await page.keyboard.type('!');
+    await page.locator('#emailComposeCancel').click();
+    assert.equal(await page.locator('#emailReply').inputValue(), 'My careful edits');
+    // A failed send of the original keeps Your reply too, and approves exactly the shown text.
+    await page.evaluate(() => { window.failApprove = true; });
+    await page.locator('#emailUseOriginal').check(); await page.locator('#emailApprove').click(); await page.locator('#emailCompose').waitFor({state: 'visible'});
+    await page.locator('#emailComposeSend').click();
+    await page.waitForFunction(() => document.querySelector('#emailCompose [role=alert]').textContent.includes('refused'));
+    // The original, with the edit typed into it earlier in this window, is what is approved.
+    assert.equal(await page.evaluate(() => window.calls.filter(c => c.action === 'approve_draft').at(-1).data.text), 'AI original!');
+    await page.locator('#emailComposeCancel').click();
+    assert.equal(await page.locator('#emailReply').inputValue(), 'My careful edits');
+    // Editing Your reply in the window still keeps both in step.
+    await page.evaluate(() => { window.failApprove = false; });
+    await page.locator('#emailUseEdited').check(); await page.locator('#emailApprove').click(); await page.locator('#emailCompose').waitFor({state: 'visible'});
+    await page.locator('#emailComposeBody').fill('Edited in the window');
+    await page.locator('#emailComposeCancel').click();
+    assert.equal(await page.locator('#emailReply').inputValue(), 'Edited in the window');
+  } finally { await browser.close(); }
+});
+
+test('Resuming an approved reply shows the saved text it will send, not unsaved local text', {skip: !executablePath, timeout: 45000}, async () => {
+  const browser = await chromium.launch({executablePath, headless: true});
+  try {
+    const page = await browser.newPage(); await page.setContent('<main id="emailView"></main>');
+    await page.evaluate(() => {
+      window.setInterval = () => 1; window.calls = [];
+      window.snapshot = {accounts: [{id: 'a', kind: 'browser_outlook', email: 'owner@example.test'}], providers: [], memories: [],
+        messages: [{id: 'm', account_id: 'a', sender: 'sender@example.test', subject: 'Q', body: 'Incoming'}],
+        drafts: [{id: 'd', account_id: 'a', message_id: 'm', status: 'approved', original: 'AI original', edited: 'Server approved text', revision: 2, error: 'Reply control unavailable'}]};
+      window.request = async (url, options) => {
+        if (!options) return structuredClone(window.snapshot);
+        window.calls.push(url.split('/').pop());
+        return {ready: true, draft: structuredClone(window.snapshot.drafts[0])};
+      };
+    });
+    await page.addScriptTag({content: productionSource}); await page.evaluate(() => window.nexusEmail.refresh());
+    await page.locator('.email-message').click(); await page.locator('#emailReply').fill('Local unsaved text');
+    await page.evaluate(() => { window.snapshot.drafts[0].error = ''; }); await page.evaluate(() => window.nexusEmail.refresh());
+    await page.locator('#emailApprove').click(); await page.locator('#emailCompose').waitFor({state: 'visible'});
+    assert.equal(await page.locator('#emailComposeBody').inputValue(), 'Server approved text');
+    assert.equal(await page.locator('#emailComposeBody').evaluate(node => node.readOnly), true);
+    await page.locator('#emailComposeSend').click(); await page.waitForFunction(() => window.calls.includes('resume_draft'));
+  } finally { await browser.close(); }
+});
+
+test('A reply changed elsewhere without local edits shows the newest version instead of locking the editor', {skip: !executablePath, timeout: 45000}, async () => {
+  const browser = await chromium.launch({executablePath, headless: true});
+  try {
+    const page = await browser.newPage(); await page.setContent('<main id="emailView"></main>');
+    await page.evaluate(() => {
+      window.setInterval = () => 1; window.calls = [];
+      window.snapshot = {accounts: [{id: 'a', kind: 'imap', email: 'o@x.test'}], providers: [], memories: [],
+        messages: [{id: 'm', account_id: 'a', sender: 's@x.test', subject: 'Q', body: 'In'}],
+        drafts: [{id: 'd', account_id: 'a', message_id: 'm', status: 'review', original: 'A', edited: 'A', revision: 1}]};
+      window.request = async (url, options) => { if (!options) return structuredClone(window.snapshot); window.calls.push(url.split('/').pop()); return {ready: true, draft: structuredClone(window.snapshot.drafts[0])}; };
+    });
+    await page.addScriptTag({content: productionSource}); await page.evaluate(() => window.nexusEmail.refresh());
+    await page.locator('.email-message').click();
+    await page.evaluate(() => Object.assign(window.snapshot.drafts[0], {edited: 'B saved elsewhere', revision: 2}));
+    await page.locator('#emailApprove').click();
+    await page.waitForFunction(() => document.querySelector('#emailReply').value === 'B saved elsewhere');
+    assert.match(await page.locator('#emailNotice').textContent(), /updated elsewhere/);
+    assert.equal(await page.locator('#emailRevert').isDisabled(), true, 'nothing unsaved is left to revert');
+    assert.equal(await page.locator('#emailCompose').isVisible(), false);
+    await page.locator('#emailApprove').click(); await page.locator('#emailCompose').waitFor({state: 'visible'});
+    assert.equal(await page.locator('#emailComposeBody').inputValue(), 'B saved elsewhere');
+    // With local edits the user's text is kept, as before.
+    await page.locator('#emailComposeCancel').click(); await page.locator('#emailReply').fill('Mine');
+    await page.evaluate(() => Object.assign(window.snapshot.drafts[0], {edited: 'C saved elsewhere', revision: 3}));
+    await page.locator('#emailApprove').click();
+    await page.waitForFunction(() => document.querySelector('#emailNotice').textContent.includes('while you were editing'));
+    assert.equal(await page.locator('#emailReply').inputValue(), 'Mine');
+  } finally { await browser.close(); }
+});
+
+test('The review window is built from a snapshot taken after readiness, not an older refresh in flight', {skip: !executablePath, timeout: 45000}, async () => {
+  const browser = await chromium.launch({executablePath, headless: true});
+  try {
+    const page = await browser.newPage(); await page.setContent('<main id="emailView"></main>');
+    await page.evaluate(() => {
+      window.setInterval = () => 1; window.calls = [];
+      window.snapshot = {accounts: [{id: 'a', kind: 'browser_outlook', email: 'o@x.test'}], providers: [], memories: [],
+        messages: [{id: 'm', account_id: 'a', sender: 's@x.test', subject: 'Q', body: 'In'}],
+        drafts: [{id: 'd', account_id: 'a', message_id: 'm', status: 'approved', error: 'Reply control missing', original: 'A', edited: 'A', revision: 1}]};
+      window.request = async (url, options) => {
+        if (!options) { const snap = structuredClone(window.snapshot); if (window.slowGet) { window.slowGet = false; await new Promise(resolve => { window.releaseGet = resolve; }); } return snap; }
+        window.calls.push(url.split('/').pop());
+        if (url.endsWith('prepare_draft')) { await new Promise(resolve => { window.releasePrepare = resolve; }); Object.assign(window.snapshot.drafts[0], {status: 'review', error: ''}); return {ready: true, draft: structuredClone(window.snapshot.drafts[0])}; }
+        return {draft: structuredClone(window.snapshot.drafts[0])};
+      };
+    });
+    await page.addScriptTag({content: productionSource}); await page.evaluate(() => window.nexusEmail.refresh());
+    await page.locator('.email-message').click(); await page.locator('#emailApprove').click();
+    await page.waitForFunction(() => !!window.releasePrepare);
+    await page.evaluate(() => { window.slowGet = true; }); await page.locator('#emailRefresh').click();
+    await page.waitForFunction(() => !!window.releaseGet);
+    await page.evaluate(() => window.releasePrepare()); await page.waitForTimeout(50); await page.evaluate(() => window.releaseGet());
+    await page.locator('#emailCompose').waitFor({state: 'visible'});
+    assert.match(await page.locator('#emailDraftStatus').textContent(), /Status: review/);
+    await page.locator('#emailComposeSend').click();
+    await page.waitForFunction(() => window.calls.includes('approve_draft'));
+    assert.equal(await page.locator('#emailCompose [role=alert]').textContent(), '');
+  } finally { await browser.close(); }
+});
+
+test('Edits to the original AI draft in the review window survive Escape, Cancel and switching versions', {skip: !executablePath, timeout: 45000}, async () => {
+  const browser = await chromium.launch({executablePath, headless: true});
+  try {
+    const page = await browser.newPage(); await page.setContent('<main id="emailView"></main>');
+    await page.evaluate(() => {
+      window.setInterval = () => 1; window.calls = [];
+      window.snapshot = {accounts: [{id: 'a', kind: 'imap', email: 'o@x.test'}], providers: [], memories: [],
+        messages: [{id: 'm', account_id: 'a', sender: 's@x.test', subject: 'Q', body: 'In'}],
+        drafts: [{id: 'd', account_id: 'a', message_id: 'm', status: 'review', original: 'A', edited: 'A', revision: 1}]};
+      window.request = async (url, options) => {
+        if (!options) return structuredClone(window.snapshot);
+        const data = JSON.parse(options.body); window.calls.push({action: url.split('/').pop(), text: data.text});
+        return {ready: true, draft: structuredClone(window.snapshot.drafts[0])};
+      };
+    });
+    await page.addScriptTag({content: productionSource}); await page.evaluate(() => window.nexusEmail.refresh());
+    await page.locator('.email-message').click(); await page.locator('#emailReply').fill('E');
+    const open = async () => { await page.locator('#emailApprove').click(); await page.locator('#emailCompose').waitFor({state: 'visible'}); };
+    await open();
+    await page.locator('#emailComposeVersion').selectOption('original');
+    await page.locator('#emailComposeBody').fill('A plus my compose edits');
+    await page.keyboard.press('Escape'); await page.waitForFunction(() => !document.querySelector('#emailCompose').open);
+    assert.equal(await page.locator('#emailReply').inputValue(), 'E', 'Your reply is untouched');
+    await open();
+    assert.equal(await page.locator('#emailComposeVersion').inputValue(), 'original');
+    assert.equal(await page.locator('#emailComposeBody').inputValue(), 'A plus my compose edits', 'reopening restores the edits');
+    await page.locator('#emailComposeVersion').selectOption('edited');
+    assert.equal(await page.locator('#emailComposeBody').inputValue(), 'E');
+    await page.locator('#emailComposeVersion').selectOption('original');
+    assert.equal(await page.locator('#emailComposeBody').inputValue(), 'A plus my compose edits', 'switching back keeps them');
+    await page.locator('#emailComposeCancel').click(); await open();
+    assert.equal(await page.locator('#emailComposeBody').inputValue(), 'A plus my compose edits', 'Cancel keeps them too');
+    // Save edits bumps the revision but keeps the original: the edits stay.
+    await page.locator('#emailComposeCancel').click();
+    await page.evaluate(() => Object.assign(window.snapshot.drafts[0], {edited: 'E', revision: 2}));
+    await page.evaluate(() => window.nexusEmail.refresh());
+    await open();
+    assert.equal(await page.locator('#emailComposeBody').inputValue(), 'A plus my compose edits', 'a saved revision with the same original keeps them');
+    await page.locator('#emailComposeSend').click();
+    await page.waitForFunction(() => window.calls.some(c => c.action === 'approve_draft'));
+    assert.equal(await page.evaluate(() => window.calls.find(c => c.action === 'approve_draft').text), 'A plus my compose edits');
+    // A newer saved revision starts from its own original again.
+    await page.waitForFunction(() => !document.querySelector('#emailCompose').open);
+    await page.evaluate(() => Object.assign(window.snapshot.drafts[0], {status: 'review', original: 'B', edited: 'B', revision: 3}));
+    await page.evaluate(() => window.nexusEmail.refresh());
+    await page.locator('#emailUseOriginal').check(); await open();
+    assert.equal(await page.locator('#emailComposeBody').inputValue(), 'B');
   } finally { await browser.close(); }
 });

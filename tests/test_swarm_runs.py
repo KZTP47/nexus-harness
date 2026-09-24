@@ -17,6 +17,7 @@ from unittest import mock
 from our_harness.config import DEFAULT_CONFIG, LoadedConfig
 from our_harness.models import HarnessError, ProviderOutcomeUnknown
 from our_harness import cancellation, chat, swarm, swarm_work
+from our_harness import swarm_runs as swarm_runs_module
 from our_harness.swarm_runs import (
     SwarmRunStore, bind, global_board_change_pause_reason, provider_effect,
     _provider_resource_conversation_key,
@@ -438,6 +439,298 @@ class SwarmRunStoreTests(unittest.TestCase):
         self.assertFalse(first.is_alive())
         self.assertFalse(second.is_alive())
 
+    def test_queued_slot_outlasts_the_profile_timeout_instead_of_failing(self) -> None:
+        # The slot wait used to be bounded by the profile timeout, so a second
+        # agent on the same CLI failed whenever the first turn ran long.
+        data = copy.deepcopy(DEFAULT_CONFIG)
+        data["providers"] = {"limited": {"max_concurrency": 1, "timeout_seconds": 1}}
+        config = LoadedConfig(data, self.root, [], {})
+        owner_entered = threading.Event()
+        queued_entered = threading.Event()
+        failures: list[BaseException] = []
+
+        def owner() -> None:
+            with provider_effect(config, "limited", "owner", "owner-digest"):
+                owner_entered.set()
+                time.sleep(1.8)
+
+        def queued() -> None:
+            try:
+                with provider_effect(config, "limited", "queued", "queued-digest"):
+                    queued_entered.set()
+            except BaseException as exc:  # pragma: no cover - asserted below
+                failures.append(exc)
+
+        first = threading.Thread(target=owner)
+        second = threading.Thread(target=queued)
+        first.start()
+        self.assertTrue(owner_entered.wait(5))
+        second.start()
+        self.assertFalse(queued_entered.wait(1.2))
+        self.assertTrue(queued_entered.wait(10))
+        first.join(5)
+        second.join(5)
+        self.assertEqual(failures, [])
+
+    def test_a_freed_slot_goes_to_the_oldest_waiter_not_a_fast_reclaimer(self) -> None:
+        config = self._capacity_config(1)
+        order: list[str] = []
+        first_entered = threading.Event()
+        waiter_queued = threading.Event()
+        failures: list[BaseException] = []
+
+        def looping_owner() -> None:
+            try:
+                for turn in range(3):
+                    with provider_effect(config, "limited", f"loop-{turn}", f"loop-{turn}"):
+                        order.append(f"loop-{turn}")
+                        first_entered.set()
+                        if turn == 0:
+                            self.assertTrue(waiter_queued.wait(5))
+                            time.sleep(0.4)  # let the waiter's ticket settle
+                        else:
+                            time.sleep(0.05)
+                    # Re-claims immediately, as a goal loop does.
+            except BaseException as exc:  # pragma: no cover - asserted below
+                failures.append(exc)
+
+        def waiter() -> None:
+            try:
+                with provider_effect(
+                    config, "limited", "waiter", "waiter",
+                    before_dispatch=lambda: order.append("waiter"),
+                ):
+                    pass
+            except BaseException as exc:  # pragma: no cover - asserted below
+                failures.append(exc)
+
+        loop = threading.Thread(target=looping_owner)
+        loop.start()
+        self.assertTrue(first_entered.wait(5))
+        queued = threading.Thread(target=waiter)
+        queued.start()
+        time.sleep(0.2)
+        waiter_queued.set()
+        loop.join(10)
+        queued.join(10)
+        self.assertEqual(failures, [])
+        self.assertEqual(order[:2], ["loop-0", "waiter"])
+        self.assertEqual(sorted(order), ["loop-0", "loop-1", "loop-2", "waiter"])
+
+    def test_failed_ticket_cleanup_keeps_stop_and_never_blocks_the_queue(self) -> None:
+        config = self._capacity_config(1)
+        store = swarm_runs_module._unscoped_store(config)
+        holder_in = threading.Event()
+        release_holder = threading.Event()
+        token = cancellation.Cancellation()
+        outcome: list[str] = []
+        real_tx = store._tx
+        broken = threading.Event()
+
+        @contextmanager
+        def flaky_tx():
+            if broken.is_set() and threading.current_thread().name == "victim":
+                raise swarm_runs_module.sqlite3.OperationalError("database is locked")
+            with real_tx() as db:
+                yield db
+
+        def holder() -> None:
+            with provider_effect(config, "limited", "holder", "holder"):
+                holder_in.set()
+                self.assertTrue(release_holder.wait(10))
+
+        def victim() -> None:
+            try:
+                with cancellation.use(token):
+                    with provider_effect(config, "limited", "victim", "victim"):
+                        outcome.append("entered")
+            except cancellation.ChatCancelled:
+                outcome.append("stopped")
+            except BaseException as exc:  # pragma: no cover - asserted below
+                outcome.append(type(exc).__name__)
+
+        entered = threading.Event()
+
+        def later() -> None:
+            with provider_effect(config, "limited", "later", "later"):
+                entered.set()
+
+        with mock.patch.object(swarm_runs_module, "_TICKET_STALE_MS", 600), \
+                mock.patch.object(store, "_tx", side_effect=flaky_tx), \
+                mock.patch.object(swarm_runs_module.time, "sleep", wraps=time.sleep):
+            first = threading.Thread(target=holder)
+            first.start()
+            self.assertTrue(holder_in.wait(5))
+            stuck = threading.Thread(target=victim, name="victim")
+            stuck.start()
+            time.sleep(0.4)
+            broken.set()
+            token.cancel()
+            stuck.join(10)
+            self.assertEqual(outcome, ["stopped"])  # not OperationalError
+            third = threading.Thread(target=later)
+            third.start()
+            time.sleep(0.2)
+            release_holder.set()
+            self.assertTrue(entered.wait(10), "a leftover ticket blocked the queue")
+            first.join(5)
+            third.join(5)
+
+    def test_a_failed_claim_commit_leaves_no_ticket_behind(self) -> None:
+        config = self._capacity_config(1)
+        store = swarm_runs_module._unscoped_store(config)
+        real_tx = store._tx
+        failed = []
+
+        class Recording:
+            def __init__(self, db):
+                self.db, self.claimed = db, False
+
+            def execute(self, sql, parameters=()):
+                if sql.startswith("INSERT OR REPLACE") and parameters \
+                        and not str(parameters[0]).startswith("capacity-ticket:"):
+                    self.claimed = True
+                return self.db.execute(sql, parameters)
+
+        @contextmanager
+        def failing_claim_commit():
+            with real_tx() as db:
+                recording = Recording(db)
+                yield recording
+                if recording.claimed and not failed \
+                        and threading.current_thread().name == "victim":
+                    failed.append(True)
+                    raise swarm_runs_module.sqlite3.OperationalError("disk I/O error")
+
+        outcome: list[str] = []
+
+        def victim() -> None:
+            try:
+                with mock.patch.object(store, "_tx", side_effect=failing_claim_commit):
+                    with swarm_runs_module._provider_capacity_slot(
+                        store, "victim", "scope", "profile", 1, 1.0,
+                    ):
+                        outcome.append("entered")
+            except swarm_runs_module.sqlite3.OperationalError:
+                outcome.append("commit failed")
+
+        thread = threading.Thread(target=victim, name="victim")
+        thread.start()
+        thread.join(10)
+        self.assertEqual(outcome, ["commit failed"])
+        with store._tx() as db:
+            left = db.execute(
+                "SELECT COUNT(*) FROM resources WHERE run_id='victim'"
+            ).fetchone()[0]
+        self.assertEqual(left, 0)
+        began = time.monotonic()
+        with swarm_runs_module._provider_capacity_slot(store, "next", "scope", "profile", 1, 1.0):
+            pass
+        self.assertLess(time.monotonic() - began, 5)
+
+    def test_a_crashed_waiter_ticket_never_blocks_the_queue(self) -> None:
+        config = self._capacity_config(1)
+        store = swarm_runs_module._unscoped_store(config)
+        spec = swarm_runs_module._provider_capacity_spec(config, "limited")
+        domain = swarm_runs_module.hashlib.sha256(
+            f"nexus-provider-profile-queue-v1\0{spec[0]}\0{spec[1]}".encode("utf-8")
+        ).hexdigest()
+        with store._tx() as db:
+            db.execute(
+                "INSERT INTO resources(resource_key,run_id,owner_pid,owner_token,acquired_ms) "
+                "VALUES(?,?,?,?,?)",
+                (f"capacity-ticket:{domain}:{0:020d}:dead", "dead-run", 999999, "gone", 0),
+            )
+        entered = threading.Event()
+
+        def call() -> None:
+            with provider_effect(config, "limited", "after-crash", "after-crash"):
+                entered.set()
+
+        worker = threading.Thread(target=call)
+        worker.start()
+        self.assertTrue(entered.wait(5))
+        worker.join(5)
+
+    def test_web_conversation_stays_single_flight_and_queues_cancellably(self) -> None:
+        owner_entered = threading.Event()
+        release_owner = threading.Event()
+        queued_dispatched = threading.Event()
+        queued_cancelled = threading.Event()
+        token = cancellation.Cancellation()
+        waits: list[object] = []
+        store = swarm_runs_module._unscoped_store(self.config)
+        original = store.resource
+
+        @contextmanager
+        def observed(*args, **kwargs):
+            waits.append(kwargs.get("timeout", "default"))
+            with original(*args, **kwargs) as key:
+                yield key
+
+        def owner() -> None:
+            with provider_effect(self.config, "web:chatgpt-one", "pair-chat", "a"):
+                owner_entered.set()
+                self.assertTrue(release_owner.wait(5))
+
+        def queued() -> None:
+            try:
+                with cancellation.use(token):
+                    with provider_effect(
+                        self.config, "web:chatgpt-one", "pair-chat", "b",
+                        before_dispatch=queued_dispatched.set,
+                    ):
+                        pass
+            except cancellation.ChatCancelled:
+                queued_cancelled.set()
+
+        with mock.patch.object(store, "resource", side_effect=observed):
+            first = threading.Thread(target=owner)
+            second = threading.Thread(target=queued)
+            first.start()
+            self.assertTrue(owner_entered.wait(5))
+            second.start()
+            # Never two sends into one visible web conversation at once.
+            self.assertFalse(queued_dispatched.wait(0.3))
+            token.cancel()
+            self.assertTrue(queued_cancelled.wait(5))
+            self.assertFalse(queued_dispatched.is_set())
+            release_owner.set()
+            first.join(5)
+            second.join(5)
+        # Provider effects wait for the lease without a deadline.
+        self.assertEqual(waits, [None, None])
+
+    def test_whole_turn_lease_still_refuses_a_duplicate_send(self) -> None:
+        store = SwarmRunStore(self.config)
+        first, _ = store.accept("turn-one", {"kind": "chat"})
+        second, _ = store.accept("turn-two", {"kind": "chat"})
+        with store.conversation_turn(first["run_id"], "same-chat"):
+            with self.assertRaisesRegex(HarnessError, "already working"):
+                with store.conversation_turn(second["run_id"], "same-chat"):
+                    pass
+
+    def test_cli_profiles_default_to_parallel_slots_unless_configured(self) -> None:
+        from our_harness.providers.registry import CLI_DEFAULT_CONCURRENCY, ProviderRegistry
+
+        data = copy.deepcopy(DEFAULT_CONFIG)
+        data["providers"] = {
+            "claude": {"kind": "claude-cli", "model": "any"},
+            "codex": {"kind": "codex-cli", "model": "any"},
+            "pinned": {"kind": "claude-cli", "model": "any", "max_concurrency": 1},
+            "local-model": {"kind": "ollama", "model": "any"},
+        }
+        config = LoadedConfig(data, self.root, [], {})
+        registry = ProviderRegistry(config)
+        self.assertEqual(CLI_DEFAULT_CONCURRENCY, 4)
+        self.assertEqual(registry.profile("claude").max_concurrency, 4)
+        self.assertEqual(registry.profile("codex").max_concurrency, 4)
+        self.assertEqual(registry.profile("pinned").max_concurrency, 1)
+        self.assertEqual(registry.profile("local-model").max_concurrency, 1)
+        self.assertEqual(
+            swarm_runs_module._provider_capacity_spec(config, "claude")[2], 4,
+        )
+
     def test_integrity_read_uses_one_snapshot_while_another_connection_appends(self) -> None:
         store, run_id = self._running("snapshot-read")
         with store._read() as db:
@@ -645,8 +938,10 @@ class SwarmRunStoreTests(unittest.TestCase):
         original_resource = store.resource
 
         @contextmanager
-        def short_resource(one_run, route, conversation_key, timeout=180.0):
-            with original_resource(one_run, route, conversation_key, timeout=0.3) as key:
+        def short_resource(one_run, route, conversation_key, timeout=180.0, **kwargs):
+            # Provider effects now queue without a deadline; bound this probe
+            # so a shared conversation lease would fail the test, not hang it.
+            with original_resource(one_run, route, conversation_key, timeout=0.3, **kwargs) as key:
                 yield key
 
         both_entered = threading.Barrier(2)
@@ -795,6 +1090,53 @@ class SwarmRunStoreTests(unittest.TestCase):
         self.assertTrue(result["provider_failures"])
         self.assertIs(result["provider_failures"][0]["outcome_unknown"], True)
         self.assertEqual(store.get(run_id)["status"], "complete")
+
+    def test_board_run_keeps_going_after_one_uncertain_web_turn_and_never_resends_it(self) -> None:
+        standing = self._standing()
+        standing["board"]["agents"] = [
+            {"id": "agent-1", "name": "Uncertain", "who": "web:uncertain-route", "job": "",
+             "ready": True, "filed_as": "uncertain", "why_not": ""},
+            {"id": "agent-2", "name": "Healthy", "who": "web:healthy-route", "job": "",
+             "ready": True, "filed_as": "healthy", "why_not": ""},
+        ]
+        standing["board"]["works_on"] = [
+            {"agent": "agent-1", "project": "project-1"},
+            {"agent": "agent-2", "project": "project-1"},
+        ]
+        standing["board"]["talks_to"] = [{"one": "agent-1", "other": "agent-2"}]
+        dispatched: list[str] = []
+
+        def answer(config, route, _text, filed_as="", **_kwargs):
+            with provider_effect(config, route, filed_as or route, f"{route}-{len(dispatched)}"):
+                dispatched.append(route)
+                if route == "web:uncertain-route":
+                    raise ProviderOutcomeUnknown("browser vanished after Send")
+                return {"answer": {"who": "them", "text": f"{route} answered", "at": ""}}
+
+        store = SwarmRunStore(self.config)
+        running = swarm.Running(store)
+        board_file = self.container / "settings" / "swarm.json"
+        with mock.patch.object(swarm, "where_it_lives", return_value=board_file), \
+                mock.patch.object(chat, "say", side_effect=answer):
+            started = running.start(self.config, standing, "one-uncertain-web-turn")
+            running.wait(20)
+        durable = store.get(started["run_id"])
+        # One uncertain turn used to make the next progress save refuse, which
+        # skipped every remaining agent and lost what they said.
+        self.assertEqual(durable["status"], "complete", durable.get("error"))
+        doing = durable["result"]["doing"]
+        states = [(one["agent"], one["round"], one["state"]) for one in doing["turns"]]
+        self.assertEqual(states[:2], [
+            ("agent-1", swarm.ON_ITS_OWN, "went wrong"),
+            ("agent-2", swarm.ON_ITS_OWN, "done"),
+        ])
+        self.assertIs(doing["turns"][0]["outcome_unknown"], True)
+        self.assertEqual(
+            [one["id"] for one in durable["result"]["provider_failures"]], ["agent-1"],
+        )
+        # The uncertain conversation is never sent to again, in this run or later.
+        self.assertEqual(dispatched.count("web:uncertain-route"), 1)
+        self.assertIn("uncertain prior delivery", doing["turns"][2]["why_not"])
 
     def test_parallel_workers_journal_overlapping_provider_effects_before_final_checkpoint(self) -> None:
         store, run_id = self._running("parallel-provider-effects")

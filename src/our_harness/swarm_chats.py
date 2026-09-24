@@ -28,7 +28,6 @@ from . import swarm as swarm_lab
 from . import pipeline_runs
 from .config import LoadedConfig
 from .models import HarnessError
-from .provider_compatibility import reviewable_dispatch_contract
 from .providers.base import effective_dispatch_fingerprint
 from .redaction import CredentialRedactor
 
@@ -591,6 +590,72 @@ def _route_binding(config: LoadedConfig, member: dict[str, Any]) -> dict[str, An
     }
 
 
+# Route identity is persisted beside ``agent_routes`` rather than inside it.
+# ``agent_routes`` entries are compared field-for-field with goal bindings and
+# older readers; keeping the identity in its own optional, versioned map means
+# neither of those sees a new field, and an older reader simply drops it.
+_ROUTE_IDENTITY_FIELDS = (
+    "route_identity_version", "route_identity_contract", "route_identity_sha256",
+)
+
+
+def _route_identity(config: LoadedConfig, member: dict[str, Any]) -> dict[str, Any]:
+    return chat_lab.route_identity(config, str(member.get("who") or ""))
+
+
+def _read_route_identity(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    version = value.get("route_identity_version")
+    digest = str(value.get("route_identity_sha256") or "").lower()
+    contract = str(value.get("route_identity_contract") or "")[:160]
+    if (
+        isinstance(version, bool) or not isinstance(version, int)
+        or chat_lab.ROUTE_IDENTITY_CONTRACTS.get(version) != contract
+        or not _SHA256.fullmatch(digest)
+    ):
+        return None
+    return {
+        "route_identity_version": version,
+        "route_identity_contract": contract,
+        "route_identity_sha256": digest,
+    }
+
+
+def _same_route_identity(
+    config: LoadedConfig, member: dict[str, Any], held_identity: dict[str, Any] | None,
+    held: dict[str, Any], current: dict[str, Any],
+) -> bool:
+    """Whether a saved identity still names the current provider.
+
+    A current-version record is compared directly. An older record (v1/v2)
+    is accepted, and upgraded by the refresh, only when its own digest still
+    matches and the whole saved profile fingerprint is unchanged. Otherwise
+    the chat cannot prove it is on the same provider and account and stays a
+    reviewable binding problem.
+    """
+
+    if held_identity is None:
+        return False
+    route = str(member.get("who") or "")
+    version = held_identity.get("route_identity_version")
+    if version == chat_lab.ROUTE_IDENTITY_VERSION:
+        return held_identity == chat_lab.route_identity(config, route)
+    if version not in chat_lab.ROUTE_IDENTITY_CONTRACTS \
+            or held_identity != chat_lab.route_identity(config, route, version=version):
+        return False
+    # An older identity version ignored inputs the current one covers (v1:
+    # every flag; v2: positional words and unlisted flags), so its digest
+    # matching proves nothing about them. Only an unchanged saved profile
+    # fingerprint proves the route is the same; otherwise it is reviewed.
+    return held.get("route_fingerprint_sha256") == current.get("route_fingerprint_sha256")
+
+
+def _held_route_identity(binding: dict[str, Any], member_id: str) -> dict[str, Any] | None:
+    held = (binding.get("route_identities") or {}).get(member_id)
+    return _read_route_identity(held)
+
+
 _VERIFIED_CHAT_ROUTE_FIELDS = (
     "route", "failure_context_version", "route_fingerprint_sha256",
     "transport_contract", "effective_dispatch_version",
@@ -761,6 +826,12 @@ def _binding_for(
             1 if legacy_path_only else CHAT_BINDING_SCHEMA_VERSION
         ),
         "agent_routes": routes,
+        # Observed together with ``routes`` from the same configuration, so
+        # it is exactly as trustworthy as the route fingerprints beside it.
+        "route_identities": {
+            member_id: _route_identity(config, agents.get(member_id) or {})
+            for member_id in pair
+        },
         "project": _project_binding(
             project, project_id if project else "",
             legacy_path_only=legacy_path_only,
@@ -861,9 +932,18 @@ def _read_binding(value: Any, pair: list[str]) -> dict[str, Any]:
                 return {}
         elif strength != "unavailable" or identity_fingerprint:
             return {}
+    identities = {
+        member_id: identity
+        for member_id in pair
+        if (identity := _read_route_identity(
+            (value.get("route_identities") or {}).get(member_id)
+            if isinstance(value.get("route_identities"), dict) else None
+        )) is not None
+    }
     return {
         "binding_schema_version": schema_version,
         "agent_routes": routes,
+        **({"route_identities": identities} if identities else {}),
         "project": {
             "id": project_id,
             "path_fingerprint_sha256": path_fingerprint,
@@ -928,6 +1008,111 @@ def _adopt_legacy_registry(
     return changed
 
 
+def _route_binding_drifted(held: dict[str, Any], current: dict[str, Any]) -> bool:
+    """Whether a saved route binding differs from the current observation."""
+
+    if any(held.get(key) != current.get(key) for key in (
+        "route", "failure_context_version", "route_fingerprint_sha256",
+        "transport_contract",
+    )):
+        return True
+    return held.get("effective_dispatch_strength") == "verified" and any(
+        held.get(key) != current.get(key) for key in (
+            "effective_dispatch_version",
+            "effective_dispatch_fingerprint_sha256",
+            "effective_dispatch_contract",
+        )
+    )
+
+
+def _refresh_route_bindings(
+    config: LoadedConfig, registry: dict[str, Any], board: dict[str, Any], *,
+    chat_id: str = "", observed: dict[str, dict[str, Any]] | None = None,
+) -> bool:
+    """Record current route settings for chats whose provider identity held.
+
+    Two bounded, versioned steps, both local metadata only (no provider is
+    asked anything):
+
+    * Migration: a saved binding with no recorded route identity gets one
+      when every route fingerprint still matches the current setup exactly,
+      which proves the identity is the one it was saved with.
+    * Refresh: when the recorded identity still matches, changed tunables
+      (model, effort, timeout, flags, ...) and a changed executable version,
+      file identity or engine contract are written over the old fingerprints,
+      so the chat continues and later goal admissions see the current setup.
+
+    A changed identity is never refreshed here; it stays a reviewable
+    binding problem.
+    """
+
+    workspace_id = _board_workspace_id(board)
+    agents = _agents(board)
+    changed = False
+    if observed is None:
+        observed = {}
+    observed_identities: dict[str, dict[str, Any]] = {}
+    for raw in registry.get("chats", []):
+        if not isinstance(raw, dict) \
+                or str(raw.get("workspace_id") or "") != workspace_id \
+                or (chat_id and str(raw.get("id") or "") != chat_id) \
+                or any(one not in agents for one in raw.get("pair", [])):
+            continue
+        binding = raw.get("binding")
+        if not isinstance(binding, dict):
+            continue
+        held_routes = binding.get("agent_routes")
+        if not isinstance(held_routes, dict):
+            continue
+        identities = binding.get("route_identities")
+        if not isinstance(identities, dict):
+            identities = {}
+        for member_id in raw.get("pair", []):
+            held = held_routes.get(member_id)
+            if not isinstance(held, dict):
+                continue
+            member = agents[member_id]
+            route = str(member.get("who") or "")
+            if route not in observed:
+                observed[route] = _route_binding(config, member)
+            current = observed[route]
+            held_identity = _read_route_identity(identities.get(member_id))
+            drifted = _route_binding_drifted(held, current)
+            current_version = (
+                held_identity is not None
+                and held_identity.get("route_identity_version")
+                == chat_lab.ROUTE_IDENTITY_VERSION
+            )
+            if not drifted and current_version:
+                continue  # The steady state: nothing to observe or write.
+            if route not in observed_identities:
+                observed_identities[route] = _route_identity(config, member)
+            identity = observed_identities[route]
+            if not drifted:
+                # Unchanged saved profile: record (or upgrade to) the current
+                # identity version; the exact fingerprints prove it.
+                identities[member_id] = identity
+                changed = True
+                continue
+            if held.get("route") != current.get("route") or not _same_route_identity(
+                config, member, held_identity, held, current,
+            ):
+                continue
+            identities[member_id] = identity
+            fields = (
+                _VERIFIED_CHAT_ROUTE_FIELDS
+                if held.get("effective_dispatch_strength") == "verified"
+                else ("route", "failure_context_version",
+                      "route_fingerprint_sha256", "transport_contract")
+            )
+            for key in fields:
+                held[key] = current.get(key)
+            changed = True
+        if identities:
+            binding["route_identities"] = identities
+    return changed
+
+
 def _binding_problem(
     config: LoadedConfig, board: dict[str, Any], raw: dict[str, Any],
     agents: dict[str, dict[str, Any]], *,
@@ -957,49 +1142,59 @@ def _binding_problem(
                 route_bindings[route] = _route_binding(config, member)
             current = route_bindings[route]
         held = binding["agent_routes"].get(member_id) or {}
-        common_fields = (
-            "route", "failure_context_version", "route_fingerprint_sha256",
-            "transport_contract",
+        if not _route_binding_drifted(held, current):
+            continue
+        held_identity = _held_route_identity(binding, member_id)
+        route_renamed = held.get("route") != current.get("route")
+        if not route_renamed and _same_route_identity(
+            config, member, held_identity, held, current,
+        ):
+            # Same provider, account and program; only tunables, the
+            # executable's version/file identity, or an engine contract
+            # revision moved. That is applied from the next turn (see
+            # _refresh_route_bindings) and never pauses the chat.
+            continue
+        # A renamed route is a different provider route; the transcript
+        # stays with the old one and a fresh chat is the recovery. Every
+        # other change on the same route can be reviewed and reconnected:
+        # an identity change (another kind, account, credential slot or
+        # program) needs the person's confirmation, never a silent switch,
+        # and an older saved chat without a recorded identity cannot prove
+        # that only a setting such as the model changed.
+        reconnectable = bool(
+            reconnectable and not route_renamed
+            and binding.get("binding_schema_version") == CHAT_BINDING_SCHEMA_VERSION
+            and held.get("effective_dispatch_strength") == "verified"
         )
-        base_changed = any(
-            held.get(key) != current.get(key) for key in common_fields
-        )
-        effective_changed = (
-            held.get("effective_dispatch_strength") == "verified"
-            and any(
+        kind = (
+            "route_changed" if route_renamed
+            else "route_identity_changed" if held_identity is not None
+            else "route_settings_changed" if any(
                 held.get(key) != current.get(key) for key in (
-                    "effective_dispatch_version",
-                    "effective_dispatch_fingerprint_sha256",
-                    "effective_dispatch_contract",
+                    "route", "failure_context_version",
+                    "route_fingerprint_sha256", "transport_contract",
                 )
             )
+            else "effective_dispatch_changed"
         )
-        if base_changed or effective_changed:
-            reconnectable = (reconnectable and not base_changed
-                and held.get("effective_dispatch_version") == current.get("effective_dispatch_version")
-                and reviewable_dispatch_contract(held.get("effective_dispatch_contract"), current.get("effective_dispatch_contract")))
-            kind = (
-                "route_changed" if held.get("route") != current.get("route")
-                else "route_settings_changed" if base_changed
-                else "effective_dispatch_changed"
-            )
-            changed_routes.append({
-                "agent_id": member_id,
-                "agent_name": str(member.get("name") or member_id),
-                "before_route": str(held.get("route") or ""),
-                "current_route": str(current.get("route") or ""),
-                "kind": kind,
-            })
+        changed_routes.append({
+            "agent_id": member_id,
+            "agent_name": str(member.get("name") or member_id),
+            "before_route": str(held.get("route") or ""),
+            "current_route": str(current.get("route") or ""),
+            "kind": kind,
+        })
     if changed_routes:
         names = ", ".join(one["agent_name"] for one in changed_routes)
-        route_renamed = any(one["kind"] == "route_changed" for one in changed_routes)
-        dispatch_changed = any(
-            one["kind"] == "effective_dispatch_changed" for one in changed_routes
-        )
+        kinds = {one["kind"] for one in changed_routes}
         detail = (
-            "assistant route changed" if route_renamed
+            "assistant route changed" if "route_changed" in kinds
+            else "provider identity changed (a different provider kind, "
+            "account, sign-in slot, endpoint or program)"
+            if "route_identity_changed" in kinds
             else "effective provider executable or dispatch contract changed"
-            if dispatch_changed else "connection settings changed"
+            if kinds == {"effective_dispatch_changed"}
+            else "connection settings changed"
         )
         owner = f"{names}'s" if len(changed_routes) == 1 else f"the setup for {names}"
         return {
@@ -1009,8 +1204,9 @@ def _binding_problem(
             "message": (
                 f"This chat is paused because {owner} {detail}. Nexus kept its "
                 "transcript and will not send that history to a different provider "
-                "setup. " + (
-                    "After signing in or updating the provider, review reconnection to continue this saved chat."
+                "setup on its own. " + (
+                    "Review reconnection to continue this saved chat with the current "
+                    "setup, or start a fresh chat."
                     if reconnectable else "Start a fresh chat with the current setup."
                 )
             ),
@@ -1062,8 +1258,11 @@ def _binding_problem(
             "message": (
                 f"This chat is paused because {detail}. Nexus kept the transcript "
                 "and will not apply its "
-                "history to a different folder. Start a fresh chat with the current setup."
+                "history to a different folder on its own. Choose this chat's "
+                "project again to continue it in the current folder, or start a "
+                "fresh chat with the current setup."
             ),
+            "can_rebind_project": True,
             "action": "start_fresh",
             "action_label": "Start fresh with current setup",
         }
@@ -1084,10 +1283,21 @@ def _binding_problem(
     return None
 
 
+_PROJECT_REBIND_PROBLEMS = frozenset({
+    "project_binding_changed", "project_access_changed",
+})
+
+
 def fence_for_board_change(
     config: LoadedConfig, before: dict[str, Any], after: dict[str, Any]
 ) -> int:
-    """Fence saved chats when any authority-bearing board binding changes."""
+    """Fence each saved chat whose own authority-bearing board inputs changed.
+
+    Board saves are frequent (every drag autosaves) and are not refused while
+    a pair-chat or goal run is in flight, so fencing is per chat: renaming an
+    unrelated agent, adding an agent or project, or drawing an unrelated line
+    must leave every running conversation intact.
+    """
 
     def authority(board: dict[str, Any]) -> str:
         agents = sorted(
@@ -1113,6 +1323,65 @@ def fence_for_board_change(
                 tuple(sorted((str(one.get("one") or ""), str(one.get("other") or ""))))
                 for one in board.get("talks_to", []) if isinstance(one, dict)
             ),
+        }
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+    def chat_authority(board: dict[str, Any], conversation: dict[str, Any]) -> str:
+        """Only the inputs that bind this one chat: its members, the talk
+        line between them, its selected project and their works-on lines."""
+
+        pair = conversation.get("pair", [])
+        pair = [str(one) for one in pair] if isinstance(pair, list) else []
+        agents = _agents(board)
+        members = [
+            [
+                member_id, str(agents[member_id].get("name") or ""),
+                str(agents[member_id].get("who") or ""),
+                str(agents[member_id].get("filed_as") or ""),
+            ] if member_id in agents else [member_id, None]
+            for member_id in pair
+        ]
+        project_id = str(conversation.get("project") or "")
+        project = next((
+            one for one in board.get("projects", [])
+            if isinstance(one, dict) and str(one.get("id") or "") == project_id
+        ), None) if project_id else None
+        works_on = {
+            (str(one.get("agent") or ""), str(one.get("project") or ""))
+            for one in board.get("works_on", []) if isinstance(one, dict)
+        }
+        # A direct (one-agent) chat in collaborate/auto mode also asks every
+        # ready agent its lead has a talk line to (swarm_work._participants
+        # with no peer). Those helpers are authority inputs of that chat too:
+        # cutting such a line or changing a helper's route must fence it.
+        helpers: list[list[Any]] = []
+        if len(pair) == 1 and pair[0] in agents:
+            helpers = sorted(
+                [
+                    str(one.get("id") or ""), str(one.get("name") or ""),
+                    str(one.get("who") or ""), str(one.get("filed_as") or ""),
+                    bool(one.get("ready")),
+                ]
+                for one in board.get("agents", [])
+                if isinstance(one, dict)
+                and str(one.get("id") or "") not in ("", pair[0])
+                and swarm_lab.may_they_talk(board, pair[0], str(one.get("id") or ""))
+            )
+        payload = {
+            "workspace_id": _board_workspace_id(board),
+            "members": members,
+            "helpers": helpers,
+            "talks": (
+                swarm_lab.may_they_talk(board, pair[0], pair[1])
+                if len(pair) == 2 else None
+            ),
+            "project": (
+                [project_id, str(project.get("path") or "")]
+                if project is not None else [project_id, None]
+            ),
+            "works_on": [
+                (member_id, project_id) in works_on for member_id in pair
+            ] if project_id else [],
         }
         return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
@@ -1143,17 +1412,24 @@ def fence_for_board_change(
                 continue
             if conversation.get("workspace_id") != before_workspace:
                 continue
+            if chat_authority(before, conversation) == chat_authority(
+                after, conversation
+            ):
+                continue
             pair = conversation.get("pair", [])
-            first = str(pair[0]) if isinstance(pair, list) and pair else ""
-            old_route = old_routes.get(first, "")
-            new_route = routes.get(first, old_route)
-            fence_ledger(
-                config, old_route,
-                str(conversation.get("filed_as") or ""),
-            )
-            if new_route != old_route:
+            members = [str(one) for one in pair] if isinstance(pair, list) else []
+            # The collaboration ledger is keyed on the route of whichever
+            # member led the turn, so fence every member's old and new route,
+            # not only the first member's.
+            fenced_routes: list[str] = []
+            for member_id in members:
+                old_route = old_routes.get(member_id, "")
+                for route in (old_route, routes.get(member_id, old_route)):
+                    if route not in fenced_routes:
+                        fenced_routes.append(route)
+            for route in fenced_routes or [""]:
                 fence_ledger(
-                    config, new_route, str(conversation.get("filed_as") or "")
+                    config, route, str(conversation.get("filed_as") or ""),
                 )
             fenced += 1
         if changed_registry:
@@ -2055,12 +2331,16 @@ def list_for_agent(
             config, board, strict_schema_plans,
         ):
             changed = True
-        if changed:
-            _write(config, registry)
         # One inventory is a read snapshot, not one provider/setup probe per
         # saved conversation. Reuse observations only within this response;
         # every later inventory, migration and exact admission rechecks them.
         route_bindings: dict[str, dict[str, Any]] = {}
+        if _refresh_route_bindings(
+            config, registry, board, observed=route_bindings,
+        ):
+            changed = True
+        if changed:
+            _write(config, registry)
         work_authorities: dict[tuple[str, str], dict[str, Any]] = {}
         return {
             "agent": agent_id,
@@ -2097,6 +2377,8 @@ def resolve(
         if _keep_exact_strict_schema_chat_upgrades(
             config, board, strict_schema_plans,
         ):
+            changed = True
+        if _refresh_route_bindings(config, registry, board, chat_id=chat_id):
             changed = True
         raw, agents = _validated_conversation(
             config, registry, board, agent_id, chat_id,
@@ -2179,12 +2461,18 @@ def select_project(
         _keep_exact_strict_schema_chat_upgrades(
             config, board, strict_schema_plans,
         )
+        _refresh_route_bindings(config, registry, board, chat_id=chat_id)
         raw, agents_by_id = _validated_conversation(
             config, registry, board, agent_id, chat_id,
             require_current_binding=False,
         )
         problem = _binding_problem(config, board, raw, agents_by_id)
-        if problem:
+        # Choosing the project is the explicit user rebind that a project-only
+        # problem asks for ("Use a different folder on this computer", or a
+        # re-clone at the same path). Chat identity and history are kept and
+        # the new folder's identity is bound below. Provider/agent problems
+        # are never cleared here: they need reconnect review or a fresh chat.
+        if problem and problem.get("code") not in _PROJECT_REBIND_PROBLEMS:
             raise swarm_lab.SwarmError(str(problem["message"]))
         valid = {
             str(one.get("id")) for one in _shared_projects(board, raw["pair"])
@@ -2203,7 +2491,9 @@ def select_project(
                 "Nexus cannot verify a stable local identity for that project folder. "
                 "Restore or choose the folder before granting this chat project authority."
             )
-        if str(raw.get("project") or "") != project_id:
+        if str(raw.get("project") or "") != project_id or problem:
+            # A rebind onto a different folder invalidates writers that were
+            # started against the old one, exactly like choosing another project.
             from .collaboration_ledger import fence_ledger
 
             current = _agents(board).get(agent_id) or {}
@@ -2245,6 +2535,7 @@ def restart_provider_conversation(
         _keep_exact_strict_schema_chat_upgrades(
             config, board, strict_schema_plans,
         )
+        _refresh_route_bindings(config, registry, board, chat_id=chat_id)
         raw, agents = _validated_conversation(
             config, registry, board, agent_id, chat_id,
         )

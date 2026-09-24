@@ -19,6 +19,7 @@
 #emailQueue { display: flex; flex-direction: column; flex: 1; min-height: 0; }
 #emailQueue > * { flex-shrink: 0; }
 /* Let the review panel size the shared row, not the mailbox contents. */
+.email-inline-action { margin-left: 8px; padding: 2px 10px; font-size: .85rem; }
 .email-queue-scroll { flex: 1 1 0; min-height: 160px; overflow-y: auto; overscroll-behavior: contain; padding-right: 6px; }
 .email-message { display: block; width: 100%; margin: 10px 0; text-align: left; white-space: pre-wrap; overflow-wrap: anywhere; padding: 12px; }
 .email-message[aria-pressed="true"] { border-color: var(--cyan); background: rgba(99,230,255,.16); }
@@ -80,3 +81,39 @@
 .email-memory-empty { color: var(--muted); padding: 12px 0; }
 
 .email-learning-attempt { border-top: 1px solid var(--line); padding: 10px 0; overflow-wrap: anywhere; }
+
+.email-compose { width: min(760px, 90vw); max-height: 90vh; overflow: auto; box-sizing: border-box; padding: 20px; border: 1px solid #537682; border-radius: 14px; background: #0b2732; color: #edf6fa; }
+.email-compose::backdrop { background: rgb(0 0 0 / 65%); }
+.email-compose label { display: block; margin-top: 12px; font-weight: 600; }
+.email-compose input, .email-compose textarea { display: block; box-sizing: border-box; width: 100%; margin: 6px 0 12px; padding: 10px; color: inherit; background: #071b23; border: 1px solid #537682; border-radius: 6px; }
+.email-compose h2 { margin-top: 0; }
+.email-compose textarea { min-height: 140px; height: clamp(140px, 25vh, 320px); resize: vertical; }
+.email-compose button { margin-right: 8px; }
+
+.email-comparison > div { padding: 10px; border: 2px solid transparent; border-radius: 10px; }
+.email-comparison > .email-selected-version { border-color: var(--cyan, #63e6ff); background: rgba(99,230,255,.06); }
+.email-version-choice { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-weight: 700; cursor: pointer; }
+.email-version-choice input { width: auto; margin: 0; }
+.email-version-notice { color: var(--cyan, #63e6ff); }
+.email-compose select { display: block; width: 100%; margin: 6px 0 12px; }
+
+.email-compose-addresses { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+@media (max-width: 600px) { .email-compose-addresses { grid-template-columns: minmax(0, 1fr); gap: 0; } }
+
+/* Corner notifications in a plain browser (the desktop app shows its own
+   always-on-top pop-up instead). Same look: a dark card sliding up from the
+   corner, square avatar, bold name, quiet action line, detail in colour. */
+.nexus-mail-toasts { position: fixed; right: 16px; bottom: 16px; z-index: 2147483000; display: flex; flex-direction: column; gap: 8px; width: min(368px, calc(100vw - 32px)); pointer-events: none; }
+.nexus-mail-toast { position: relative; pointer-events: auto; border: 1px solid rgba(102, 192, 244, .45); border-radius: 4px; background: linear-gradient(180deg, #2a475e 0%, #1b2838 100%); box-shadow: 0 6px 18px rgba(0, 0, 0, .55); color: #fff; animation: nexus-mail-toast-in 320ms cubic-bezier(.2, .9, .3, 1) both; }
+.nexus-mail-toast-open { display: grid; grid-template-columns: 56px minmax(0, 1fr); gap: 12px; align-items: center; width: 100%; min-height: 84px; padding: 12px 34px 12px 12px; border: 0; background: transparent; color: inherit; font: 13px/1.35 "Segoe UI", system-ui, sans-serif; text-align: left; cursor: pointer; }
+.nexus-mail-toast-open:focus-visible, .nexus-mail-toast-close:focus-visible { outline: 2px solid #fff2a8; outline-offset: -2px; }
+.nexus-mail-toast-avatar { display: grid; place-items: center; width: 56px; height: 56px; border: 2px solid #a4d007; border-radius: 2px; background: linear-gradient(160deg, #66c0f4, #1a6ea0); font-size: 24px; font-weight: 700; }
+.nexus-mail-toast-text { min-width: 0; }
+.nexus-mail-toast-title, .nexus-mail-toast-action, .nexus-mail-toast-detail { display: block; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.nexus-mail-toast-title { font-weight: 700; font-size: 14px; }
+.nexus-mail-toast-action { color: #b8c6d1; }
+.nexus-mail-toast-detail { color: #a4d007; font-weight: 600; }
+.nexus-mail-toast-close { position: absolute; top: 6px; right: 6px; width: 24px; height: 24px; padding: 0; border: 0; border-radius: 3px; background: transparent; color: #b8c6d1; font-size: 16px; cursor: pointer; }
+.nexus-mail-toast-close:hover { background: rgba(255, 255, 255, .12); color: #fff; }
+@keyframes nexus-mail-toast-in { from { transform: translateY(110%); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .nexus-mail-toast { animation-duration: 1ms; } }

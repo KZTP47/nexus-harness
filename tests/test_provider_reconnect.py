@@ -75,26 +75,20 @@ class ProviderReconnectTests(unittest.TestCase):
         store = self.runtime.store
         before = store.get(self.goal["goal_id"])
         self.replace_executable()
-        protected = swarm_chats.resolve(self.config, self.board, "builder", self.chat_id, allow_binding_drift=True)
-        self.assertTrue(protected["binding_problem"]["can_review_reconnect"])
-        with self.assertRaises(HarnessError):
-            swarm_chats.resolve(self.config, self.board, "builder", self.chat_id)
-        with self.assertRaises(HarnessError):
-            self.runtime.resume(self.goal["goal_id"])
-        review = self.review()
-        self.assertNotIn(str(self.executable), str(review))
-        self.assertEqual(store.get(self.goal["goal_id"])["revision"], before["revision"])
-        self.apply(review)
+        # The saved chat itself continues across a CLI update: its provider
+        # identity (kind, account slot, program) did not change.
+        self.assertIsNone(swarm_chats.resolve(
+            self.config, self.board, "builder", self.chat_id)["binding_problem"])
+        # The goal follows the same rule: the provider identity is unchanged,
+        # so the update is not a setup change and needs no reconnect. The
+        # saved binding is refreshed at the next quiet claim.
         after = store.get(self.goal["goal_id"])
+        self.assertFalse(store.public(after)["provider_setup_changed"])
+        self.assertTrue(store.provider_setup_status(after)["refresh_pending"])
         for field in ("tasks", "budget", "admission_digest", "dialogue", "policy"):
             self.assertEqual(after[field], before[field], field)
         self.assertEqual(goal_access.state(after)["mode"], "full")
-        self.assertEqual(after["agent_access"]["grants"], before["agent_access"]["grants"])
-        self.assertEqual(after["agent_access"]["binding"], goal_access.binding(after))
         self.assertEqual(after["status"], "paused")
-        self.assertFalse(store.public(after)["provider_setup_changed"])
-        with self.assertRaises(HarnessError):
-            self.apply(review)
         self.runtime.close()
         self.runtime = long_horizon.LongHorizonRuntime(self.config)
         self.addCleanup(self.runtime.close)
@@ -115,8 +109,11 @@ class ProviderReconnectTests(unittest.TestCase):
         result, seen = self.run_replies(resumed, [fixtures.reply(), fixtures.reply()])
         self.assertEqual(result["status"], "complete", result["note"])
         self.assertEqual(len(seen), 2)
-        self.assertTrue(any(one["type"] == "provider_setup_reconnected"
+        finished = store.get(after["goal_id"])
+        self.assertTrue(any(one["type"] == "provider_binding_refreshed_for_tunable_change"
                             for one in store.events(after["goal_id"])["events"]))
+        self.assertEqual(goal_access.state(finished)["mode"], "full")
+        self.assertEqual(finished["agent_access"]["binding"], goal_access.binding(finished))
 
     def test_ordinary_sign_in_without_executable_change_keeps_binding(self):
         self.prepare()
@@ -160,7 +157,9 @@ class ProviderReconnectTests(unittest.TestCase):
                 self.prepare(kind="claude-cli")
             before = self.runtime.store.get(self.goal["goal_id"])
             conversation = swarm_chats.resolve(self.config, self.board, "builder", self.chat_id, allow_binding_drift=True)
-            self.assertTrue(conversation["binding_problem"]["can_review_reconnect"])
+            # An engine contract revision on the same provider is not a
+            # different provider: the chat continues; the goal is reconnected.
+            self.assertIsNone(conversation["binding_problem"])
             self.apply(self.review())
             after = self.runtime.store.get(self.goal["goal_id"])
             for field in ("objective", "tasks", "budget", "execution_contract", "policy"):
@@ -253,6 +252,56 @@ class ProviderReconnectTests(unittest.TestCase):
         self.assertEqual(self.runtime.store.active_authority_goals(), [])
         self.assertFalse(swarm_chats.resolve(self.config, self.board, "builder", self.chat_id).get("binding_problem"))
 
+    def test_identity_change_needs_review_then_continues_the_same_chat(self):
+        self.prepare(goal=False)
+        other = self.base / "other-assistant.cmd"
+        other.write_text("another program")
+        other.chmod(0o755)
+        self.config.data["providers"]["builder-route"]["command"] = [str(other), "--arbitrary"]
+        protected = swarm_chats.resolve(self.config, self.board, "builder", self.chat_id,
+                                        allow_binding_drift=True)
+        self.assertEqual(protected["binding_problem"]["changed_agents"][0]["kind"],
+                         "route_identity_changed")
+        self.assertTrue(protected["binding_problem"]["can_review_reconnect"])
+        # Never silent: until the person confirms, the chat is not sent anywhere.
+        with self.assertRaises(HarnessError):
+            swarm_chats.resolve(self.config, self.board, "builder", self.chat_id)
+        review = self.review()
+        self.assertIn("intended account", review["message"])
+        with self.assertRaises(HarnessError):
+            swarm_chats.resolve(self.config, self.board, "builder", self.chat_id)
+        self.apply(review)
+        resolved = swarm_chats.resolve(self.config, self.board, "builder", self.chat_id)
+        self.assertIsNone(resolved["binding_problem"])
+        self.assertEqual(chat.read_it(self.config, "builder-route", resolved["filed_as"])[-1].text,
+                         "saved answer")
+        saved = next(one for one in swarm_chats._read(self.config)["chats"] if one["id"] == self.chat_id)
+        self.assertEqual(saved["binding"]["route_identities"]["builder"],
+                         chat.route_identity(self.config, "builder-route"))
+
+    def test_profile_flag_switch_needs_review_then_continues(self):
+        self.prepare(goal=False)
+        self.config.data["providers"]["builder-route"]["command"] = [
+            str(self.executable), "--arbitrary", "--profile", "other-account",
+        ]
+        protected = swarm_chats.resolve(self.config, self.board, "builder", self.chat_id,
+                                        allow_binding_drift=True)
+        self.assertEqual(protected["binding_problem"]["changed_agents"][0]["kind"],
+                         "route_identity_changed")
+        with self.assertRaises(HarnessError):
+            swarm_chats.resolve(self.config, self.board, "builder", self.chat_id)
+        self.apply(self.review())
+        self.assertIsNone(swarm_chats.resolve(
+            self.config, self.board, "builder", self.chat_id)["binding_problem"])
+
+    def test_model_edit_keeps_chat_going_without_any_review(self):
+        self.prepare(goal=False)
+        self.config.data["providers"]["builder-route"]["model"] = "another-model"
+        self.assertIsNone(swarm_chats.resolve(
+            self.config, self.board, "builder", self.chat_id)["binding_problem"])
+        with self.assertRaisesRegex(HarnessError, "already matches"):
+            self.review()
+
     def test_wrong_pair_and_workspace_and_changed_contract_are_rejected(self):
         self.prepare()
         self.replace_executable()
@@ -274,10 +323,15 @@ class ProviderReconnectTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 self.apply(review)
         self.assertEqual(self.runtime.store.get(self.goal["goal_id"])["status"], "paused")
-        with self.assertRaises(HarnessError):
-            swarm_chats.resolve(self.config, self.board, "builder", self.chat_id)
-        self.apply(self.review())
+        # Goals commit before chat metadata. The interrupted chat write is
+        # harmless: the chat's provider identity held, so the chat records the
+        # new executable itself, and the reconnected goal never auto-resumes.
         self.assertFalse(swarm_chats.resolve(self.config, self.board, "builder", self.chat_id).get("binding_problem"))
+        after = self.runtime.store.get(self.goal["goal_id"])
+        self.assertEqual(after["status"], "paused")
+        self.assertFalse(self.runtime.store.public(after)["provider_setup_changed"])
+        with self.assertRaisesRegex(HarnessError, "already matches"):
+            self.review()
 
     def test_http_reconnect_is_authenticated_scoped_and_keeps_goal_paused(self):
         from our_harness.server import HarnessHTTPServer

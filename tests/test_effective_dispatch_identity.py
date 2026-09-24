@@ -216,6 +216,50 @@ class EffectiveDispatchIdentityTests(unittest.TestCase):
             build_opener.call_args.args[0], provider_base._RejectRedirectHandler,
         )
 
+    def test_a_timed_out_version_probe_is_remembered_instead_of_flipping(self) -> None:
+        current = self.root / "slow-tool"
+        self.executable(current, "slow binary")
+        provider = provider_base.LocalProcessProvider(self.config([str(current)]))
+        answers = [
+            {"state": "timed-out", "version_output_sha256": "a" * 64},
+            {"state": "observed", "version_output_sha256": "b" * 64},
+        ]
+        with mock.patch.object(
+            provider_base.LocalProcessProvider, "_effective_dispatch_version",
+            side_effect=lambda _command: answers.pop(0),
+        ) as probe:
+            first = provider.effective_dispatch_fingerprint()
+            second = provider.effective_dispatch_fingerprint()
+            self.assertEqual(probe.call_count, 1)
+            self.assertEqual(first, second)
+            # After the settle period the program is asked again and its real
+            # version is recorded.
+            with mock.patch.object(
+                provider_base, "_UNSETTLED_VERSION_SECONDS", 0.0,
+            ):
+                third = provider.effective_dispatch_fingerprint()
+            fourth = provider.effective_dispatch_fingerprint()
+        self.assertEqual(probe.call_count, 2)
+        self.assertNotEqual(first, third)
+        self.assertEqual(third, fourth)
+
+    def test_route_identity_is_separate_from_the_persisted_failure_context(self) -> None:
+        # Other stores compare ``_route_failure_context`` output field for
+        # field; the identity digest must never be added to it.
+        config = self.config(["agent-tool"])
+        config.data["providers"] = {
+            "worker": {"kind": "local", "model": "model-a", "command": ["agent-tool"]},
+        }
+        _kind, context = chat._route_failure_context(config, "worker")
+        self.assertFalse(any(key.startswith("route_identity") for key in context))
+        identity = chat.route_identity(config, "worker")
+        config.data["providers"]["worker"]["model"] = "model-b"
+        _kind, changed = chat._route_failure_context(config, "worker")
+        self.assertNotEqual(
+            context["route_fingerprint_sha256"], changed["route_fingerprint_sha256"],
+        )
+        self.assertEqual(chat.route_identity(config, "worker"), identity)
+
 
 if __name__ == "__main__":
     unittest.main()

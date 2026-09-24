@@ -20,6 +20,16 @@ requires executed checks for runtime deliverables and directs agents to author
 meaningful missing checks before trying again. Repeated failures are bounded;
 Nexus does not manufacture progress or silently approve new commands.
 
+That 0.2.10 rule was later withdrawn under the owner rule "Agents lead; Nexus
+only supports" (see `AGENTS.md`). A regex over goal wording classified requests
+such as "make the website footer say 2026" or "write a script that renames
+photos" as runtime work, so any changed `.py`/`.js` file in a project without
+tests could never complete. Check policy v4 (verification contract schema 5)
+requires executed checks only when the user explicitly asked for tests; runtime
+files are otherwise reported (`runtime_paths`) but never veto completion, and a
+reasoned no-change result is valid. Schema-4 goals keep their saved command
+authority and receive the new policy.
+
 The verification policy is versioned and bound to saved goal context. Fresh and
 incomplete resumed goals use the current policy while preserving the user's
 exact command authority. Historical completed goals remain historical records;
@@ -52,3 +62,29 @@ not an execution result.
 The regression suite covers inert-versus-working launch handlers in the real
 contained browser runner, missing verification, placeholder-only game output,
 unsupported direct-file launch claims, bounded repair, and resumed contracts.
+
+## Work-together completion (legacy profile)
+
+The board's "work together" engine applies the same owner rule. Its
+requirement contract marks everything inferred from goal wording or plans as
+`mandatory: false` hints (named files, file operations, artifact kinds,
+behaviour clauses, planned effect paths). Only explicitly requested tests are
+mandatory. When the agents agree and no deterministic check can run, including
+toolchains without a containment profile, the goal completes as
+`agent_verified` (`machine_verified: false`) rather than being held open; a
+failing check still blocks. See "What restricts agents in Work together" in
+[AGENT_ACCESS.md](AGENT_ACCESS.md).
+
+Nexus never ends a work-together run on a progress heuristic: the former
+progress guard (14 "no counted progress" rounds or an A/B pattern) is gone.
+After six exactly identical rounds the agents are told they may be looping and
+continue; only user-set round limits end a run early, plus one outcome-based
+machine guard (`no_change_guard`): 200 rounds without a new outcome state
+(completion flags, verification status, changed-file contents; wording never
+counts), or project work returning to an already-left state twice, stop the
+run, keeping all work and resumable. A run that ends incomplete keeps the
+agents' applied work and is reported (and resumable) as incomplete.
+Discussion consensus accepts remaining items explicitly labelled
+`Optional:`/`Advisory:`/`Non-blocking:`/`Follow-up:` (or "None"/"N/A"), and
+all agents claiming completion two rounds running. A verifier whose reply
+cannot be read blocks completion until it has failed three passes in a row.

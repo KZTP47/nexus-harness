@@ -39,6 +39,14 @@ from .staged_coding import StagedCandidate, StagedCodingWorkspace, TextReplaceme
 
 EventEmitter = Callable[[str, str, dict[str, Any]], None]
 
+
+class AgentToolCallLimitReached(HarnessError):
+    """The session's tool calls are used up. Nothing was run for this call.
+
+    Its own type so a caller can hand the limit back to the agent as a tool
+    result, instead of treating it like a broken provider or a failed run.
+    """
+
 # Provider call IDs belong to an agent response. The engine supplies a stable
 # response scope when it can replay that response across process restarts.
 TOOL_IDENTITY_CONTRACT = "agent-tool-identity-v2:node,execution-scope,provider-call-id"
@@ -590,7 +598,7 @@ class AgentToolSession:
             raise HarnessError("Agent tool execution scope must be a bounded engine-owned string")
         self.deadline.check("before an agent tool call")
         if self.calls >= self.max_calls:
-            raise HarnessError(f"Agent tool call limit reached: {self.max_calls}")
+            raise AgentToolCallLimitReached(f"Agent tool call limit reached: {self.max_calls}")
         self.calls += 1
         span_id = uuid.uuid4().hex
         try:

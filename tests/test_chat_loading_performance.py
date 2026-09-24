@@ -250,6 +250,21 @@ class SavedChatInventoryPerformanceTests(unittest.TestCase):
         with mock.patch.object(swarm_chats, "_route_binding", wraps=swarm_chats._route_binding) as routes:
             fresh = swarm_chats.list_for_agent(self.config, self.board, "agent-1")
         self.assertEqual(routes.call_count, 2)
+        # A model edit is a tunable: every pair chat is rechecked, continues,
+        # and records the current configuration.
+        changed = [one for one in fresh["chats"] if len(one["pair"]) == 2]
+        self.assertTrue(changed and all(one["binding_problem"] is None for one in changed))
+        self.assertNotEqual(
+            next(one for one in changed if one["id"] == selected["id"])["binding"]["agent_routes"],
+            selected["binding"]["agent_routes"],
+        )
+        self.assertIsNone(swarm_chats.resolve(
+            self.config, self.board, "agent-1", selected["id"])["binding_problem"])
+        # A changed account slot is an identity change and is rechecked too.
+        self.config.data["providers"]["codex"]["api_key_env"] = "ANOTHER_ACCOUNT_KEY"
+        with mock.patch.object(swarm_chats, "_route_binding", wraps=swarm_chats._route_binding) as routes:
+            fresh = swarm_chats.list_for_agent(self.config, self.board, "agent-1")
+        self.assertEqual(routes.call_count, 2)
         changed = [one for one in fresh["chats"] if len(one["pair"]) == 2]
         self.assertTrue(all(one["binding_problem"]["code"] == "agent_binding_changed" for one in changed))
         with self.assertRaisesRegex(HarnessError, "will not send that history"):

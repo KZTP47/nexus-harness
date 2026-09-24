@@ -114,6 +114,19 @@ contextBridge.exposeInMainWorld("harnessDesktop", {
       (_event, chats, selected) => listener(chats, selected || null),
     );
   },
+  // A corner pop-up for new mail the assistant is drafting a reply to. The
+  // main process re-checks and bounds every field before anything is shown.
+  showMailNotification: (notice) => ipcRenderer.invoke(
+    "harness:showMailNotification", notice && typeof notice === "object" ? notice : {}),
+  onMailNotificationActivated: (listener) => {
+    if (typeof listener !== "function") return;
+    // The main process holds the newest click until a page takes it, so one
+    // made while this page was reloading still opens its email, exactly once.
+    const take = () => ipcRenderer.invoke("harness:takeMailNotificationActivation")
+      .then((target) => { if (target && typeof target === "object") listener(target); }, () => {});
+    ipcRenderer.on("harness:mailNotificationActivated", take);
+    take();
+  },
   onFullScreenChanged: (listener) => {
     if (typeof listener !== "function") return;
     ipcRenderer.on("harness:fullScreenChanged", (_event, on) => listener(Boolean(on)));

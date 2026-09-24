@@ -24,6 +24,13 @@ def canonical_recipient(value):
     if not value or any(c in value for c in '\r\n;'):
         return ''
     value = value.strip()
+    # A decoded display name such as `Müller, Hans <h@x.de>` keeps an unquoted
+    # comma. With no '@', quote, ':' or ';' before the one angle address, the
+    # display part names no other mailbox and the angle address is exact.
+    decoded = re.fullmatch(r'[^<>@":;]*,[^<>@":;]*<([^<>]+)>', value)
+    if decoded:
+        address = decoded[1].strip()
+        return address.casefold() if re.fullmatch(r'[^\s@<>,:"]+@[^\s@<>,:"]+', address) else ''
     envelope = re.fullmatch(r'(?:[^<>]*<([^<>]+)>|([^<>]+))', value)
     if not envelope:
         return ''
@@ -78,6 +85,38 @@ class EmailMemory:
                 db.execute('INSERT INTO mail_fts(rowid,subject,body,sender) SELECT row_id,subject,body,sender FROM documents')
                 db.execute("INSERT OR REPLACE INTO metadata VALUES('index_contract',?)", (signature,))
             db.execute(f'PRAGMA user_version={SCHEMA_VERSION}')
+            self._migrate_learned_authority(db)
+
+    LEARNED_AUTHORITY_MIGRATION = 'learned-authority/v1'
+
+    @classmethod
+    def _migrate_learned_authority(cls, db):
+        """Once: record where each preference came from before an edit made it 'user'.
+
+        Earlier versions overwrote the authority of an edited approved-edit
+        preference, so a sender-specific rule read as mailbox-wide. The first
+        revision still holds the original authority; evidence of an approved
+        draft is the fallback when that revision is missing.
+        """
+        if db.execute('SELECT 1 FROM metadata WHERE key=?', (cls.LEARNED_AUTHORITY_MIGRATION,)).fetchone():
+            return
+        for account, identity, revision, raw in db.execute(
+                'SELECT account,id,revision,record FROM preferences').fetchall():
+            record = json.loads(raw)
+            if 'learned_authority' in record:
+                continue
+            first = db.execute('SELECT record FROM preferences WHERE account=? AND id=? AND revision=1',
+                               (account, identity)).fetchone()
+            origin = json.loads(first[0]).get('authority') if first else None
+            if origin not in ('user', 'approved_edit'):
+                evidence = record.get('evidence') if isinstance(record.get('evidence'), dict) else {}
+                learned = bool(evidence.get('message_id') or evidence.get('source_draft_id')
+                               or (evidence.get('migration') and not str(record.get('source_draft_id', '')).startswith('legacy:')))
+                origin = 'approved_edit' if learned else record.get('authority', 'user')
+            record['learned_authority'] = origin
+            db.execute('UPDATE preferences SET record=? WHERE account=? AND id=? AND revision=?',
+                       (json.dumps(record), account, identity, revision))
+        db.execute('INSERT OR REPLACE INTO metadata VALUES(?,?)', (cls.LEARNED_AUTHORITY_MIGRATION, _now()))
 
     def _db(self):
         db = sqlite3.connect(self.path, timeout=30)
@@ -223,7 +262,8 @@ class EmailMemory:
                             and prior_record.get('recipient') == recipient
                             and prior_record.get('account_fingerprint') == account_fingerprint
                             and prior_record.get('category') == category and category != 'other'
-                            and prior_record.get('authority') != 'user'):
+                            and prior_record.get('authority') != 'user'
+                            and not prior_record.get('user_edited')):
                         self._supersede(db, account_id, prior_record['id'])
             if supersedes and not self._supersede(db, account_id, str(supersedes)):
                 raise ValueError('Superseded preference must be active in this account.')
@@ -250,7 +290,11 @@ class EmailMemory:
                 raise ValueError('Preference is not active in this account.')
             record = json.loads(row[0])
             self._supersede(db, account_id, preference_id)
-            record.update(revision=record['revision'] + 1, text=text, authority='user', updated_at=_now())
+            # The user's wording now leads (authority 'user'), but the preference
+            # keeps the scope it was learned for: `learned_authority` records that
+            # a sender-specific approved-edit rule never becomes mailbox-wide.
+            record.setdefault('learned_authority', record.get('authority', 'user'))
+            record.update(revision=record['revision'] + 1, text=text, authority='user', user_edited=True, updated_at=_now())
             db.execute('INSERT INTO preferences VALUES(?,?,?,?,?,?,?)',
                        (account_id, preference_id, record['revision'], text, record['scope'], 'active', json.dumps(record)))
             return record

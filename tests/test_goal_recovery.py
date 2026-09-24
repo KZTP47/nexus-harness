@@ -99,14 +99,22 @@ class GoalRecoveryTests(unittest.TestCase):
         resumed = self.runtime.store.control(goal['goal_id'], 'resume', self.choice(fresh))
         self.assertEqual(resumed['agent_access']['mode'], 'ask')
 
-    def test_changed_route_and_project_binding_never_adopt_automatic_retry(self):
+    def test_changed_provider_identity_never_adopts_automatic_retry(self):
         goal, _ = self.interrupted(codex=True)
-        self.config.data['providers']['builder-route']['model'] = 'different-model'
+        # A different provider endpoint is a new identity, not a tunable.
+        self.config.data['providers']['builder-route']['endpoint'] = 'https://another-provider.invalid/v1'
         projected = self.runtime.store.public(self.runtime.store.get(goal['goal_id']))
         self.assertFalse(projected['resume_recovery']['can_retry'])
         with self.assertRaises(HarnessError):
             self.runtime.store.control(goal['goal_id'], 'resume', self.choice(goal))
         self.assertTrue(self.runtime.store.get(goal['goal_id'])['tasks'][0]['outcome_unknown'])
+
+    def test_model_edit_is_a_tunable_and_keeps_the_recovery_choice(self):
+        goal, _ = self.interrupted(codex=True)
+        self.config.data['providers']['builder-route']['model'] = 'different-model'
+        projected = self.runtime.store.public(self.runtime.store.get(goal['goal_id']))
+        self.assertFalse(projected['provider_setup_changed'])
+        self.assertTrue(projected['resume_recovery']['can_retry'])
 
     def test_saved_action_or_transaction_is_not_discarded_by_provider_recovery(self):
         goal, _ = self.interrupted(codex=True)

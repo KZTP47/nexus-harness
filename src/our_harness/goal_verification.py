@@ -21,7 +21,7 @@ from .config import LoadedConfig
 from .models import HarnessError
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 SHARED_GOAL_PROFILE = "shared_goal_v1"
 LEGACY_CHECK_POLICY = {
     "schema_version": 1,
@@ -34,15 +34,25 @@ PREVIOUS_CHECK_POLICY = {
     "schema_version": 2,
     "request_intent_contract": "polite-and-plural-action-requests/v2",
 }
-CHECK_POLICY = {
+# Schema-4 contracts saved this policy. Their command authority is still
+# honoured, but their results are produced under the current policy below.
+RUNTIME_REQUIRED_CHECK_POLICY = {
     **PREVIOUS_CHECK_POLICY,
     "schema_version": 3,
     "runtime_deliverables": "executed-checks-required/v1",
 }
+# Agents lead; Nexus only supports. Executed tests are required only when the
+# user explicitly asked for tests. Otherwise test evidence is optional and
+# reported, never a veto, and a reasoned "no change needed" is a valid result.
+CHECK_POLICY = {
+    **PREVIOUS_CHECK_POLICY,
+    "schema_version": 4,
+    "runtime_deliverables": "executed-checks-only-when-user-requested-tests/v2",
+    "no_change_result": "agent-reasoned-no-change-is-valid/v1",
+}
 
-# This identifies an executable deliverable, not an English-to-test compiler.
-# Its behavior still needs task-specific checks authored and inspected by the
-# team. Static prose/data retain the authenticated no-change completion path.
+# Executable source suffixes are reported as information only. They never
+# make executed checks mandatory; only the user's explicit request does.
 _RUNTIME_SUFFIXES = frozenset({
     ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".vue", ".svelte",
     ".py", ".rb", ".go", ".rs", ".c", ".cc", ".cpp", ".cxx", ".cs",
@@ -50,8 +60,149 @@ _RUNTIME_SUFFIXES = frozenset({
 })
 _HTML_RUNTIME = re.compile(r"<script\b|\bon[a-z]+\s*=|javascript\s*:", re.I)
 _REQUEST_ACTION = re.compile(r"\b(?:create|build|make|implement|fix|repair|improve|update|add|write)\b", re.I)
-_RUNTIME_OBJECT = re.compile(r"\b(?:game|application|app|website|web\s+site|api|script|program|service|server|plugin)\b", re.I)
 _DOCUMENT_OBJECT = re.compile(r"\b(?:documentation|docs|readme|guide|report|instructions|notes|plan)\b|\.(?:md|txt)\b", re.I)
+# Nouns after "test" that name something other than an automated test, as in
+# "a typing test game" or "a test plan document".
+_NOT_A_TEST = (
+    r"(?!\s+(?:game|games|app|apps|application|page|pages|plan|plans|data|dataset|account|accounts|"
+    r"user|users|server|environment|site|website|mode|drive|question|questions|quiz|quizzes|print|"
+    r"pilot|flight|subject|subjects|group|groups|audience|market|document|documents|report|reports)\b)"
+)
+_EXPLICIT_TEST_REQUEST = re.compile(
+    r"\b(?:unit|integration|automated|automatic|e2e|end[- ]to[- ]end|regression|smoke|browser|ui|api|"
+    r"acceptance|functional|behaviou?r(?:al)?)[- ]tests?\b"
+    r"|\btest[- ]?(?:suite|coverage|cases?|runner|command|harness)s?\b"
+    r"|\b(?:pytest|unittest|jest|vitest|mocha|jasmine|playwright|cypress|junit|rspec|go\s+test|cargo\s+test|npm\s+test)\b"
+    r"|\b(?:write|writes|writing|add|adds|adding|create|include|including|with|run|runs|running|execute|"
+    r"executing|pass|passes|passing|cover(?:ed)?\s+by|verif(?:y|ied)\s+(?:it\s+)?(?:with|by)|backed\s+by|"
+    r"make\s+sure|ensure|all)\s+"
+    r"(?:(?:the|some|a|an|its|their|any|new|real|proper|meaningful|existing|project|relevant|few|all|"
+    r"one|two|three|several|more|another|extra|additional|missing|enough)\s+){0,3}"
+    r"tests?\b" + _NOT_A_TEST +
+    # "Tests are required.", "Tests: mandatory", "It must have tests",
+    # "Don't forget tests!"
+    r"|\btests?\s+(?:are|is)\s+(?:also\s+)?(?:required|needed|necessary|mandatory|expected|a\s+must)\b"
+    r"|\btests?\s*:\s*(?:required|mandatory|needed|yes|must)\b"
+    r"|\b(?:must|should|needs?\s+to|has\s+to|have\s+to)\s+(?:have|include|come\s+with|ship\s+with|get)\s+"
+    r"(?:(?:some|a|an|the|its|new|more|proper|real)\s+)?tests?\b" + _NOT_A_TEST +
+    r"|\b(?:don'?t|do\s+not|never)\s+forget\s+(?:to\s+(?:add|write|run|include|update)\s+)?"
+    r"(?:(?:the|any|some)\s+)?tests?\b" + _NOT_A_TEST +
+    r"|\btests?\s+(?:pass|passes|passing|must|should|that|to\s+(?:cover|prove|check|verify|confirm))\b"
+    r"|(?:^|\b(?:and|then|also|please|,))\s*test\s+(?:it|them|this|that|the|its|their|everything|each|all)\b"
+    r"|\b(?:well[- ]|fully\s+|properly\s+|thoroughly\s+)?tested\b"
+    # Repairing or changing tests is a request about tests too.
+    r"|\b(?:fix|fixes|fixing|repair|repairs|repairing|update|updates|updating|rewrite|adjust|correct)\s+"
+    r"(?:(?:the|all|any|its|their|those|these|our|my|failing|broken|existing|red|flaky|remaining)\s+){0,3}tests?\b"
+    + _NOT_A_TEST +
+    r"|\b(?:failing|broken|red|flaky)\s+tests?\b" + _NOT_A_TEST +
+    r"|\btests?\s+(?:(?:are|is|keep|still)\s+)?(?:fail|fails|failed|failing|broken|red)\b"
+    # "Never skip the tests": a double negative is a request.
+    r"|\b(?:never|don'?t|do\s+not)\s+(?:ever\s+)?(?:skip|skipping|omit|leave\s+out)\s+"
+    r"(?:(?:the|any|our|all)\s+)?tests?\b",
+    re.I,
+)
+# A negation only reaches the clause it is in: "Don't touch the backend but
+# add unit tests" asks for tests.
+_CLAUSE_BOUNDARY = re.compile(r"[,;:.!?\n]|\b(?:but|and|then|however|also|though|although)\b", re.I)
+_NEGATED_TEST_REQUEST = re.compile(
+    r"\b(?:no|without|skip|skipping|don'?t|do\s+not|does\s+not|doesn'?t|never|not|needn'?t|"
+    r"no\s+need\s+(?:to|for))\b[^.;!?\n]{0,40}$",
+    re.I,
+)
+_NEGATION_WORD = re.compile(
+    r"\b(?:no\s+need\s+(?:to|for)|no|without|skip|skipping|don'?t|do\s+not|does\s+not|doesn'?t|never|not|needn'?t)\b",
+    re.I,
+)
+# "Don't forget to...", "Do not finish until...", "Don't stop until...",
+# "not to ship without...": the negation is about something else, and the
+# request for tests stands.
+_NEGATION_REVERSAL = re.compile(
+    r"\b(?:forget|forgetting|fail|stop|stopping|finish|finishing|quit|end|ship|shipping|leave|omit|miss|"
+    r"until|unless|before)\b",
+    re.I,
+)
+
+
+def _negates_request(before: str) -> bool:
+    """Whether the clause just before a test request negates it."""
+    matches = list(_NEGATION_WORD.finditer(before))
+    if not matches or len(before) - matches[-1].end() > 40:
+        return False
+    last = matches[-1]
+    if _NEGATION_REVERSAL.search(before[last.end():]):
+        return False
+    # "Never skip the tests", "not ... without tests": a double negative.
+    if last.group(0).casefold() in {"skip", "skipping", "without"} and len(matches) > 1:
+        return False
+    return True
+
+
+def tests_explicitly_requested(goal: str) -> bool:
+    """Return True only when the user's own wording asks for tests or test runs.
+
+    Wording such as "make the footer say 2026" or "write a script that renames
+    photos" never implies tests. "Add unit tests", "make sure the tests pass",
+    "run the test suite" or "build it and test it" do. Negated requests such
+    as "no tests needed" or "don't write tests" do not.
+    """
+    return bool(explicit_test_requests(goal))
+
+
+_TEST_RUN_WORDING = re.compile(
+    r"\b(?:run|runs|running|execute|executing|rerun|pass|passes|passing|green|suite|runner|command|"
+    r"fail|fails|failed|failing|broken|red|flaky|fix|fixes|fixing|repair|repairs|repairing|skip|"
+    r"skipping)\b",
+    re.I,
+)
+_TEST_WRITE_WORDING = re.compile(
+    r"^(?:write|writes|writing|add|adds|adding|create|include|including|with|cover|covered|backed|"
+    r"author|implement|must|should|needs?|has|have|don'?t|do\s+not|never)\b"
+    r"|\b(?:required|needed|necessary|mandatory|expected|a\s+must)\b",
+    re.I,
+)
+_TEST_LEVEL_WINDOW = re.compile(
+    r"\b(?:write|writes|writing|add|adds|adding|create|include|including|with|author|implement)\b",
+    re.I,
+)
+
+
+def explicit_test_requests(goal: str) -> list[dict[str, str]]:
+    """Each non-negated explicit request for tests, classified.
+
+    ``kind`` is "write" when the user asked for tests to be written ("add
+    unit tests", "It must have tests", "Tests are required") and "run" when
+    they asked for existing tests to run or pass ("make sure the tests pass",
+    "run the test suite", "fix the failing tests"). ``phrase`` is the request
+    with its coordinated qualifiers ("Add unit, API and E2E tests"), so test
+    levels can be read from what the user actually asked for.
+    """
+    text = str(goal or "")
+    found: list[dict[str, str]] = []
+    for match in _EXPLICIT_TEST_REQUEST.finditer(text):
+        before = _CLAUSE_BOUNDARY.split(text[max(0, match.start() - 60):match.start()])[-1]
+        after = text[match.end():match.end() + 30]
+        if _negates_request(before) or re.match(
+            r"\s*(?:(?:are|is)\s+)?(?:optional|unnecessary|not\s+(?:needed|required|necessary))\b", after, re.I,
+        ):
+            continue
+        phrase = match.group(0)
+        tail = re.split(r"[,;.!?\n]", after, maxsplit=1)[0]
+        if _TEST_WRITE_WORDING.search(phrase):
+            kind = "write"
+        elif _TEST_RUN_WORDING.search(phrase + " " + tail):
+            kind = "run"
+        else:
+            kind = "write"
+        window = re.split(r"[;.!?\n]", text[max(0, match.start() - 80):match.start()])[-1]
+        verbs = list(_TEST_LEVEL_WINDOW.finditer(window))
+        prefix = window[verbs[-1].start():] if verbs and kind == "write" else ""
+        found.append({"kind": kind, "phrase": prefix + phrase})
+    return found
+
+
+def tests_write_requested(goal: str) -> bool:
+    """Whether the user explicitly asked for tests to be written."""
+    return any(one["kind"] == "write" for one in explicit_test_requests(goal))
 
 
 def _request_objects(goal: str) -> list[str]:
@@ -78,24 +229,38 @@ def _request_objects(goal: str) -> list[str]:
 
 
 def requested_runtime_verification(goal: str) -> bool:
-    """Reject obvious runtime requests satisfied only by placeholder files.
+    """Return whether the user explicitly asked for executed tests.
 
-    This deliberately does not invent gameplay rules or tests from prose. It
-    only recognizes direct runtime creation/repair requests; the task ledger
-    and meaningful executed checks still own their detailed acceptance.
+    Kept under its historical name for callers. It no longer infers a test
+    requirement from nouns such as "app", "website" or "script": only the
+    user's explicit request for tests or test runs makes executed checks
+    required. Otherwise test evidence is optional and reported, never a veto.
     """
     from . import swarm_work as work
 
     if work._goal_intent(goal) == "read_only":
         return False
-    return any(_RUNTIME_OBJECT.search(one) and not _DOCUMENT_OBJECT.search(one)
-               for one in _request_objects(goal))
+    return tests_explicitly_requested(goal)
 
 
 def runtime_verification_paths(
     root: Path, goal: str, changed: list[str], manifest: dict[str, Any],
 ) -> list[str]:
-    """Find in-scope runtime files that snapshots cannot functionally verify.
+    """Return executable paths that NEED executed checks.
+
+    Empty unless the user explicitly asked for tests. Executable source alone
+    (a changed .py/.js file, a website, a script) never makes tests mandatory,
+    so a project without tests can complete on the agents' own evidence.
+    """
+    if not requested_runtime_verification(goal):
+        return []
+    return runtime_source_paths(root, goal, changed, manifest)
+
+
+def runtime_source_paths(
+    root: Path, goal: str, changed: list[str], manifest: dict[str, Any],
+) -> list[str]:
+    """Report in-scope executable files. Informational only, never a veto.
 
     Applied paths bound an edit's scope. For an existing-result/no-op claim,
     use the named deliverable if present, otherwise inspect the project tree.
@@ -193,11 +358,12 @@ def _selected_verification_project(config: LoadedConfig, goal: dict[str, Any]) -
     # Legacy contracts retain their exact saved command authority. Resume
     # captures the current contract and invalidates context-tool results through the new
     # contract fingerprint; reading legacy state must not fabricate approval.
-    if contract.get("schema_version") not in {1, 2, 3, SCHEMA_VERSION} or contract.get("verification_profile") != SHARED_GOAL_PROFILE or (
+    if contract.get("schema_version") not in {1, 2, 3, 4, SCHEMA_VERSION} or contract.get("verification_profile") != SHARED_GOAL_PROFILE or (
         contract.get("fingerprint_sha256") != _fingerprint(unsigned)
         or contract.get("project_root") != _root_key(Path(project["path"]))
         or (contract.get("schema_version") == 2 and contract.get("check_policy") != LEGACY_CHECK_POLICY)
         or (contract.get("schema_version") == 3 and contract.get("check_policy") != PREVIOUS_CHECK_POLICY)
+        or (contract.get("schema_version") == 4 and contract.get("check_policy") != RUNTIME_REQUIRED_CHECK_POLICY)
         or (contract.get("schema_version") == SCHEMA_VERSION and contract.get("check_policy") != CHECK_POLICY)
     ):
         raise HarnessError("The saved project verification contract changed; start a new goal")
@@ -486,8 +652,9 @@ def run_configured_goal_verification(
             return outcome("failed", "read_only_tree_drift", "Read-only work cannot change project files.")
         merkle, _ = work._project_tree_merkle(root)
         return outcome("passed", "read_only_zero_write", "Read-only work retained the project tree.", current_tree_merkle=merkle)
-    if require_changes and not changed:
-        return outcome("failed", "goal_effect", "The requested project work has not produced a recorded file change.")
+    # An agent's reasoned "no change was needed" is a valid result. Record
+    # the observation for reporting; never veto completion because of it.
+    no_change = {"no_file_changes_recorded": True} if require_changes and not changed else {}
     commands, source = work._verification_commands(config, root, project)
     if not commands:
         if str(project.get("approved_test_command_digest") or ""):
@@ -497,29 +664,30 @@ def run_configured_goal_verification(
                 "Restore or explicitly refresh the selected checks before completing this goal.",
             )
         merkle, manifest = work._project_tree_merkle(root)
-        runtime_paths = runtime_verification_paths(root, goal, changed, manifest)
-        runtime_requested = requested_runtime_verification(goal)
-        if runtime_paths or runtime_requested:
+        tests_requested = requested_runtime_verification(goal)
+        source_paths = runtime_source_paths(root, goal, changed, manifest)
+        if tests_requested:
+            # The user explicitly asked for tests, so their execution is part
+            # of the request itself rather than a harness-invented requirement.
             return outcome(
                 "failed", "runtime_verification_required",
-                "Executable deliverables have no selected or discoverable checks; no tests ran. "
-                "File existence, code review, team agreement and an unchanged snapshot cannot prove that "
-                "the result launches or works. Add meaningful automated checks for the requested behavior "
-                "and launch method, expose a test command at the selected project root (including tests "
-                "in a new subfolder), then call run_selected_verification. If discovered commands need "
-                "approval, report the exact proposed command through the existing verification flow. "
-                "Do not fabricate a test pass or change files solely to obtain an artifact.",
-                current_tree_merkle=merkle, runtime_paths=runtime_paths[:100],
-                runtime_requested=runtime_requested,
-                file_count=len(manifest),
+                "The user explicitly asked for tests, but no selected or discoverable checks exist; no tests ran. "
+                "Add meaningful automated checks for the requested behavior, expose a test command at the "
+                "selected project root (including tests in a new subfolder), then call run_selected_verification. "
+                "If discovered commands need approval, report the exact proposed command through the existing "
+                "verification flow. Do not fabricate a test pass.",
+                current_tree_merkle=merkle, runtime_paths=source_paths[:100],
+                runtime_requested=True, tests_requested=True,
+                file_count=len(manifest), **no_change,
             )
         return outcome(
             "not_configured", "no_selected_checks",
             "No deterministic project checks are configured or discoverable; no tests ran. "
-            "The in-scope deliverables contain no executable source. Complete the task only when its actual "
-            "requirements are supported by inspected artifacts and team agreement. "
-            "Any explicitly required testing still needs real execution evidence.",
+            "Tests were not explicitly requested, so test evidence is optional: complete the work on the "
+            "agents' own inspected evidence and report accurately that no tests ran."
+            + (" No file changes were recorded; a reasoned no-change conclusion is a valid result." if no_change else ""),
             current_tree_merkle=merkle, file_count=len(manifest),
+            runtime_paths=source_paths[:100], tests_requested=False, **no_change,
         )
     from .goal_access import command_gate
     access = command_gate(project, commands, work._command_approval_digest(
@@ -581,7 +749,9 @@ def run_configured_goal_verification(
             return outcome("failed", "verification_containment_denied", "Project checks attempted an operation outside their permitted scope.")
         if payload.get("exit_code") == -1:
             return outcome("unavailable", "missing_runner", "The selected test runner could not start: " + str(payload.get("stderr") or ""))
-        if re.search(r"no module named|module not found|cannot find module|command not found|is not recognized", combined, re.I):
+        # Only a failing command is a missing dependency; a passing one may
+        # just report an optional module it replaced with a fallback.
+        if payload.get("exit_code") != 0 and re.search(r"no module named|module not found|cannot find module|command not found|is not recognized", combined, re.I):
             return outcome("failed", "missing_test_dependency", "A project test dependency is missing: " + combined.strip()[:2000])
         if payload.get("exit_code") != 0 or payload.get("timed_out") or work._EMPTY_TEST_OUTPUT.search(combined):
             return outcome("failed", source, "A project check failed, timed out, or ran zero tests.")
@@ -591,4 +761,4 @@ def run_configured_goal_verification(
     analysis = analyze_verification(commands, results, evidence_contracts=contracts if isinstance(contracts, list) else [])
     if not analysis["passed"]:
         return outcome("failed", "positive_test_evidence", "Checks did not provide complete positive evidence that tests executed.", verification_analysis=analysis)
-    return outcome("passed", source, "All selected project checks passed. The agents' task evidence records how the goal was fulfilled.", verification_analysis=analysis)
+    return outcome("passed", source, "All selected project checks passed. The agents' task evidence records how the goal was fulfilled.", verification_analysis=analysis, **no_change)

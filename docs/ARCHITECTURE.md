@@ -182,13 +182,22 @@ and execution/verification contracts. A new task conversation inspects a separat
 authenticated read-only snapshot, never the reviewer's old draft. Another provider
 is preferred; one connected provider can still run a fresh judge conversation.
 
-Approval requires a verdict, findings, the exact packet reference and evidence for
-every criterion, including the overall request. Only a current approval can support
-publication. Changes during verification or between judgment and application
-supersede the result. Rejections create repair work for the latest contributing
-author; repair prompts retain the original and current goals. The existing task,
-call and no-progress budgets remain authoritative, with a further three-rejection
-limit on an unchanged submission. Existing goals keep their earlier contract.
+The judge is an agent, so Nexus reads its verdict leniently. The verdict is its
+explicit `review_verdict` (common spellings such as `approved` or `reject` are
+accepted), or else follows its `complete`/`blocked` action; missing findings fall
+back to its summary, and the packet reference is filled in once the fingerprint
+check has proved the verdict is for the current packet. Criterion evidence is
+matched tolerantly (case, whitespace and punctuation, 1-based numbers or ids such
+as `2`, `#2`, `AC-2`, a criterion quoted inside longer text, or close wording;
+`file:` paths ignore `./`, backslashes and case). Unmatched criteria are recorded
+as `evidence_notes` on the outcome and never veto an approval. Only a current
+approval can support publication. Changes during verification or between judgment
+and application supersede the result. Rejections create repair work for the latest
+contributing author; repair prompts retain the original and current goals. Repeated
+identical rejections never pause the agents: after three, the goal note and a
+`closeout_repeated_findings` event tell the user, and the next judge sees the
+rejection count so it can re-check whether earlier findings still apply. Existing
+goals keep their earlier contract.
 
 
 ## Collaboration policy and exact review workspaces

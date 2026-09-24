@@ -26,6 +26,17 @@ from our_harness.providers import base as provider_base
 from test_document_text import make_docx
 
 
+def _fixture_route_identity(digests):
+    """Stand-in for chat.route_identity keyed by route, for identity-change tests."""
+    from our_harness import chat as chat_module
+
+    def identity(_config, route):
+        return {"route_identity_version": chat_module.ROUTE_IDENTITY_VERSION,
+                "route_identity_contract": chat_module.ROUTE_IDENTITY_CONTRACT,
+                "route_identity_sha256": digests[route]}
+    return identity
+
+
 THREAD_COORDINATION_TIMEOUT_SECONDS = 30.0
 PROCESS_STATUS_POLL_SECONDS = 0.1
 PROCESS_CLEANUP_TIMEOUT_SECONDS = 5.0
@@ -1065,7 +1076,7 @@ class LongHorizonTests(unittest.TestCase):
 
     def test_required_pair_rejects_provider_budget_below_named_team(self):
         with self.assertRaisesRegex(
-            HarnessError, "provider-call budget.*required chat-participant contribution count",
+            HarnessError, "provider-call limit you set.*required chat-participant contribution count",
         ):
             self.store().create(
                 self.board, "project", ["Both providers must contribute"],
@@ -1078,7 +1089,7 @@ class LongHorizonTests(unittest.TestCase):
             self.store().get_by_request("pair-provider-budget-too-small")
         )
         with self.assertRaisesRegex(
-            HarnessError, "provider-call budget.*required chat-participant contribution count",
+            HarnessError, "provider-call limit you set.*required chat-participant contribution count",
         ):
             self.store().create(
                 self.board, "project", ["First", "Second", "Third"],
@@ -1499,6 +1510,12 @@ class LongHorizonTests(unittest.TestCase):
         admitted = {"codex": "a" * 64, "claude": "b" * 64}
         changed = {"codex": "a" * 64, "claude": "c" * 64}
         store = self.store()
+        # Another account is another provider identity (a tunable is not).
+        identities = dict(admitted)
+        identity_patch = mock.patch.object(long_horizon.chat_lab, "route_identity",
+                                           side_effect=_fixture_route_identity(identities))
+        identity_patch.start()
+        self.addCleanup(identity_patch.stop)
         with mock.patch.object(
             long_horizon.chat_lab, "_route_failure_context",
             side_effect=route_context(admitted),
@@ -1509,6 +1526,7 @@ class LongHorizonTests(unittest.TestCase):
                 participant_ids=["lead", "reviewer"], conversation_id="chat-account",
             )
         store.control(goal["goal_id"], "pause")
+        identities.update(changed)
         with mock.patch.object(
             long_horizon.chat_lab, "_route_failure_context",
             side_effect=route_context(changed),
@@ -1541,6 +1559,8 @@ class LongHorizonTests(unittest.TestCase):
 
         with mock.patch.object(
             long_horizon.chat_lab, "_route_failure_context", side_effect=route_context,
+        ), mock.patch.object(
+            long_horizon.chat_lab, "route_identity", side_effect=_fixture_route_identity(principals),
         ):
             runtime = long_horizon.LongHorizonRuntime(self.config)
             self.addCleanup(runtime.close)
@@ -1843,6 +1863,9 @@ class LongHorizonTests(unittest.TestCase):
         with mock.patch.object(
             provider_base.shutil, "which", return_value=str(second),
         ), mock.patch.object(long_horizon.chat_lab, "ask_once") as ask:
+            # The same program resolved elsewhere (an update) is not a setup change.
+            self.assertFalse(runtime.store.get_by_request("path-dispatch-drift")["provider_setup_changed"])
+            config.data["providers"]["local-route"]["command"] = ["another-agent-tool", "--json"]
             shown = runtime.store.get_by_request("path-dispatch-drift")
             self.assertTrue(shown["provider_setup_changed"])
             with self.assertRaisesRegex(HarnessError, "provider setup changed"):
@@ -1882,7 +1905,10 @@ class LongHorizonTests(unittest.TestCase):
             )
 
             def swap_before_send(*_args, **kwargs):
+                # Another configured program is another provider identity; a
+                # mere executable update of the same program is a tunable.
                 selected["path"] = str(second)
+                config.data["providers"]["local-route"]["command"] = ["another-agent-tool", "--json"]
                 kwargs["before_provider_dispatch"]("initial")
                 raise AssertionError("A changed executable must stop before provider send")
 
@@ -2090,7 +2116,7 @@ class LongHorizonTests(unittest.TestCase):
         task = store.claim_ready(goal["goal_id"], "worker")[0]
         store.record_dispatch(goal["goal_id"], task, "first")
         store.record_dispatch(goal["goal_id"], task, "second", phase="requested_files")
-        with self.assertRaisesRegex(HarnessError, "budget"):
+        with self.assertRaisesRegex(HarnessError, "provider-call limit you set"):
             store.record_dispatch(goal["goal_id"], task, "third")
         self.assertEqual(store.get(goal["goal_id"])["budget"]["provider_calls"], 2)
 
@@ -2225,6 +2251,11 @@ class LongHorizonTests(unittest.TestCase):
                 "provider_principal_contract": "nexus/provider-principal/v1",
             }
 
+        # The fixture contexts are the current setup for the whole test, so a
+        # quiet claim never refreshes bindings back to the real routes.
+        context_patch = mock.patch.object(long_horizon.chat_lab, "_route_failure_context", side_effect=context)
+        context_patch.start()
+        self.addCleanup(context_patch.stop)
         store = self.store()
         with mock.patch.object(long_horizon.chat_lab, "_route_failure_context", side_effect=context):
             review_goal = store.create(
@@ -2625,7 +2656,8 @@ class LongHorizonTests(unittest.TestCase):
         self.board["agents"] = [self.board["agents"][0]]
         self.board["works_on"] = [self.board["works_on"][0]]
         store = self.store()
-        goal = store.create(self.board, "project", ["Work with one agent"], "review-question-stop")
+        goal = store.create(self.board, "project", ["Work with one agent"], "review-question-stop",
+                            policy={"agent_access_mode": "ask"})
         task = store.claim_ready(goal["goal_id"], "review-question-worker")[0]
         interrupt_ids = self.stage_review(store, goal, task, action("request_review"))
         current = store.get(goal["goal_id"])
@@ -4569,6 +4601,35 @@ class LongHorizonTests(unittest.TestCase):
             ["legacy-run:older-overlapping"],
         )
 
+    def test_legacy_projects_whose_folders_vanished_never_block_long_horizon_admission(self):
+        vanished = self.base / "moved-or-deleted-project"
+        nested_gone = self.project / "deleted-subfolder"
+        gone_board = copy.deepcopy(self.board)
+        gone_board["projects"][0].update({"id": "gone", "path": str(vanished)})
+        panel = harness_server.HarnessHTTPServer(("127.0.0.1", 0), self.config)
+        self.addCleanup(panel.server_close)
+        fake_runs = mock.Mock()
+        fake_runs.active_runs.return_value = [
+            {"run_id": "board-gone", "snapshot": {"kind": "board_order", "board": gone_board}},
+            {"run_id": "work-gone", "snapshot": {
+                "selected_mode": "work", "project_id": "gone",
+                "board": gone_board, "conversation": {"project": "gone"},
+            }},
+        ]
+        fake_queue = mock.Mock()
+        fake_queue.active_project_paths.return_value = [str(vanished)]
+        panel._swarm_runs = fake_runs
+        panel._swarm_goal_queue = fake_queue
+        # A missing folder elsewhere is no conflict, and is not an error.
+        self.assertEqual(panel.legacy_project_conflicts(self.project), [])
+        # A missing folder still reserves its recorded place.
+        fake_runs.active_runs.return_value = []
+        fake_queue.active_project_paths.return_value = [str(nested_gone)]
+        self.assertEqual(
+            panel.legacy_project_conflicts(self.project),
+            ["legacy-goal-queue:" + str(nested_gone.resolve())],
+        )
+
     def test_attachment_failure_cannot_persist_or_block_a_goal(self):
         runtime = long_horizon.LongHorizonRuntime(self.config)
         self.addCleanup(runtime.close)
@@ -4809,6 +4870,8 @@ class LongHorizonTests(unittest.TestCase):
             document["agents"][0]["route_binding"][
                 "route_fingerprint_sha256"
             ] = "0" * 64
+            # Admitted as another provider identity (a tunable drift refreshes).
+            document["agents"][0]["route_identity"]["route_identity_sha256"] = "0" * 64
 
         store._mutate(goal["goal_id"], drift_provider)
         with mock.patch.object(long_horizon.chat_lab, "ask_once") as ask:
@@ -5022,6 +5085,94 @@ class LongHorizonTests(unittest.TestCase):
             relaxed_contract["fingerprint_sha256"],
         )
 
+    def test_schema_recovery_binding_upgrade_keeps_saved_full_access(self):
+        # The strict-schema repair moves the route binding; the user's saved
+        # access decision must be re-tied to it, exactly as a reviewed
+        # reconnect does, instead of silently becoming stale read-only.
+        board = copy.deepcopy(self.board)
+        board["agents"] = [board["agents"][0]]
+        board["works_on"] = [board["works_on"][0]]
+        objectives = ["Keep full access across the schema repair"]
+        with mock.patch.object(
+            provider_base.OpenAIProvider, "_effective_dispatch_contract",
+            return_value="openai/effective-dispatch/v1",
+        ):
+            store = self.store()
+            goal = store.create(board, "project", objectives, "schema-recovery-keeps-access",
+                                policy={"agent_access_mode": "full"})
+            self.assertEqual(long_horizon.goal_access.state(goal)["mode"], "full")
+            task = store.claim_ready(goal["goal_id"], "v1-access-worker")[0]
+            store.record_dispatch(goal["goal_id"], task, "old-open-schema")
+            store.fail_task(goal["goal_id"], task, self.schema_rejection_error())
+            store.release_scheduler(goal["goal_id"], "v1-access-worker")
+        reopened = long_horizon.GoalStore(self.config)
+        recovered = reopened.get(goal["goal_id"])
+        self.assertEqual(recovered["agents"][0]["route_binding"]["effective_dispatch_contract"],
+                         "openai/effective-dispatch/v2")
+        access = long_horizon.goal_access.state(recovered)
+        self.assertEqual(access["mode"], "full")
+        self.assertNotIn("stale", access)
+        # A later restart keeps the re-tied record current.
+        self.assertEqual(long_horizon.goal_access.state(long_horizon.GoalStore(self.config).get(goal["goal_id"]))["mode"], "full")
+
+    def tunable_goal(self, request):
+        board = copy.deepcopy(self.board)
+        board["agents"] = [board["agents"][0]]
+        board["works_on"] = [board["works_on"][0]]
+        goal = self.store().create(board, "project", ["Keep working across provider tuning"], request,
+                                   policy={"agent_access_mode": "full"})
+        self.assertRegex(goal["agents"][0]["route_identity"]["route_identity_sha256"], r"^[0-9a-f]{64}$")
+        return goal
+
+    def assert_refreshed_and_running(self, goal):
+        store = self.store()
+        status = store.provider_setup_status(store.get(goal["goal_id"]))
+        self.assertFalse(status["changed"], status)
+        self.assertEqual(status["refresh_pending"], ["lead"])
+        claimed = store.claim_ready(goal["goal_id"], "tunable-worker")
+        self.assertEqual(len(claimed), 1)
+        current = store.get(goal["goal_id"])
+        self.assertEqual(store.provider_setup_status(current)["refresh_pending"], [])
+        self.assertEqual(long_horizon.goal_access.state(current)["mode"], "full")
+        self.assertNotIn("stale", long_horizon.goal_access.state(current))
+        self.assertEqual(len(current["route_tunable_refreshes"]), 1)
+        events = store.events(goal["goal_id"])["events"]
+        self.assertTrue(any(one["type"] == "provider_binding_refreshed_for_tunable_change" for one in events))
+        # Restart keeps the refreshed binding current and the access intact.
+        reopened = long_horizon.GoalStore(self.config).get(goal["goal_id"])
+        self.assertFalse(long_horizon.GoalStore(self.config).provider_setup_status(reopened)["changed"])
+        self.assertEqual(long_horizon.goal_access.state(reopened)["mode"], "full")
+        return current
+
+    def test_model_edit_refreshes_goal_binding_and_keeps_it_running(self):
+        goal = self.tunable_goal("tunable-model-edit")
+        self.config.data["providers"]["codex"]["model"] = "gpt-test-newer"
+        current = self.assert_refreshed_and_running(goal)
+        self.assertNotEqual(current["agents"][0]["route_binding"], goal["agents"][0]["route_binding"])
+        self.assertEqual(current["agents"][0]["route_identity"], goal["agents"][0]["route_identity"])
+
+    def test_program_version_change_refreshes_goal_binding(self):
+        goal = self.tunable_goal("tunable-program-version")
+        original = provider_base.OpenAIProvider.effective_dispatch_fingerprint
+        def updated_program(provider):
+            return {**original(provider), "effective_dispatch_fingerprint_sha256": "e" * 64}
+        with mock.patch.object(provider_base.OpenAIProvider, "effective_dispatch_fingerprint", updated_program):
+            self.assertTrue(self.store().provider_setup_status(goal)["refresh_pending"])
+            current = self.assert_refreshed_and_running(goal)
+        self.assertEqual(current["agents"][0]["route_binding"]["effective_dispatch_fingerprint_sha256"], "e" * 64)
+
+    def test_provider_identity_change_still_needs_review(self):
+        goal = self.tunable_goal("identity-change")
+        self.config.data["providers"]["codex"]["api_key_env"] = "ANOTHER_ACCOUNT_KEY"
+        store = self.store()
+        status = store.provider_setup_status(goal)
+        self.assertTrue(status["changed"])
+        self.assertEqual(status["agents"][0]["code"], "route_identity_changed")
+        store.claim_ready(goal["goal_id"], "identity-worker")
+        current = store.get(goal["goal_id"])
+        self.assertEqual(current["agents"][0]["route_binding"], goal["agents"][0]["route_binding"])
+        self.assertTrue(long_horizon.GoalStore(self.config).provider_setup_status(current)["changed"])
+
     def test_exact_v1_openai_binding_upgrades_only_with_schema_recovery(self):
         board = copy.deepcopy(self.board)
         board["agents"] = [board["agents"][0]]
@@ -5142,7 +5293,11 @@ class LongHorizonTests(unittest.TestCase):
             "openai/effective-dispatch/v1",
         )
         self.assertNotIn("provider_binding_migrations", held)
-        self.assertTrue(reopened.provider_setup_status(held)["changed"])
+        # An engine contract revision with the same provider identity is not a
+        # setup change; it is refreshed at the next quiet claim instead.
+        status = reopened.provider_setup_status(held)
+        self.assertFalse(status["changed"])
+        self.assertEqual(status["refresh_pending"], ["lead"])
         with self.assertRaisesRegex(HarnessError, "already bound to a different"):
             reopened.preflight_runtime_admission(
                 board, "project", objective, request_id,
@@ -5792,7 +5947,7 @@ class LongHorizonTests(unittest.TestCase):
         store = self.store()
         goal = store.create(
             self.board, "project", ["Stop a risky proposal without reauthorizing work"],
-            "pause-risk-stop-suppression",
+            "pause-risk-stop-suppression", policy={"agent_access_mode": "ask"},
         )
         task = store.claim_ready(goal["goal_id"], "risk-stop-worker")[0]
         interrupt_ids = self.stage_review(
@@ -5969,6 +6124,7 @@ class LongHorizonTests(unittest.TestCase):
                 one for one in document["agents"] if one["id"] == "lead"
             )
             lead_agent["route_binding"]["route_fingerprint_sha256"] = "0" * 64
+            lead_agent["route_identity"]["route_identity_sha256"] = "0" * 64
 
         migrated_store._mutate(goal["goal_id"], drift_saved_provider)
         runtime = long_horizon.LongHorizonRuntime(self.config)
@@ -7464,7 +7620,8 @@ class LongHorizonTests(unittest.TestCase):
         self.board["agents"] = [self.board["agents"][0]]
         self.board["works_on"] = [self.board["works_on"][0]]
         store = self.store()
-        goal = store.create(self.board, "project", ["Risky change"], "risk-question-loop")
+        goal = store.create(self.board, "project", ["Risky change"], "risk-question-loop",
+                            policy={"agent_access_mode": "ask"})
         proposed = action("request_review", risk="high")
         for turn in range(long_horizon.MAX_NO_PROGRESS + 1):
             task = store.claim_ready(goal["goal_id"], f"worker-{turn}")[0]
@@ -7489,7 +7646,9 @@ class LongHorizonTests(unittest.TestCase):
         self.board["agents"] = [self.board["agents"][0]]
         self.board["works_on"] = [self.board["works_on"][0]]
         store = self.store()
-        goal = store.create(self.board, "project", ["Improve risky work"], "changing-risk")
+        # Risk questions are Ask-mode behaviour; goals now default to Full.
+        goal = store.create(self.board, "project", ["Improve risky work"], "changing-risk",
+                            policy={"agent_access_mode": "ask"})
         for turn in range(long_horizon.MAX_NO_PROGRESS + 2):
             task = store.claim_ready(goal["goal_id"], f"worker-{turn}")[0]
             proposed = action(

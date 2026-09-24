@@ -1,5 +1,9 @@
 """Recognize repeated tool-only continuations without capping exploration.
 
+Agents lead; Nexus only supports. Repetition never pauses a goal: after a few
+identical results the record carries a ``notice`` telling the agent that its
+last calls returned the same result, and the agent decides what to do next.
+
 The owning authenticated goal snapshot persists this small record. A scope,
 lease, call ID or restart is not evidence of progress. New arguments, observed
 contents, a teammate/user message, or a changed project/route contract is.
@@ -16,21 +20,32 @@ from typing import Any, Callable
 from .models import HarnessError
 
 
-SCHEMA_VERSION = 1
-MAX_IDENTICAL_REPEATS = 4
+SCHEMA_VERSION = 2
+# Identical repeats after which the agent is told. It is a notice, not a stop.
+NOTICE_AFTER_IDENTICAL_REPEATS = 4
+# Kept for callers; the same threshold, now only for the notice.
+MAX_IDENTICAL_REPEATS = NOTICE_AFTER_IDENTICAL_REPEATS
+# Saturating bound on the saved counters so the durable record stays small.
+MAX_TRACKED_REPEATS = 1_000
 CONTRACT = {
     "schema_version": SCHEMA_VERSION,
     "comparison": "tool-name-arguments-semantic-observation/v1",
     "continuity": "authenticated-step-identity-not-session-or-lease/v1",
     "freshness": "project-objective-route-and-other-participant-messages/v1",
     "conversation_reads": "other-participant-content-without-own-request-echo/v1",
-    "max_identical_repeats": MAX_IDENTICAL_REPEATS,
+    "notice_after_identical_repeats": NOTICE_AFTER_IDENTICAL_REPEATS,
+    "repetition": "notice-agent-never-pause/v2",
     "recoverable_failures": "wrong-skill-reader-and-unusable-search/v1",
 }
-PAUSE_REASON = (
-    "The same context-tool request returned the same result repeatedly. "
-    "No new project evidence or teammate message arrived. "
-    "Resume with a different question, file range, or next action to continue."
+REPEAT_NOTICE = (
+    "Your last context-tool calls returned the same result as before, and no new project evidence "
+    "or teammate message arrived. Consider a different question, file range, or next action."
+)
+# Retained name for callers that displayed the old pause text.
+PAUSE_REASON = REPEAT_NOTICE
+FAILED_LOOP_NOTICE = (
+    "Your recent tool calls keep returning recoverable errors without a corrected result. "
+    "Use read_file for ordinary files or fetch_url for known sources."
 )
 
 
@@ -143,17 +158,17 @@ def observe(
         and held.get("contract_fingerprint_sha256") == fingerprint
     if compatible:
         if not isinstance(held.get("recoverable_failures", {}), dict) or any(
-            k not in categories.values() or type(v) is not int or not 0 <= v <= MAX_IDENTICAL_REPEATS + 1
+            k not in categories.values() or type(v) is not int or not 0 <= v <= MAX_TRACKED_REPEATS
             for k, v in held.get("recoverable_failures", {}).items()
         ):
             raise HarnessError("The saved context failure counts are malformed")
         if type(held.get("identical_repeats")) is not int \
-                or not 0 <= held["identical_repeats"] <= MAX_IDENTICAL_REPEATS \
+                or not 0 <= held["identical_repeats"] <= MAX_TRACKED_REPEATS \
                 or not str(held.get("last_step_id") or "") \
                 or any(not re.fullmatch(r"[0-9a-f]{64}", str(held.get(key) or "")) for key in (
                     "binding_sha256", "observation_sha256",
                 )) \
-                or held.get("state") not in {"tracking", "paused"}:
+                or held.get("state") not in {"tracking", "repeating"}:
             raise HarnessError("The saved context progress record is malformed")
         if held.get("binding_sha256") == binding_digest and held.get("last_step_id") == step_id:
             if held.get("observation_sha256") != observation_digest:
@@ -161,23 +176,24 @@ def observe(
             return copy.deepcopy(held)
     same = compatible and held.get("binding_sha256") == binding_digest \
         and held.get("observation_sha256") == observation_digest
-    repeats = min(MAX_IDENTICAL_REPEATS, int(held.get("identical_repeats") or 0) + 1) if same else 0
-    paused = repeats >= MAX_IDENTICAL_REPEATS
+    repeats = min(MAX_TRACKED_REPEATS, int(held.get("identical_repeats") or 0) + 1) if same else 0
+    repeating = repeats >= NOTICE_AFTER_IDENTICAL_REPEATS
     counts = dict(held.get("recoverable_failures", {})) if compatible and held.get("binding_sha256") == binding_digest else {}
     for category in corrected:
         counts.pop(category, None)
     for category in set(failures):
-        counts[category] = min(MAX_IDENTICAL_REPEATS + 1, counts.get(category, 0) + 1)
+        counts[category] = min(MAX_TRACKED_REPEATS, counts.get(category, 0) + 1)
     failed_loop = bool(failures) and len(failures) == len(calls) and any(
-        counts[k] > MAX_IDENTICAL_REPEATS for k in failures)
-    paused = paused or failed_loop
+        counts[k] > NOTICE_AFTER_IDENTICAL_REPEATS for k in failures)
+    notice = FAILED_LOOP_NOTICE if failed_loop else REPEAT_NOTICE if repeating else ""
+    # Never a pause: the agent sees the notice and keeps full control.
     return {
         "schema_version": SCHEMA_VERSION, "contract_fingerprint_sha256": fingerprint,
         "binding_sha256": binding_digest, "observation_sha256": observation_digest,
         "last_step_id": step_id, "identical_repeats": repeats,
-        "state": "paused" if paused else "tracking",
-        "reason": ("Repeated recoverable tool errors without a corrected result. Use read_file for ordinary files "
-                   "or fetch_url for known sources, then resume with the corrected action.") if failed_loop else PAUSE_REASON if paused else "",
+        "state": "repeating" if notice else "tracking",
+        "notice": notice,
+        "reason": notice,
         "recoverable_failures": counts,
         "tool_names": [str(call.get("name") or "") for call in calls],
     }

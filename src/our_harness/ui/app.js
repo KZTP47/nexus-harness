@@ -702,7 +702,14 @@ async function validate(candidate = graph) { try { const result = await request(
 async function simulate() { const checked = await validate(); if (!checked.valid) return; try { const result = await request("/api/simulate", {method: "POST", body: JSON.stringify({graph, state: {test_failures_remaining: 1, temperature: .2}})}); await animateTransitions(result.transitions); appendEvent("simulation", result.complete ? "Complete" : result.error || "Stopped"); announce(result.complete ? "Simulation completed." : `Simulation stopped: ${result.error || result.stopped_at}`); } catch (error) { showError(error.message); } }
 async function animateTransitions(transitions) { const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches; for (const transition of transitions.filter((item) => item.node)) { nodeStatuses.set(transition.node, transition.state?.stage_passed === false ? "Failed" : "Passed"); renderNodes(); appendEvent(transition.node, transition.state?.stage_passed === false ? "Failed; routed to coder" : "Passed"); if (!reduced) await new Promise((resolve) => setTimeout(resolve, 220)); } }
 function appendEvent(state, result) { const row = document.createElement("tr"); row.append(make("td", "", new Date().toLocaleTimeString()), make("td", "", state), make("td", "", typeof result === "string" ? result : JSON.stringify(result))); $("eventBody").prepend(row); while ($("eventBody").children.length > 500) $("eventBody").lastElementChild.remove(); }
-function showError(message) { $("validationStatus").className = "status-fail"; $("validationStatus").textContent = message; announce(`Error: ${message}`, true); appendEvent("error", message); }
+function showError(message) {
+  $("validationStatus").className = "status-fail"; $("validationStatus").textContent = message; announce(`Error: ${message}`, true); appendEvent("error", message);
+  // The validation line lives in the Workflow view. On the board it is hidden,
+  // so an error there would only be heard, not seen: say it on the board's own
+  // status line too. Other views are left exactly as they were.
+  const swarmView = $("swarmView");
+  if (swarmView && !swarmView.hidden && $("swarmSaid")) sayInSwarm(message);
+}
 async function startRun() { if (pipelineCannotRun) { showError(executionPauseWords("Project execution", pipelineCannotRun)); return; } const task = $("taskInput").value.trim(); if (!task) { showError("Enter a task before starting a run."); $("taskInput").focus(); return; } const checked = await validate(); if (!checked.valid) return; try { await request("/api/run", {method: "POST", body: JSON.stringify({task, dry_run: $("dryRunInput").checked, graph})}); announce("Run accepted. Events will appear in the run log."); appendEvent("run", "Accepted"); } catch (error) { showError(error.message); } }
 
 async function pollEvents() {
@@ -6973,6 +6980,9 @@ async function boot() {
     // courier cannot start until this point. Start it explicitly now instead
     // of relying on a later timer tick to rescue the first no-token attempt.
     startWebChatBridge();
+    // New-mail corner notifications work from every tab, not only once the
+    // Email view has been opened.
+    window.nexusEmail?.watch?.();
     template = migrateGraph(value.template);
     graph = structuredClone(template);
     catalog = await request("/api/catalog");
@@ -7442,10 +7452,27 @@ function chatLongGoalContext(agentId, snapshots = longGoals) {
       ? goal.collaboration_contract_status?.message
         || "This saved goal uses an older collaboration engine. Open advanced goal details to keep its history and cancel it, then start a fresh Work together goal."
       : "");
+  // The saved chat's reconnect review also carries a goal whose own provider
+  // setup drifted while the chat itself still looks current, so offer it for
+  // either. Only the user's press sends it.
+  const reconnectForGoal = matches && !conversation.binding_problem?.can_review_reconnect
+    && goalSetupCanBeReconnected(goal);
   return {goal, problem: String(problem || ""),
     ...(matches && conversation.binding_problem ? {repairChat: conversation} : {}),
-    ...(matches && conversation.binding_problem?.can_review_reconnect
-      ? {reconnectChat: conversation} : {})};
+    ...(matches && (conversation.binding_problem?.can_review_reconnect || reconnectForGoal)
+      ? {reconnectChat: conversation} : {}),
+    ...(reconnectForGoal ? {reconnectForGoal: true} : {})};
+}
+
+// A goal whose provider route changed (a new account, endpoint or program)
+// can be carried over by the chat's reconnect review, whatever the goal's own
+// status suggests; the server re-checks everything before it applies.
+function goalSetupCanBeReconnected(goal) {
+  const status = goal?.provider_setup_status || {};
+  return Boolean(goal?.provider_setup_changed === true
+    || status.code === "route_identity_changed"
+    || (Array.isArray(status.agents)
+      && status.agents.some((one) => one?.code === "route_identity_changed")));
 }
 
 function chatGoalBinding(agentId, goal) {
@@ -8215,7 +8242,10 @@ function fillChatGoalPanel(container, agentId, context) {
   panel.append(make("p", "hint", problem || (pending.length
     ? "The team needs your answers before it can continue."
     : "Send a message below to steer both agents. Their replies and progress stay in this chat.")));
-  if (context.reconnectChat) appendProviderReconnectControl(panel, agentId, context.reconnectChat);
+  if (context.reconnectChat) {
+    appendProviderReconnectControl(panel, agentId, context.reconnectChat,
+      {forGoal: Boolean(context.reconnectForGoal)});
+  }
   else if (context.repairChat) {
     const conversation = context.repairChat;
     const fresh = make("button", "primary chat-team-repair", conversation.binding_problem.action_label || "Start fresh with current setup");
@@ -8225,6 +8255,9 @@ function fillChatGoalPanel(container, agentId, context) {
       const peer = members.find(id => id !== String(agentId)) || "";
       return createConversationFor(agentId, peer, peer ? "" : "single");
     });
+    if (chatCanContinueInThisFolder(conversation)) {
+      panel.append(continueInThisFolderButton(agentId, conversation, "chat-team-repair"));
+    }
     panel.append(fresh);
   }
   if (!problem && goal?.execution_workspace) {
@@ -8337,9 +8370,11 @@ function fillChatGoalPanel(container, agentId, context) {
   accessControls();
 }
 
+// Returns the mode the user picked for this chat, or "" when they never picked
+// one: the server then applies its own default (Full, recorded as the default).
 function chatComposerAccessPreference(conversation, mode = null) {
   const allowed = ["read_only", "ask", "full"];
-  if (!conversation?.id) return "full";
+  if (!conversation?.id) return "";
   const key = `nexus.chat-composer-access.v1:${conversation.id}`;
   const binding = JSON.stringify(directLongGoalCanonicalValue({
     contract: "chat-composer-access/v1", project: conversation.project,
@@ -8353,7 +8388,7 @@ function chatComposerAccessPreference(conversation, mode = null) {
     const saved = JSON.parse(localStorage.getItem(key) || "null");
     if (saved?.schema_version === 1 && saved.binding === binding && allowed.includes(saved.mode)) return saved.mode;
   } catch {}
-  return "full";
+  return "";
 }
 
 function fillChatComposerPermissions(host, agentId, context, inline = false) {
@@ -8362,7 +8397,7 @@ function fillChatComposerPermissions(host, agentId, context, inline = false) {
   const goal = context.goal;
   const active = goal && !["complete", "cancelled"].includes(goal.status);
   const labels = {read_only: "Read only", ask: "Ask before commands", full: "Full project access"};
-  const mode = active ? goal.agent_access?.mode || "ask" : chatComposerAccessPreference(conversation);
+  const mode = active ? goal.agent_access?.mode || "ask" : chatComposerAccessPreference(conversation) || "full";
   const needsInput = active && goal.command_request?.state === "pending";
   const signature = JSON.stringify([conversation?.id, conversation?.binding, conversation?.project,
     goal?.goal_id, goal?.status, goal?.agent_access, goal?.command_request, goal?.scheduler_live,
@@ -8885,6 +8920,8 @@ function restoreSwarmChatDraft(chatKey, words) {
 }
 
 function restoreSwarmActivityDraft(activity) {
+  // A queued board goal's words were never the user's draft.
+  if (activity?.leavesComposerAlone) return;
   const words = String(activity?.localTurns?.find(
     (one) => one?.who === "you" && String(one?.text || "").trim()
   )?.text || "");
@@ -11212,7 +11249,13 @@ function longHorizonAdmissionWords(goal) {
     if (goal?.execution_workspace && goal.workspace_publication?.state !== "published") {
       return {stage: "Result awaiting publication", detail: `Goal ${goalId} has not published its independent result to the project. Open its goal details to inspect the saved status.`};
     }
-    return {stage: "Goal verified complete", detail: `Durable goal ${goalId} already has verified completion evidence.`};
+    // "Verified" only when an automatic check really passed. A goal may also be
+    // complete because the agents agreed it is done when no check could run
+    // (for example no project tests were configured); say that plainly.
+    if (goalAutomaticChecksPassed(goal)) {
+      return {stage: "Goal verified complete", detail: `Durable goal ${goalId} already has verified completion evidence.`};
+    }
+    return {stage: "Goal complete", detail: `Durable goal ${goalId} is done. ${agentsAgreedWords()}`};
   }
   if (status === "failed") {
     return {stage: "Goal failed", detail: `Durable goal ${goalId} failed; Mission control has the recorded reason.`};
@@ -11227,6 +11270,115 @@ function longHorizonAdmissionWords(goal) {
     return {stage: "Goal cancelled", detail: `Durable goal ${goalId} was cancelled and is not complete.`};
   }
   return {stage: "Goal status received", detail: `Durable goal ${goalId} has status “${status}” in Mission control.`};
+}
+
+// A goal can be done two ways: an automatic check passed, or - when no check
+// could run - every agent agreed it is done. Both are complete; only the first
+// is called verified. Results from board work say which in verification_status
+// (deterministically_verified or agent_verified) and machine_verified; a
+// long-horizon goal says it in its recorded verification.
+function goalAutomaticChecksPassed(result) {
+  if (!result) return false;
+  const how = String(result.verification_status || "");
+  if (how === "deterministically_verified") return true;
+  if (how === "agent_verified") return false;
+  if (result.machine_verified === true) return true;
+  if (result.machine_verified === false) return false;
+  return result.verification?.status === "passed";
+}
+
+function agentsAgreedWords() {
+  return "Agents agreed it is done; no automatic check was available.";
+}
+
+// Short, plain notes about how a goal or a board-work result went: things the
+// user may want to know, none of them a failure or a veto. Reads a
+// long-horizon goal (its workspace, tasks, access and provider status) or a
+// board-work result (its deterministic_verification), whichever it is given.
+function goalResultNotices(value, events = []) {
+  if (!value || typeof value !== "object") return [];
+  const notes = [];
+  const plural = (count, one, many) => `${count} ${count === 1 ? one : many}`;
+  const skipped = Number(value.execution_workspace?.skipped_links?.count
+    ?? value.skipped_links?.count ?? 0);
+  if (skipped > 0) {
+    notes.push(`${plural(skipped, "linked file was", "linked files were")} left out of the private copy.`);
+  }
+  const judged = [
+    ...(Array.isArray(value.evidence_notes) ? value.evidence_notes : []),
+    ...(Array.isArray(value.tasks) ? value.tasks : [])
+      .flatMap((task) => task?.closeout_outcome?.evidence_notes || []),
+  ].map((one) => String(one || "").trim()).filter(Boolean);
+  for (const one of judged.slice(0, 3)) notes.push(one.endsWith(".") ? one : `${one}.`);
+  if (judged.length > 3) notes.push(`${judged.length - 3} more judge note(s) are in the goal details.`);
+  const repeated = (Array.isArray(events) ? events : [])
+    .filter((event) => event?.type === "closeout_repeated_findings").at(-1);
+  if (repeated) {
+    const times = Number(repeated.payload?.previous_rejections || 0);
+    notes.push(`Judges asked for changes to the same submission${times ? ` ${times} times` : ""}; the agents keep working. Pause the goal if you want to step in.`);
+  }
+  if (value.provider_setup_status?.refresh_pending === true || value.refresh_pending === true) {
+    notes.push("Only provider settings such as the model or program version changed; Nexus refreshes the saved setup before the next turn.");
+  }
+  const denied = Object.values(value.agent_access?.grants || {})
+    .filter((grant) => grant?.decision === "deny");
+  // command_denials says, for each denied command, which agents' CLIs block it
+  // for real and for which the agent is only asked not to run it.
+  const denials = Array.isArray(value.command_denials) ? value.command_denials : [];
+  for (const one of denials.slice(0, 3)) notes.push(commandDenialWords(one));
+  if (denials.length > 3) notes.push(`${denials.length - 3} more denied command(s) are in the goal details.`);
+  if (!denials.length && denied.length) {
+    notes.push(`You denied ${plural(denied.length, "command request", "command requests")}; the agents were told not to run ${denied.length === 1 ? "it" : "them"}. Everything else stays available.`);
+  }
+  const checked = value.verification || value.deterministic_verification || {};
+  const evidence = checked.requirement_evidence || {};
+  const advisoryIds = [...new Set([evidence, evidence.artifacts, evidence.execution]
+    .flatMap((one) => (Array.isArray(one?.advisory_unmet) ? one.advisory_unmet : []))
+    .map(String))];
+  if (advisoryIds.length) {
+    const described = new Map((checked.requirement_contract?.requirements || [])
+      .map((one) => [String(one?.id || ""), String(one?.description || "")]));
+    const names = advisoryIds.map((id) => described.get(id) || id);
+    notes.push(`Not required, but not done: ${names.slice(0, 4).join("; ")}${names.length > 4 ? ` and ${names.length - 4} more` : ""}.`);
+  }
+  const planned = (checked.requirement_contract?.planned_effect_paths || []).map(String).filter(Boolean);
+  if (planned.length) {
+    notes.push(`Hint: the goal's wording mentions ${planned.slice(0, 4).join(", ")}${planned.length > 4 ? ` and ${planned.length - 4} more` : ""}; the agents decide what to change.`);
+  }
+  return notes;
+}
+
+function commandDenialWords(denial) {
+  const commands = (Array.isArray(denial?.commands) ? denial.commands : [])
+    .map((one) => (Array.isArray(one) ? one.map(String).join(" ") : String(one ?? "")).trim())
+    .filter(Boolean);
+  const shown = commands.length
+    ? commands.slice(0, 2).map((one) => `\`${one.length > 120 ? `${one.slice(0, 117)}...` : one}\``).join(", ")
+      + (commands.length > 2 ? ` and ${commands.length - 2} more` : "")
+    : "a command";
+  const agents = Array.isArray(denial?.agents) ? denial.agents : [];
+  const names = (enforcement) => agents.filter((one) => one?.enforcement === enforcement)
+    .map((one) => String(one?.name || one?.agent_id || "an agent"));
+  const blocked = names("cli_rule");
+  const asked = agents.filter((one) => one?.enforcement !== "cli_rule")
+    .map((one) => String(one?.name || one?.agent_id || "an agent"));
+  const list = (items) => (items.length > 1
+    ? `${items.slice(0, -1).join(", ")} and ${items.at(-1)}` : items[0]);
+  let how = "";
+  if (blocked.length && asked.length) {
+    how = ` ${list(blocked)}'s CLI blocks it; for ${list(asked)} this is a request, not a hard block.`;
+  } else if (blocked.length) {
+    const who = blocked.length > 1 ? "Every agent's CLI blocks it" : `${list(blocked)}'s CLI blocks it`;
+    how = ` ${who}.`;
+  } else if (asked.length) {
+    how = ` For ${list(asked)} this is a request, not a hard block: the CLI cannot enforce it, so the agent is told not to run it.`;
+  }
+  return `You denied ${shown}.${how}`;
+}
+
+function resultNoticesWords(value) {
+  const notes = goalResultNotices(value);
+  return notes.length ? ` ${notes.join(" ")}` : "";
 }
 
 function finishLongHorizonAdmissionActivity(agentId, goal, expectedActivity) {
@@ -12684,17 +12836,24 @@ function setWhatCanBePressedInSwarm() {
   $("swarmWorkGoals").title = String(
     boardGoalPause || held
     || (swarmGoalWorkRunning ? "Goal work is starting." : ""));
-  $("swarmCancelGoals").disabled = !longGoal
-    || ["complete", "cancelled"].includes(longGoal.status);
+  $("swarmCancelGoals").disabled = !legacyBoardGoalsCanBeCancelled() && (!longGoal
+    || ["complete", "cancelled"].includes(longGoal.status));
+  // The reason is shown only while it is the reason the button is greyed out.
+  $("swarmCancelGoals").title = $("swarmCancelGoals").disabled
+    && swarmGoalQueue?.status === "running"
+    ? "Stop the exact active chat run first; then cancel the remaining board goals." : "";
   const longProjectWorkActive = longGoals.some((goal) => (
     ["waiting_for_project", "queued", "running", "paused", "waiting_for_user"]
       .includes(goal.status)
     || (goal.status === "cancelling" && goal.project_queue?.state !== "released")
     || (goal.status === "failed" && goal.project_queue?.state === "owner")
   ));
+  // A queued legacy queue stays pressable: after a reload nothing else carries
+  // it on, and the server keeps its project held until somebody does. The
+  // press is the user's say-so to send the next goal; it is never sent alone.
   $("swarmLegacyGoals").disabled = Boolean(
     held || boardGoalPause || swarmGoing || swarmGoalWorkRunning
-    || ["queued", "running"].includes(swarmGoalQueue?.status)
+    || swarmGoalQueue?.status === "running"
     || longProjectWorkActive);
   $("swarmLegacyGoals").title = longProjectWorkActive
     ? "Cancel or finish active long-horizon project work before using the legacy paired workflow."
@@ -12787,6 +12946,12 @@ function setWhatCanBePressedInSwarm() {
     renderWorkRecoveryButtons(theBigOne);
     syncChatGoalControls(theBigOne);
   }
+}
+
+// The legacy paired queue can be cancelled while it waits between goals or
+// sits paused; a goal that is running is stopped from its chat first.
+function legacyBoardGoalsCanBeCancelled(queue = swarmGoalQueue) {
+  return ["queued", "paused"].includes(queue?.status);
 }
 
 // ---- changing it ---------------------------------------------------------
@@ -13006,7 +13171,7 @@ async function rebindTheSwarmProject() {
     held.approved_test_command_digest = "";
   }, () => {
     const rebound = theSwarmProject(project.id);
-    return `Rebound ${rebound?.name || project.name} to ${wanted}. Tasks, agents, links, and its board identity were kept; local command approval was cleared.`;
+    return `Rebound ${rebound?.name || project.name} to ${wanted}. Tasks, agents, links, and its board identity were kept; local command approval was cleared. A chat that was working in the old folder waits for you: press Continue in this folder in that chat to carry it on here, or start it fresh.`;
   });
   if (changed) pickSwarmBox("project", project.id);
 }
@@ -13071,7 +13236,10 @@ function tidyTheSwarmBoard() {
 // back to it. Big, because a chat in a strip at the edge of the page is a chat
 // nobody uses, and because the answer is the part you came to read.
 
-async function openTheChatFor(agentId) {
+// Pressed by somebody, the chat takes the keyboard so they can type at once.
+// Opened by the board-goal queue, it does not: the user may be typing
+// somewhere else, and the queue has no business moving them.
+async function openTheChatFor(agentId, {focus = true} = {}) {
   const agent = theSwarmAgent(agentId);
   if (!agent) return;
   const already = swarmChats.find((one) => one.agent === agentId);
@@ -13096,7 +13264,7 @@ async function openTheChatFor(agentId) {
   renderSwarmBoard();
   renderTheChatsOnThisBoard();
   const card = theChatCardFor(agentId);
-  if (card) {
+  if (card && focus) {
     card.querySelector(".swarm-chat-box").focus();
     card.scrollIntoView({block: "nearest"});
   }
@@ -13299,15 +13467,17 @@ function finishConversationSwitch(agentId) {
   }
 }
 
-async function createConversationFor(agentId, peerId, scope = "") {
+async function createConversationFor(agentId, peerId, scope = "", {focus = true} = {}) {
   if (swarmConversationSwitching.has(agentId) || swarmChatIsHydrating(agentId)) return;
   const composerOwner = beginNewChatComposer(agentId, peerId, scope);
   if (!composerOwner) return;
   swarmConversationSwitching.add(agentId);
   nextConversationListRevision(agentId);
   setWhatCanBePressedInSwarm();
-  if (theBigOne === agentId) $("theBigChatBox").focus({preventScroll: true});
-  else theChatCardFor(agentId)?.querySelector(".swarm-chat-box")?.focus({preventScroll: true});
+  // Not when the board-goal queue made the chat: nobody pressed anything, and
+  // the user may be typing somewhere else.
+  if (focus && theBigOne === agentId) $("theBigChatBox").focus({preventScroll: true});
+  else if (focus) theChatCardFor(agentId)?.querySelector(".swarm-chat-box")?.focus({preventScroll: true});
   sayInBigChatConversationFor(agentId, "Opening a new chat. You can type now; sending will be available when it is saved.");
   try {
     const said = await request("/api/swarm/chats/create", {
@@ -13333,8 +13503,10 @@ async function createConversationFor(agentId, peerId, scope = "") {
   }
 }
 
-function appendProviderReconnectControl(container, agentId, conversation) {
-  if (!conversation?.binding_problem?.can_review_reconnect) return;
+// forGoal: the chat is current but its goal's provider setup drifted; the
+// same reconnect review carries the goal over.
+function appendProviderReconnectControl(container, agentId, conversation, {forGoal = false} = {}) {
+  if (!conversation?.id || (!conversation.binding_problem?.can_review_reconnect && !forGoal)) return;
   const reconnect = make("button", "primary", "Reconnect saved chat");
   reconnect.type = "button";
   reconnect.dataset.conversationAction = "reconnect";
@@ -13579,6 +13751,37 @@ async function selectConversationProject(agentId, projectId) {
   } finally {
     finishConversationSwitch(agentId);
   }
+}
+
+// A chat paused because its project folder moved or changed can carry on in
+// the folder the board uses now, when the server says that is safe
+// (can_rebind_project). It is the same choose-this-chat's-project request the
+// project picker sends, with the project the chat already had, and it is only
+// ever sent from the user's own press - never on its own.
+function chatCanContinueInThisFolder(conversation) {
+  const problem = conversation?.binding_problem;
+  return Boolean(problem?.can_rebind_project
+    && (problem.project_id || conversation.project));
+}
+
+async function continueChatInThisFolder(agentId, conversation) {
+  if (!chatCanContinueInThisFolder(conversation)) return;
+  const projectId = String(conversation.binding_problem.project_id || conversation.project);
+  if (activeConversationFor(agentId)?.id !== conversation.id) {
+    await activateConversationFor(agentId, conversation.id);
+    if (activeConversationFor(agentId)?.id !== conversation.id) return;
+  }
+  await selectConversationProject(agentId, projectId);
+}
+
+function continueInThisFolderButton(agentId, conversation, className = "") {
+  const button = make("button", className, "Continue in this folder");
+  button.type = "button";
+  button.dataset.conversationAction = "continue-in-folder";
+  button.title = "Keep this chat and its history, and carry on in the project folder the board uses now.";
+  button.disabled = swarmConversationSwitching.has(agentId) || swarmChatIsHydrating(agentId);
+  button.addEventListener("click", () => continueChatInThisFolder(agentId, conversation));
+  return button;
 }
 
 // The cards move when they are dragged; the empty drawing paper moves the
@@ -15826,6 +16029,17 @@ function workResponseWords(answered, agentName = "The team", ordinaryWords = "")
   if (status === "applied_unverified") {
     return "Changes were applied but are not deterministically verified. Resume the saved run before treating the work as complete." + budget;
   }
+  // Finished board work says how it was found done. "Verified" is kept for an
+  // automatic check that passed; agreement between the agents is named as such.
+  if (answered?.goal_complete === true && ["deterministically_verified", "agent_verified"]
+    .includes(String(answered?.verification_status || ""))) {
+    const changes = answered?.changed?.length
+      ? ` Nexus applied ${answered.changed.length} file change(s).` : "";
+    return (goalAutomaticChecksPassed(answered)
+      ? `${agentName}: the goal is done and the automatic checks passed.`
+      : `${agentName}: the goal is done. ${agentsAgreedWords()}`)
+      + changes + resultNoticesWords(answered) + budget;
+  }
   if (ordinaryWords) return ordinaryWords;
   return answered.partial_provider_failure || automaticRoundStopWords(answered) || (answered?.changed?.length
     ? `${agentName} answered. Nexus applied ${answered.changed.length} file change(s).`
@@ -15987,15 +16201,19 @@ async function sendWhatIsTypedTo(agentId) {
   const agent = theSwarmAgent(agentId);
   if (!card || !agent) return;
   const box = card.querySelector(".swarm-chat-box");
-  const typed = box.value;
+  // A queued board goal brings its own words. It never reads, clears, refills
+  // or focuses the composer, and never takes the files attached there: those
+  // are the user's, for the user's own next message.
+  const fromTheQueue = Boolean(goalQueueItem);
+  const typed = fromTheQueue ? String(goalQueueItem.text || "") : box.value;
   let words = typed.trim();
   const executionPause = projectWorkPauseForMessage(mode, words, agentId);
   if (executionPause) {
     sayInTheChatFor(agentId, executionPause);
-    box.focus();
+    if (!fromTheQueue) box.focus();
     return;
   }
-  if (!words && !(swarmChatAttachments.get(swarmChatKey(agentId)) || []).length) { sayInTheChatFor(agentId, "Type something first."); return; }
+  if (!words && (fromTheQueue || !(swarmChatAttachments.get(swarmChatKey(agentId)) || []).length)) { sayInTheChatFor(agentId, "Type something first."); return; }
   if (words.length > Number(limitsForSwarmChat(agentId).input_characters || 200000)) {
     sayInTheChatFor(agentId,
       "This message is over the displayed limit. Nexus kept the complete draft; split it or attach a file.");
@@ -16033,7 +16251,7 @@ async function sendWhatIsTypedTo(agentId) {
     sayInTheChatFor(agentId, "Finishing the chat switch first.");
     return;
   }
-  if (swarmChatAttachmentsAreLoading(agentId)) {
+  if (!fromTheQueue && swarmChatAttachmentsAreLoading(agentId)) {
     sayInTheChatFor(agentId, "Wait for the attached files to finish loading before sending.");
     return;
   }
@@ -16070,18 +16288,24 @@ async function sendWhatIsTypedTo(agentId) {
   nextSwarmChatRevision(agentId);
   setWhatCanBePressedInSwarm();
   const attachmentKey = requestChatKey;
-  const attachments = swarmChatAttachments.get(attachmentKey) || [];
+  const attachments = fromTheQueue ? [] : (swarmChatAttachments.get(attachmentKey) || []);
   const durableDirectAdmission = mode === "work" && !goalQueueItem;
   // A sent prompt is already represented as the activity's local transcript
   // turn. Direct goal work keeps its draft until the backend confirms that the
   // exact payload (including attachment bytes) is durable. Other chat modes
   // retain their established immediate-clear behaviour.
-  if (!durableDirectAdmission) {
+  if (!durableDirectAdmission && !fromTheQueue) {
     box.value = "";
     swarmChatComposerDrafts.delete(requestChatKey);
     rememberSwarmChatComposer(agentId);
   }
   const activity = beginSwarmChatActivity(agentId, mode, agent, words, attachments);
+  if (fromTheQueue) {
+    // Nothing of the composer's went with this request, so nothing of it is
+    // cleared when it succeeds or put back when it fails.
+    activity.attachmentsCleared = true;
+    activity.leavesComposerAlone = true;
+  }
   sayInTheChatFor(agentId, mode === "auto" ? "Deciding whether connected agents should help..."
     : mode === "chat" ? `Asking ${agent.name}...`
     : mode === "collaborate" ? "Relaying to connected agents..."
@@ -16201,8 +16425,9 @@ async function sendWhatIsTypedTo(agentId) {
     clearSwarmActivityAttachments(activity);
     if (!theChatCardFor(agentId)) {
       // The chat was closed while the answer was on its way. It is kept, and is
-      // there when it is opened again.
-      return;
+      // there when it is opened again. It was still answered, so say so: a
+      // board-goal queue waiting on this must carry on, not stop.
+      return said;
     }
     keepWhatWasSaidToRuntime(
       runtimeKey, said.said || [], conversation?.id || "",
@@ -16233,7 +16458,7 @@ async function sendWhatIsTypedTo(agentId) {
     // secondary transcript read waits; the activity feed also reconciles a
     // terminal server run when the original HTTP response is lost.
     if (!swarmActivityCanSettle(activity)) return null;
-    restoreSwarmChatDraft(requestChatKey, typed);
+    if (!fromTheQueue) restoreSwarmChatDraft(requestChatKey, typed);
     if (swarmChatKey(agentId) === requestChatKey) await refreshTheChatFor(agentId);
     if (durableDirectAdmission) await refreshDirectLongGoalRecoveries();
     if (!stoppedChatError(error)) showError(error.message);
@@ -16430,6 +16655,8 @@ let swarmGoing = false;      // a run is on
 let swarmGoalWorkRunning = false; // this renderer is dispatching the server's exact cursor
 let swarmGoalQueue = null;   // durable server-owned board-wide goal cursor
 let swarmGoalQueueWatching = 0;
+// Reads of the queue that failed in a row; the watch backs off by this.
+let swarmGoalQueueMissed = 0;
 let swarmGoalQueueContinuing = false;
 const SWARM_GOAL_QUEUE_REQUEST_KEY = "nexus.swarm.goal-queue-request.v1";
 const LONG_GOAL_SELECTED_KEY = "nexus.long-horizon.selected.v1";
@@ -16528,7 +16755,7 @@ function workingPairForProject(project) {
 }
 
 async function prepareGoalConversation(project, pair) {
-  await openTheChatFor(pair.lead.id);
+  await openTheChatFor(pair.lead.id, {focus: false});
   const held = swarmChats.find((one) => one.agent === pair.lead.id);
   if (!held) throw new Error(`Nexus could not open ${pair.lead.name}'s durable chat.`);
   let conversation = (held.conversations || []).find((one) => (
@@ -16540,7 +16767,7 @@ async function prepareGoalConversation(project, pair) {
   if (conversation && held.conversation !== conversation.id) {
     await activateConversationFor(pair.lead.id, conversation.id);
   } else if (!conversation) {
-    await createConversationFor(pair.lead.id, pair.peer.id);
+    await createConversationFor(pair.lead.id, pair.peer.id, "", {focus: false});
   }
   conversation = activeConversationFor(pair.lead.id);
   if (!conversation || conversation.peer !== pair.peer.id) {
@@ -16567,8 +16794,10 @@ function showBoardGoalQueue(queue) {
   const current = queue.current;
   if (queue.status === "complete") {
     button.textContent = "Use legacy paired workflow";
-    $("swarmGoalWorkSaid").textContent =
-      `All ${queue.total} board goal(s) reached verified completion.`;
+    // The server's note says whether any goal rested on the agents' agreement
+    // rather than an automatic check, so it goes first.
+    $("swarmGoalWorkSaid").textContent = queue.note
+      || `All ${queue.total} board goal(s) are complete.`;
     localStorage.removeItem(SWARM_GOAL_QUEUE_REQUEST_KEY);
   } else if (queue.status === "cancelled") {
     button.textContent = "Restart legacy paired workflow";
@@ -16576,10 +16805,13 @@ function showBoardGoalQueue(queue) {
     localStorage.removeItem(SWARM_GOAL_QUEUE_REQUEST_KEY);
   } else {
     button.textContent = queue.status === "paused"
-      ? "Open the saved goal's Resume controls" : "Show active goal work";
+      ? "Open the saved goal's Resume controls"
+      : queue.status === "queued" ? "Continue the saved board goals" : "Show active goal work";
     const number = Number(queue.cursor || 0) + 1;
     $("swarmGoalWorkSaid").textContent = queue.note
-      || `Goal ${number} of ${queue.total}: ${current?.lead_name || "the team"} is working in ${current?.project_name || "the project"}.`;
+      || (queue.status === "queued"
+        ? `Goal ${number} of ${queue.total} is waiting for ${current?.lead_name || "the team"} in ${current?.project_name || "the project"}. Press Continue the saved board goals to send it, or Cancel remaining goals.`
+        : `Goal ${number} of ${queue.total}: ${current?.lead_name || "the team"} is working in ${current?.project_name || "the project"}.`);
   }
   setWhatCanBePressedInSwarm();
 }
@@ -16587,6 +16819,7 @@ function showBoardGoalQueue(queue) {
 async function refreshBoardGoalQueue(autoContinue = false) {
   try {
     const said = await request("/api/swarm/goal-queue");
+    swarmGoalQueueMissed = 0;
     showBoardGoalQueue(said.queue);
     if (said.queue?.status === "running") watchBoardGoalQueue();
     if (autoContinue && said.queue?.status === "queued") {
@@ -16594,23 +16827,37 @@ async function refreshBoardGoalQueue(autoContinue = false) {
     }
     return said.queue;
   } catch (error) {
+    swarmGoalQueueMissed += 1;
     $("swarmGoalWorkSaid").textContent = String(error.message || error);
     return null;
   }
 }
 
-function watchBoardGoalQueue() {
+// One timer, however many times this is called. The read inside each tick
+// calls back here when the queue is still running, so the watch stays marked
+// as taken until that read has come back; cleared first, every tick started a
+// second timer beside its own and the asking doubled up on every tick.
+function watchBoardGoalQueue(wait = 1200) {
   if (swarmGoalQueueWatching) return;
   const poll = async () => {
-    swarmGoalQueueWatching = 0;
-    const queue = await refreshBoardGoalQueue(false);
+    let queue = null;
+    try {
+      queue = await refreshBoardGoalQueue(false);
+    } finally {
+      swarmGoalQueueWatching = 0;
+    }
     if (queue?.status === "running") {
-      swarmGoalQueueWatching = window.setTimeout(poll, 1200);
+      watchBoardGoalQueue();
     } else if (queue?.status === "queued") {
       void continueBoardGoalQueue();
+    } else if (!queue && swarmGoalQueueMissed && swarmGoalQueue?.status === "running") {
+      // One failed read (a restart, a dropped connection) must not end the
+      // watch for good while the queue it last saw is still running: nothing
+      // else would notice it finish or move on to its next goal.
+      watchBoardGoalQueue(Math.min(30000, 1200 * (2 ** swarmGoalQueueMissed)));
     }
   };
-  swarmGoalQueueWatching = window.setTimeout(poll, 1200);
+  swarmGoalQueueWatching = window.setTimeout(poll, wait);
 }
 
 async function continueBoardGoalQueue({retryPaused = false} = {}) {
@@ -16621,7 +16868,15 @@ async function continueBoardGoalQueue({retryPaused = false} = {}) {
   try {
     while (true) {
       const queue = await refreshBoardGoalQueue(false);
-      if (!queue || ["complete", "cancelled"].includes(queue.status)) return;
+      if (!queue) {
+        // A failed read must not strand a waiting or running queue: nothing
+        // else would ask again. A missing queue simply ends here.
+        if (swarmGoalQueueMissed && ["queued", "running"].includes(swarmGoalQueue?.status)) {
+          watchBoardGoalQueue(Math.min(30000, 1200 * (2 ** swarmGoalQueueMissed)));
+        }
+        return;
+      }
+      if (["complete", "cancelled"].includes(queue.status)) return;
       const item = queue.current;
       if (!item) return;
       if (queue.status === "running") {
@@ -16651,14 +16906,15 @@ async function continueBoardGoalQueue({retryPaused = false} = {}) {
       if (queue.status === "paused" && !retryPaused) return;
       $("swarmGoalWorkSaid").textContent =
         `Goal ${Number(queue.cursor) + 1} of ${queue.total}: ${lead.name} and ${peer.name} are working in ${project.name}.`;
-      const card = theChatCardFor(lead.id);
-      const box = card?.querySelector(".swarm-chat-box");
-      if (!box) throw new Error(`Nexus could not open the composer for ${lead.name}.`);
-      box.value = item.objective;
-      countWhatIsTypedTo(lead.id);
+      if (!theChatCardFor(lead.id)) {
+        throw new Error(`Nexus could not open the chat for ${lead.name}.`);
+      }
+      // The goal's own words go with the request. The composer is left alone:
+      // whatever the user is typing there, and the files they attached, stay
+      // theirs for their own next message.
       const answered = await sendWhatIsTypedTo(
         lead.id, "work", {allowed: true, confirmed: true, boardGoal: true},
-        {queueId: queue.queue_id, itemId: item.id});
+        {queueId: queue.queue_id, itemId: item.id, text: item.objective});
       if (!answered) {
         await refreshBoardGoalQueue(false);
         return;
@@ -16667,6 +16923,13 @@ async function continueBoardGoalQueue({retryPaused = false} = {}) {
       // answering. Read that authority rather than incrementing browser state.
       retryPaused = false;
     }
+  } catch (error) {
+    // Said where the goal work is shown, not left as a quiet rejection while
+    // the line above the buttons still says the team is working.
+    const words = String(error?.message || error);
+    $("swarmGoalWorkSaid").textContent =
+      `The board goals stopped: ${words} Nexus kept the saved queue, so it can be continued once that is put right.`;
+    showError(words);
   } finally {
     swarmGoalQueueContinuing = false;
     swarmGoalWorkRunning = false;
@@ -17060,10 +17323,20 @@ function renderMissionControl() {
       evidence.append(approval);
     }
   }
+  const notices = goalResultNotices(longGoal, longGoalEvents);
+  if (longGoal?.status === "complete") {
+    notices.unshift(goalAutomaticChecksPassed(longGoal)
+      ? "Done, and the automatic checks passed." : `Done. ${agentsAgreedWords()}`);
+  }
+  if (notices.length) {
+    const list = make("ul", "hint mission-goal-notes");
+    for (const one of notices) list.append(make("li", "", one));
+    evidence.append(make("h3", "", "Notes"), list);
+  }
   if (longGoal?.verification) {
     const pre = make("pre");
     pre.textContent = JSON.stringify(longGoal.verification, null, 2);
-    evidence.append(make("h3", "", "Deterministic verification"), pre);
+    evidence.append(make("h3", "", "Recorded checks"), pre);
   }
   for (const artifact of longGoal?.artifacts || []) {
     const details = make("details");
@@ -17258,6 +17531,13 @@ function longGoalComposerDraft() {
   };
 }
 
+function longGoalAccessChosen() {
+  // The HTML default option is "Full project access"; a different selection
+  // (or a restored draft that picked one) is the user's explicit choice.
+  const select = $("longGoalAccess");
+  return Boolean(select && select.selectedOptions[0] && !select.selectedOptions[0].defaultSelected);
+}
+
 function longGoalIntent(draft) {
   return JSON.stringify({
     schema_version: 1,
@@ -17267,7 +17547,9 @@ function longGoalIntent(draft) {
     agent_ids: [...draft.agent_ids].sort(),
     lead_id: draft.lead_id,
     collaboration_mode: draft.collaboration_mode,
-    policy: {agent_access_mode: draft.access_mode || "full", execution_mode: draft.execution_mode || "facilitator"},
+    // Only a mode the user picked is sent; otherwise the server's default applies.
+    policy: {...(longGoalAccessChosen() ? {agent_access_mode: draft.access_mode} : {}),
+      execution_mode: draft.execution_mode || "facilitator"},
   });
 }
 
@@ -17502,7 +17784,8 @@ async function startLongGoalFromComposer(event) {
       lead_id: draft.lead_id,
       collaboration_mode: draft.collaboration_mode,
       participant_ids: draft.agent_ids,
-      policy: {agent_access_mode: draft.access_mode || "full", execution_mode: draft.execution_mode || "facilitator"},
+      policy: {...(longGoalAccessChosen() ? {agent_access_mode: draft.access_mode} : {}),
+        execution_mode: draft.execution_mode || "facilitator"},
     };
     const said = await request("/api/long-horizon/start-board", {
       method: "POST", body: JSON.stringify({request_id: requestId, goal: goalSpec}),
@@ -17668,11 +17951,37 @@ async function cancelLongGoal() {
   await missionControl("cancel");
 }
 
+// One Cancel remaining goals button for both kinds of goal work, and it
+// cancels what the user has selected. A waiting legacy paired queue is the one
+// meant only when it belongs to this open board and no live long-horizon goal
+// on another project is the selected one; otherwise the selected long-horizon
+// goal is cancelled, as ever.
+function legacyQueueIsTheSelectedGoalWork(queue = swarmGoalQueue) {
+  if (!legacyBoardGoalsCanBeCancelled(queue)) return false;
+  const projectId = String(queue.current?.project_id || "");
+  if (!projectId || !theSwarmProject(projectId)) return false;
+  const selected = longGoal && !["complete", "cancelled"].includes(longGoal.status) ? longGoal : null;
+  const selectedProject = String(selected?.project?.id || "");
+  return !selectedProject || selectedProject === projectId;
+}
+
+async function cancelTheSwarmGoals() {
+  if (legacyQueueIsTheSelectedGoalWork()) return cancelRemainingBoardGoals();
+  if (!longGoal && legacyBoardGoalsCanBeCancelled()) {
+    // A queue saved from a board that is not open now. Cancelling it from
+    // here would reach work the user cannot see on this board.
+    $("swarmGoalWorkSaid").textContent =
+      "The waiting board goals belong to a board that is not open. Open that board to continue or cancel them.";
+    return;
+  }
+  return cancelLongGoal();
+}
+
 async function cancelRemainingBoardGoals() {
   const queue = swarmGoalQueue || await refreshBoardGoalQueue(false);
   if (!queue || !["queued", "paused"].includes(queue.status)) return;
   if (!window.confirm(
-    `Cancel ${queue.total - queue.completed} remaining board goal(s)? Verified completed goals stay recorded.`
+    `Cancel ${queue.total - queue.completed} remaining board goal(s)? Completed goals stay recorded.`
   )) return;
   try {
     const said = await request("/api/swarm/goal-queue/cancel", {
@@ -17702,20 +18011,43 @@ async function stopThemGoing() {
   }
 }
 
+// How long between asks while the run is going, and the longest it waits after
+// asks that did not get an answer.
+const SWARM_WATCH_EVERY_MS = 1500;
+const SWARM_WATCH_LONGEST_WAIT_MS = 30000;
+
+// A refusal that asking again cannot change: the run is gone. Anything else -
+// a dropped connection, a busy or restarting server - is worth asking again.
+function swarmRunIsGone(error) {
+  const status = Number(error?.status || 0);
+  if (status === 404 || status === 410) return true;
+  return status >= 400 && status < 500
+    && /run (does not exist|was not found|not found)|no such run|unknown run/i
+      .test(String(error?.message || ""));
+}
+
 // One timer, however many times this is called. Two would ask twice as often
-// and fight over the same list.
+// and fight over the same list. Each ask waits for the one before it to come
+// back, so a slow answer cannot have a second ask sent on top of it.
+//
+// An ask that fails is asked again, waiting a little longer each time up to
+// half a minute. Giving up after one lost answer left the board held and Start
+// greyed out with nobody left asking whether the run had finished.
 function watchWhatTheyAreDoing() {
   if (swarmWatching) return;
-  swarmWatching = window.setInterval(async () => {
+  let missed = 0;
+  const ask = async () => {
+    // swarmWatching still holds this tick's timer while the ask is on its way,
+    // so another call here cannot start a second watch beside it.
     try {
       const doing = await readSwarmBoardRun(swarmBoardRunId, swarmBoardCursor);
+      missed = 0;
       swarmBoardCursor = Number((doing || {}).next_cursor ?? (doing || {}).cursor ?? swarmBoardCursor);
       swarmDoing = doing || null;
       renderWhatTheyAreDoing(doing);
       if (!doing || !doing.going) {
         swarmBoardRequestId = "";
         localStorage.removeItem("nexus.swarm.board-request");
-        window.clearInterval(swarmWatching);
         swarmWatching = 0;
         // What they said is in their chats now, and a chat that was open while
         // its agent was asked is showing what it held before.
@@ -17723,13 +18055,37 @@ function watchWhatTheyAreDoing() {
         refreshWhatTheySaidToEachOther();
         // And the board can be changed again, which the server decides.
         refreshSwarm(true);
+        return;
       }
     } catch (error) {
-      window.clearInterval(swarmWatching);
-      swarmWatching = 0;
-      $("swarmDoingSaid").textContent = error.message;
+      if (swarmRunIsGone(error)) {
+        // Asking again cannot bring back a run the server no longer has. Stop
+        // asking, forget its identity so later reads ask about the board's
+        // current run instead, and let the server say whether the board is
+        // still held.
+        swarmWatching = 0;
+        swarmBoardRunId = "";
+        swarmBoardCursor = 0;
+        swarmBoardRequestId = "";
+        localStorage.removeItem("nexus.swarm.board-run");
+        localStorage.removeItem("nexus.swarm.board-request");
+        swarmDoing = null;
+        renderWhatTheyAreDoing(null);
+        const words = `Nexus stopped following this board run: the server no longer has it (${error.message}). The board is not held by it any more.`;
+        $("swarmDoingSaid").textContent = words;
+        sayInSwarm(words);
+        refreshSwarm(true);
+        return;
+      }
+      missed += 1;
+      $("swarmDoingSaid").textContent =
+        `${error.message} Nexus will ask again in a moment.`;
     }
-  }, 1500);
+    const wait = Math.min(
+      SWARM_WATCH_LONGEST_WAIT_MS, SWARM_WATCH_EVERY_MS * (2 ** missed));
+    swarmWatching = window.setTimeout(ask, wait);
+  };
+  swarmWatching = window.setTimeout(ask, SWARM_WATCH_EVERY_MS);
 }
 
 // What the run last said it was doing, kept so the big chat can show what one
@@ -18071,6 +18427,10 @@ async function openTheKeptBoard(name) {
     const said = await request("/api/swarm/open-kept", {
       method: "POST", body: JSON.stringify({name}),
     });
+    // The whole board was just replaced. Counted like any other change that
+    // landed, so a slower read already on its way cannot draw the old board
+    // back over the one that was opened.
+    howManyChangesLanded += 1;
     swarmSaid = said;
     acceptKeptInventory(said);
     keepTheSwarmPick();
@@ -19167,6 +19527,9 @@ function renderTheConversationSidebar(agentId) {
           createConversationFor(
             agentId, currentPeer, singleAgentGroup ? "single" : ""
           ));
+        if (!running && chatCanContinueInThisFolder(conversation)) {
+          repair.append(continueInThisFolderButton(agentId, conversation));
+        }
         repair.append(fresh);
         row.append(repair);
       }
@@ -21477,7 +21840,7 @@ function wireUpTheSwarmBoard() {
   $("longGoalDialog").addEventListener("close", () => {
     longGoalDialogInvoker?.focus?.({preventScroll: true});
   });
-  $("swarmCancelGoals").addEventListener("click", cancelLongGoal);
+  $("swarmCancelGoals").addEventListener("click", cancelTheSwarmGoals);
   $("swarmLegacyGoals").addEventListener("click", workOnEveryBoardGoalLegacy);
   $("missionGoalSelect").addEventListener("change", (event) => {
     const goalId = String(event.target.value || "");

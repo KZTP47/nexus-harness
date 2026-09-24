@@ -32,10 +32,12 @@ class GoalRepairContextTests(test_provider_repair.RepairEndpointTests):
         self.store.get.side_effect = lambda _goal: copy.deepcopy(self.goal)
         self.store.active_authority_goals.side_effect = lambda: [copy.deepcopy(self.goal)]
         self.store.protocol_recovery_status.side_effect = lambda _goal: copy.deepcopy(self.verdict)
+        self.diagnosis_stub = mock.patch.object(
+            provider_repair, "repair_plan", side_effect=lambda *_a, **_k: self.allowed_plan())
         for patcher in [
             mock.patch.object(self.server, "swarm_standing", side_effect=lambda: {"board": self.board}),
             mock.patch.object(long_horizon, "GoalStore", return_value=self.store),
-            mock.patch.object(provider_repair, "repair_plan", side_effect=lambda *_a, **_k: self.allowed_plan()),
+            self.diagnosis_stub,
         ]:
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -63,6 +65,14 @@ class GoalRepairContextTests(test_provider_repair.RepairEndpointTests):
         self.server._long_horizon = runtime
         self.addCleanup(setattr, self.server, "_long_horizon", None)
         return runtime
+
+    def test_saved_timeout_can_be_verified_through_endpoint_and_stays_cleared_after_restart(self) -> None:
+        # Inherited from the endpoint suite, where it proves what the real
+        # diagnosis says about a saved timeout. This suite stubs the diagnosis
+        # for its goal-bound actions, so give the inherited check the real one;
+        # the goal context around it must not change what a timeout diagnoses.
+        self.diagnosis_stub.stop()
+        super().test_saved_timeout_can_be_verified_through_endpoint_and_stays_cleared_after_restart()
 
     def test_diagnosis_reads_saved_failure_without_starting_runtime_or_model(self) -> None:
         with mock.patch("our_harness.chat.ask_once") as asked:

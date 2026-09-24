@@ -22,7 +22,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import files
 from pathlib import Path
-from typing import Any, TYPE_CHECKING
+from typing import Any, Iterator, TYPE_CHECKING
 
 from . import bundle
 from . import cancellation
@@ -428,6 +428,13 @@ class HarnessHTTPServer(ThreadingHTTPServer):
         # Serializes project switching with the short admission window before
         # a command owns its durable run/provider lease.
         self.project_admission_lock = threading.Lock()
+        # Chat turns in flight on the current project. A turn pins the project
+        # (it cannot be moved away) without holding admission for the whole
+        # provider reply, so board edits and other commands are not queued
+        # behind a slow answer. Taken under admission, released under its own
+        # lock; read by the project move while it holds admission.
+        self._project_pins = 0
+        self._project_pins_lock = threading.Lock()
         # Marks the exact cross-process request+chat lease held by this thread.
         # A compatibility rewrite of authenticated pending admission metadata
         # is never allowed from a helper call outside that lease.
@@ -2918,7 +2925,10 @@ class HarnessHTTPServer(ThreadingHTTPServer):
                 for project in (snapshot.get("board") or {}).get("projects", []):
                     if not isinstance(project, dict) or not str(project.get("path") or ""):
                         continue
-                    legacy_root = Path(str(project["path"])).resolve(strict=True)
+                    # Not strict: a folder moved or deleted since the run was
+                    # accepted still reserves its old place, and must not stop
+                    # every long-horizon start with a missing-file error.
+                    legacy_root = Path(str(project["path"])).resolve()
                     if self._project_paths_overlap(root, legacy_root):
                         conflicts.append(f"legacy-board-run:{active.get('run_id')}")
                 continue
@@ -2926,11 +2936,21 @@ class HarnessHTTPServer(ThreadingHTTPServer):
             conversation = snapshot.get("conversation") if isinstance(snapshot.get("conversation"), dict) else {}
             project_id = str(snapshot.get("project_id") or conversation.get("project") or "")
             if selected_mode in {"work", "auto"} and project_id:
-                legacy_root = self._board_project_path(snapshot.get("board") or {}, project_id)
-                if self._project_paths_overlap(root, legacy_root):
+                try:
+                    legacy_root = self._board_project_path(snapshot.get("board") or {}, project_id)
+                except OSError:
+                    legacy_root = next((
+                        Path(str(one["path"])).resolve()
+                        for one in (snapshot.get("board") or {}).get("projects", [])
+                        if isinstance(one, dict) and str(one.get("id") or "") == project_id
+                        and str(one.get("path") or "")
+                    ), None)
+                if legacy_root is not None and self._project_paths_overlap(root, legacy_root):
                     conflicts.append(f"legacy-run:{active.get('run_id')}")
         for path in self.swarm_goal_queue.active_project_paths():
-            legacy_root = Path(path).resolve(strict=True)
+            # A queued or paused project whose folder has since been moved or
+            # deleted is compared by its recorded place instead of raising.
+            legacy_root = Path(path).resolve()
             if self._project_paths_overlap(root, legacy_root):
                 conflicts.append("legacy-goal-queue:" + str(legacy_root))
         current_root = self.config.project_root.resolve()
@@ -3173,6 +3193,20 @@ class HarnessHTTPServer(ThreadingHTTPServer):
         ]
         return standing
 
+    @contextmanager
+    def pinned_project(self) -> Iterator[LoadedConfig]:
+        """Hold the current project in place for one provider turn; yield its config."""
+
+        with self.project_admission_lock:
+            config = self.config
+            with self._project_pins_lock:
+                self._project_pins += 1
+        try:
+            yield config
+        finally:
+            with self._project_pins_lock:
+                self._project_pins -= 1
+
     def move_to(self, where: str) -> dict[str, Any]:
         """Show a different project, without stopping and starting again.
 
@@ -3199,6 +3233,14 @@ class HarnessHTTPServer(ThreadingHTTPServer):
             raise HarnessError(
                 "A swarm board or chat command is being accepted, or another project "
                 "command is contacting a provider. Wait for it before moving projects."
+            )
+        with self._project_pins_lock:
+            pinned = self._project_pins
+        if pinned:
+            self.project_admission_lock.release()
+            raise HarnessError(
+                "A chat is contacting a provider for this project. Wait for its "
+                "answer, or stop it, before moving projects."
             )
         if self.pipeline_running:
             self.project_admission_lock.release()
@@ -3778,6 +3820,16 @@ class HarnessHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/email":
                 self._require_token()
                 self._json(self.server.email.snapshot())
+            elif parsed.path == "/api/email/notifications":
+                # Cheap in-memory read that every open page polls, whatever
+                # tab it shows; it never opens or creates the mail store.
+                self._require_token()
+                query = urllib.parse.parse_qs(parsed.query)
+                try:
+                    after = int(query["after"][0]) if "after" in query else None
+                except ValueError:
+                    after = None
+                self._json(self.server.email.notifications(after))
             elif parsed.path == "/api/bootstrap":
                 # This is the one call that hands out the session key, so it must
                 # come from the panel's own page. A browser always says where a
@@ -5340,7 +5392,10 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     held_goal = runtime.store.get(goal_id)
                     self.server.require_long_horizon_chat_binding(held_goal, body)
                     runtime._require_goal_authority(held_goal)
-                    runtime._require_agent_setup(held_goal)
+                    # Access is the user's decision. A changed provider setup
+                    # is reviewed separately (reconnect) and must never stop
+                    # the user from changing access; update_access ties the
+                    # new record to the goal's current agent bindings.
                     goal = runtime.store.update_access(goal_id,
                         expected_revision=body.get("expected_revision"), mode=body.get("mode"),
                         decision=body.get("decision"), command_digest=str(body.get("command_digest") or ""))
@@ -6844,10 +6899,11 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     str(body.get("request_id") or ""),
                 ))
             elif self.path == "/api/chat/say":
-                # The conversation has its own provider lock; admission also
-                # pins the current project until this provider turn finishes.
-                # This endpoint cannot run project commands or mutate project
-                # files, so copied-project execution authority is irrelevant.
+                # The conversation has its own provider lock; the turn pins the
+                # current project until it finishes, without holding admission
+                # for the whole reply. This endpoint cannot run project commands
+                # or mutate project files, so copied-project execution authority
+                # is irrelevant.
                 who = str(body.get("who") or "")
                 chat_key = f"talk:{who}"
                 # Claim the individual turn first so a duplicate request is
@@ -6855,8 +6911,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 # admission and silently becoming a second provider turn.
                 cancel_token = self.server.chat_cancellations.begin(chat_key)
                 try:
-                    with self.server.project_admission_lock:
-                        config = self.server.config
+                    with self.server.pinned_project() as config:
                         with cancellation.use(cancel_token):
                             answer = chat_lab.say(
                                 config, who, str(body.get("text") or ""),
@@ -6874,8 +6929,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 chat_key = "talk:everyone"
                 cancel_token = self.server.chat_cancellations.begin(chat_key)
                 try:
-                    with self.server.project_admission_lock:
-                        config = self.server.config
+                    with self.server.pinned_project() as config:
                         with cancellation.use(cancel_token):
                             answers = chat_lab.ask_everyone(
                                 config, str(body.get("text") or "")

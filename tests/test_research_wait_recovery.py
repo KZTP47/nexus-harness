@@ -69,12 +69,13 @@ class RecoveryProgressTests(unittest.TestCase):
         return progress.observe(held, step, binding=binding or {"route": "arbitrary-route-v1"},
             speaker_id="a", messages=[], normalize=long_horizon._semantic_tool_result)
 
-    def test_variant_errors_pause_after_restart_and_changed_route_resets(self):
+    def test_variant_errors_notify_after_restart_and_changed_route_resets(self):
         held = {}
         for n in range(5):
             held = self.observe(json.loads(json.dumps(held)), self.step(n))
-        self.assertEqual(held["state"], "paused")
-        self.assertIn("read_file", held["reason"])
+        # A notice for the agent, never a pause of its work.
+        self.assertEqual(held["state"], "repeating")
+        self.assertIn("read_file", held["notice"])
         self.assertEqual(self.observe(held, self.step(4)), held)
         self.assertEqual(self.observe(held, self.step(5), {"route": "different"})["state"], "tracking")
 

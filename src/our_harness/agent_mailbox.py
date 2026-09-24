@@ -61,6 +61,10 @@ class AgentMessage:
     last_attempt_at: str = ""
     acknowledged_at: str = ""
     last_error: str = ""
+    # The saved board the handoff was written on. Project ids such as
+    # "project-1" repeat on nearly every board, so a project id alone does not
+    # say whose mail this is.
+    workspace: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -142,7 +146,7 @@ def _payload_body(where: Path, one: dict[str, Any]) -> str:
 def _externalize_body(where: Path, one: dict[str, Any]) -> dict[str, Any]:
     """Move one queued canonical body out of the frequently rewritten index."""
 
-    if one.get("state") == "acknowledged":
+    if one.get("state") in _SETTLED:
         held = dict(one)
         if "body" in held:
             body = str(held.pop("body") or "")
@@ -194,19 +198,137 @@ def _write(where: Path, messages: list[dict[str, Any]]) -> None:
     }, indent=2) + "\n")
 
 
+# Finished with: answered, or left behind when the project's jobs changed. Only
+# these may fall off the end of the bounded history.
+_SETTLED = {"acknowledged", "superseded"}
+
+
 def _pruned(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Bound the history without silently discarding undelivered work."""
 
     if len(messages) <= MOST_MESSAGES:
         return messages
-    queued = [one for one in messages if one.get("state") != "acknowledged"]
-    acknowledged = [one for one in messages if one.get("state") == "acknowledged"]
+    queued = [one for one in messages if one.get("state") not in _SETTLED]
+    settled = [one for one in messages if one.get("state") in _SETTLED]
     if len(queued) > MOST_MESSAGES:
         raise MailboxError(
             "The agent mailbox is full of undelivered messages. Let the receiving "
             "agents catch up before starting another run."
         )
-    return acknowledged[-(MOST_MESSAGES - len(queued)):] + queued
+    # Counted from the front: at exactly the limit, "-0:" would have kept
+    # every settled message instead of none.
+    return settled[len(settled) - (MOST_MESSAGES - len(queued)):] + queued
+
+
+def _release_body(where: Path, one: dict[str, Any]) -> Path | None:
+    """Drop a settled message's text from the index; return its payload file."""
+
+    reference = str(one.get("body_ref") or "").strip()
+    payload = (
+        _payload_folder(where) / reference
+        if reference and Path(reference).name == reference else None
+    )
+    if "body" in one:
+        body = str(one.get("body") or "")
+        one["body_sha256"] = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        one["body_characters"] = len(body)
+    one.pop("body", None)
+    one.pop("body_ref", None)
+    one["body_removed_after_acknowledgement"] = True
+    return payload
+
+
+def _remove_unreferenced(where: Path, messages: list[dict[str, Any]], payloads: Iterable[Path]) -> None:
+    remaining_references = {
+        str(one.get("body_ref") or "") for one in messages
+        if one.get("state") not in _SETTLED and one.get("body_ref")
+    }
+    # Only after the settled metadata is durable, and only when no other
+    # queued fan-out delivery still refers to the same exact payload.
+    for payload in set(payloads):
+        if payload.name in remaining_references:
+            continue
+        try:
+            payload.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _supersede(
+    where: Path, messages: list[dict[str, Any]], current_goals: dict[str, str], workspace: str,
+    known_workspaces: set[str] | None = None,
+) -> tuple[int, list[Path]]:
+    """Settle queued mail that can never be delivered.
+
+    A changed job list is a changed goal, and mail is only ever delivered into
+    the goal it was written for, so mail for a project's earlier jobs can
+    never be delivered or acknowledged. Left queued it would count toward the
+    limit forever and eventually refuse every new handoff.
+
+    Which board wrote the mail decides whose earlier jobs they were:
+
+    - mail from this board (``workspace``) is settled when its project's jobs
+      changed;
+    - mail that names no board was written before mail named one, so the
+      project id is all there is to go on, as it was then;
+    - mail from a board that no longer exists (not in ``known_workspaces``,
+      when that is given) can never be opened again and is settled whatever
+      its project;
+    - mail from another saved board is left alone: its "project-1" is a
+      different project whose handoffs must survive until it is opened again.
+    """
+
+    count = 0
+    payloads: list[Path] = []
+    if not workspace:
+        return count, payloads
+    for one in messages:
+        if one.get("state") != "queued":
+            continue
+        written_on = str(one.get("workspace") or "")
+        project = str(one.get("project") or "")
+        changed = project in current_goals and one.get("shared_goal_id") != current_goals[project]
+        if written_on == workspace or not written_on:
+            if not changed:
+                continue
+        elif known_workspaces is None or written_on in known_workspaces:
+            continue
+        payload = _release_body(where, one)
+        if payload is not None:
+            payloads.append(payload)
+        one["state"] = "superseded"
+        one["superseded_at"] = _now()
+        one["last_error"] = ""
+        count += 1
+    return count, payloads
+
+
+def retire_superseded_goals(
+    where: Path, current_goals: dict[str, str], *, workspace: str = "",
+    known_workspaces: Iterable[str] | None = None,
+) -> int:
+    """Settle queued mail that can never be delivered; return how many.
+
+    ``workspace`` is the board being run and ``current_goals`` its projects'
+    goals. Mail for a project that is simply not on this board right now, or
+    that belongs to another saved board, is left alone. Hand in
+    ``known_workspaces`` (every board that can still be opened, this one
+    included) to also settle mail from boards that are gone.
+    """
+
+    wanted = {_clean(project): _clean(goal, 100) for project, goal in current_goals.items()
+              if _clean(project) and _clean(goal, 100)}
+    board = _clean(workspace, 100)
+    known = None if known_workspaces is None else {_clean(one, 100) for one in known_workspaces} | {board}
+    if not board or (not wanted and known is None):
+        return 0
+    with _lock:
+        messages = _read(where)
+        count, payloads = _supersede(where, messages, wanted, board, known)
+        if count:
+            _write(where, _pruned(messages))
+            _remove_unreferenced(where, messages, payloads)
+    return count
 
 
 def enqueue(
@@ -222,6 +344,7 @@ def enqueue(
     body: str,
     expects_reply: bool = True,
     thread_id: str = "",
+    workspace: str = "",
 ) -> AgentMessage:
     """Queue one handoff and return its durable identity."""
 
@@ -260,11 +383,18 @@ def enqueue(
         body=text,
         created_at=_now(),
         expects_reply=bool(expects_reply),
+        workspace=_clean(workspace, 100),
     )
     with _lock:
         messages = _read(where)
+        # This message says which jobs its project has now. Mail still queued
+        # for the project's earlier jobs can never be delivered, so it must
+        # not take up room this one needs.
+        _count, payloads = _supersede(
+            where, messages, {message.project: message.shared_goal_id}, message.workspace)
         messages.append(message.to_dict())
         _write(where, _pruned(messages))
+        _remove_unreferenced(where, messages, payloads)
     return message
 
 
@@ -321,6 +451,7 @@ def pending(
                 last_attempt_at=_clean(one.get("last_attempt_at"), 100),
                 acknowledged_at=_clean(one.get("acknowledged_at"), 100),
                 last_error=_clean(one.get("last_error"), LONGEST_ERROR),
+                workspace=_clean(one.get("workspace"), 100),
             ))
             delivered_characters += len(message_body)
         except (TypeError, ValueError) as exc:
@@ -368,33 +499,14 @@ def acknowledge(where: Path, message_ids: Iterable[str]) -> None:
         for one in messages:
             if one.get("message_id") not in wanted:
                 continue
-            reference = str(one.get("body_ref") or "").strip()
-            if reference and Path(reference).name == reference:
-                payloads_to_remove.append(_payload_folder(where) / reference)
-            if "body" in one:
-                body = str(one.get("body") or "")
-                one["body_sha256"] = hashlib.sha256(body.encode("utf-8")).hexdigest()
-                one["body_characters"] = len(body)
-            one.pop("body", None)
-            one.pop("body_ref", None)
-            one["body_removed_after_acknowledgement"] = True
+            payload = _release_body(where, one)
+            if payload is not None:
+                payloads_to_remove.append(payload)
             one["state"] = "acknowledged"
             one["acknowledged_at"] = _now()
             one["last_error"] = ""
         _write(where, _pruned(messages))
-        remaining_references = {
-            str(one.get("body_ref") or "") for one in messages
-            if one.get("state") != "acknowledged" and one.get("body_ref")
-        }
-        # Only after acknowledged metadata is durable, and only when no other
-        # queued fan-out delivery still refers to the same exact payload.
-        for payload in set(payloads_to_remove):
-            if payload.name in remaining_references:
-                continue
-            try:
-                payload.unlink(missing_ok=True)
-            except OSError:
-                pass
+        _remove_unreferenced(where, messages, payloads_to_remove)
 
 
 def status(where: Path) -> dict[str, int]:
@@ -419,6 +531,12 @@ def delivery_details(where: Path, *, active_message_ids: Iterable[str] = ()) -> 
     for one in messages:
         identity = str(one.get('message_id', ''))
         acknowledged = one.get('state') == 'acknowledged'
+        if one.get('state') == 'superseded':
+            result[identity] = {
+                'stage': 'superseded', 'age_seconds': 0, 'attention': False,
+                'label': 'Not delivered: the jobs for this project changed after it was written',
+            }
+            continue
         try:
             age = max(0, int((datetime.now() - datetime.fromisoformat(one['created_at'])).total_seconds()))
         except (ValueError, TypeError, KeyError):

@@ -16,6 +16,7 @@ const { WebChatManager } = require("./web-chats");
 const { DesktopSettingsStore } = require("./settings-store");
 const { DirectGoalOutbox } = require("./direct-goal-outbox");
 const { createShutdownCoordinator } = require("./shutdown");
+const { MailNotifier } = require("./mail-notifier");
 
 function readBuildInfo() {
   try {
@@ -43,6 +44,34 @@ let reviewedTrust = null;
 let desktopSettingsStore = null;
 let shutdownCoordinator = null;
 const pendingJsonExports = new Map();
+const mailToastPage = pageUrl("mail-toast.html");
+// A click on a mail card that arrives while the main page reloads (or before it
+// listens) waits here until the page takes it, so the email still opens.
+const MAIL_ACTIVATION_MS = 120000;
+let pendingMailActivation = null;
+// A held click belongs to the Nexus server (project) whose page raised it.
+function pageOrigin(url) {
+  try { return new URL(String(url || "")).origin; } catch (_error) { return ""; }
+}
+const mailNotifier = new MailNotifier({
+  electron,
+  page: mailToastPage,
+  preload: path.join(__dirname, "mail-toast-preload.js"),
+  // The pop-up shows one local page and nothing else: no navigation, no new
+  // windows, no permissions.
+  guard: (contents) => {
+    attachGuards(contents, { allowedTarget: (url) => url === mailToastPage, openExternally: () => {} });
+    contents.session.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
+  },
+  onActivate: (target) => {
+    if (!window || window.isDestroyed()) return;
+    if (window.isMinimized()) window.restore();
+    window.show();
+    window.focus();
+    pendingMailActivation = { target, at: Date.now(), origin: pageOrigin(window.webContents.getURL()) };
+    window.webContents.send("harness:mailNotificationActivated", target);
+  },
+});
 const ownsApplicationInstance = app.requestSingleInstanceLock();
 
 if (!ownsApplicationInstance) {
@@ -189,6 +218,8 @@ function pageUrl(name, parameters = {}) {
 }
 
 function showPage(name, parameters) {
+  // Leaving the project page: a held mail click no longer has a page to open it.
+  pendingMailActivation = null;
   if (window && !window.isDestroyed()) window.loadURL(pageUrl(name, parameters));
 }
 
@@ -273,6 +304,8 @@ async function openProject(chosen, options = {}) {
   chosen = remembered;
   reviewedTrust = null;
   repairAvailable = false;
+  // Mail cards on screen belong to the project being closed.
+  mailNotifier.close();
   showPage("starting.html", { project: path.basename(chosen) });
   try {
     const stopped = await server.stop();
@@ -361,7 +394,10 @@ function createWindow() {
   const createdWindow = window;
   window.on("closed", () => {
     abandonRendererExports();
-    if (window === createdWindow) window = null;
+    if (window === createdWindow) {
+      window = null;
+      mailNotifier.close();
+    }
   });
   window.on("enter-full-screen", () => {
     if (window && !window.isDestroyed()) {
@@ -789,6 +825,19 @@ ipcMain.handle("harness:appIconDataUrl", (event) => {
     return "";
   }
 });
+ipcMain.handle("harness:showMailNotification", (event, notice) => (
+  fromHarnessWindow(event) ? mailNotifier.show(notice) : false
+));
+ipcMain.handle("harness:takeMailNotificationActivation", (event) => {
+  if (!fromHarnessWindow(event)) return null;
+  const held = pendingMailActivation;
+  pendingMailActivation = null;
+  if (!held || Date.now() - held.at >= MAIL_ACTIVATION_MS) return null;
+  // Another project's page (or the starting page) never receives this click.
+  return held.origin && held.origin === pageOrigin(event.sender.getURL()) ? held.target : null;
+});
+ipcMain.on("mail-toast:resize", (event, height) => { mailNotifier.resize(event.sender, height); });
+ipcMain.on("mail-toast:activate", (event, id) => { mailNotifier.activate(event.sender, id); });
 ipcMain.handle("harness:focusHarness", (event) => {
   if (!fromHarnessWindow(event) || !window || window.isDestroyed()) return false;
   window.focus();
@@ -992,6 +1041,7 @@ app.on("window-all-closed", () => {
 });
 
 app.on("before-quit", (event) => {
+  mailNotifier.close();
   for (const identity of [...pendingJsonExports.keys()]) {
     try { closeLargeJsonExport(identity); } catch (_error) { /* target was never replaced */ }
   }

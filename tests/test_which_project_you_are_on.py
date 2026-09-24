@@ -509,6 +509,11 @@ class MovingToAnotherOne(ProjectTestCase):
                     with self.assertRaisesRegex(server.HarnessError, "contacting a provider"):
                         self.panel.move_to(str(self.second))
                     self.assertEqual(self.panel.config.project_root, self.first)
+                    # The turn pins the project without holding admission, so
+                    # board edits and other commands are not queued behind a
+                    # slow answer.
+                    self.assertTrue(self.panel.project_admission_lock.acquire(timeout=1))
+                    self.panel.project_admission_lock.release()
 
                     release.set()
                     self.assertTrue(response_started.wait(5))

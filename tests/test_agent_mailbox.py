@@ -18,7 +18,7 @@ class DurableAgentMailbox(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.where = Path(self.temporary.name) / "mailbox.json"
 
-    def queued(self, goal: str = "goal-one") -> mailbox.AgentMessage:
+    def queued(self, goal: str = "goal-one", workspace: str = "board-a") -> mailbox.AgentMessage:
         return mailbox.enqueue(
             self.where,
             shared_goal_id=goal,
@@ -29,6 +29,7 @@ class DurableAgentMailbox(unittest.TestCase):
             project="project-1",
             project_name="Nexus",
             body="Please check the provider boundary.",
+            workspace=workspace,
         )
 
     def test_a_failed_delivery_survives_for_the_next_run(self) -> None:
@@ -112,6 +113,132 @@ class DurableAgentMailbox(unittest.TestCase):
             receiver="agent-2",
             allowed_senders=["agent-1"],
         ), [])
+
+    def test_mail_for_a_projects_earlier_jobs_never_blocks_new_handoffs(self) -> None:
+        with mock.patch.object(mailbox, "MOST_MESSAGES", 3):
+            for number in range(3):
+                mailbox.enqueue(
+                    self.where, shared_goal_id="old-jobs", sender="agent-1",
+                    sender_name="Reviewer", receiver="agent-2", receiver_name="Writer",
+                    project="project-1", project_name="Nexus", body=f"old answer {number}",
+                    workspace="board-a",
+                )
+            # The jobs changed, so the goal changed: the full mailbox of old
+            # mail used to refuse every new handoff forever.
+            fresh = self.queued("new-jobs")
+            messages = json.loads(self.where.read_text(encoding="utf-8"))["messages"]
+            self.assertEqual(
+                sorted(one["state"] for one in messages),
+                ["queued", "superseded", "superseded"],
+            )
+            self.assertFalse(any("body_ref" in one for one in messages if one["state"] == "superseded"))
+            payloads = list((self.where.parent / f"{self.where.stem}-payloads").glob("*.txt"))
+            self.assertEqual(len(payloads), 1)
+            self.assertEqual(mailbox.pending(
+                self.where, shared_goal_id="old-jobs", receiver="agent-2",
+                allowed_senders=["agent-1"],
+            ), [])
+            self.assertEqual([one.message_id for one in mailbox.pending(
+                self.where, shared_goal_id="new-jobs", receiver="agent-2",
+                allowed_senders=["agent-1"],
+            )], [fresh.message_id])
+            details = mailbox.delivery_details(self.where)
+            self.assertEqual(
+                sorted(one["stage"] for one in details.values()),
+                ["queued", "superseded", "superseded"],
+            )
+            # Undelivered mail for the current goal is still never dropped.
+            self.queued("new-jobs")
+            self.queued("new-jobs")
+            with self.assertRaisesRegex(mailbox.MailboxError, "catch up"):
+                self.queued("new-jobs")
+
+    def test_retiring_earlier_jobs_leaves_other_and_absent_projects_alone(self) -> None:
+        stale = self.queued("old-jobs")
+        elsewhere = mailbox.enqueue(
+            self.where, shared_goal_id="their-goal", sender="agent-1",
+            sender_name="Reviewer", receiver="agent-2", receiver_name="Writer",
+            project="project-2", project_name="Other", body="other project",
+            workspace="board-a",
+        )
+        absent = mailbox.enqueue(
+            self.where, shared_goal_id="absent-goal", sender="agent-1",
+            sender_name="Reviewer", receiver="agent-2", receiver_name="Writer",
+            project="project-3", project_name="Not on this board", body="kept",
+            workspace="board-a",
+        )
+        retired = mailbox.retire_superseded_goals(
+            self.where, {"project-1": "new-jobs", "project-2": "their-goal"}, workspace="board-a",
+        )
+        self.assertEqual(retired, 1)
+        states = {one["message_id"]: one["state"]
+                  for one in json.loads(self.where.read_text(encoding="utf-8"))["messages"]}
+        self.assertEqual(states, {
+            stale.message_id: "superseded",
+            elsewhere.message_id: "queued",
+            absent.message_id: "queued",
+        })
+        self.assertEqual(mailbox.retire_superseded_goals(
+            self.where, {"project-1": "new-jobs"}, workspace="board-a",
+        ), 0)
+
+    def test_another_saved_boards_project_one_keeps_its_queued_handoffs(self) -> None:
+        # "project-1" is on nearly every board. Board B's run, or a handoff on
+        # board B, must not settle board A's queued mail for its own project-1.
+        board_a = self.queued("board-a-jobs", workspace="board-a")
+        self.assertEqual(mailbox.retire_superseded_goals(
+            self.where, {"project-1": "board-b-jobs"}, workspace="board-b"), 0)
+        self.queued("board-b-jobs", workspace="board-b")
+        self.assertEqual([one.message_id for one in mailbox.pending(
+            self.where, shared_goal_id="board-a-jobs", receiver="agent-2",
+            allowed_senders=["agent-1"],
+        )], [board_a.message_id], "board A's handoff is still there when board A is opened again")
+        # Board A's own changed jobs still settle it.
+        self.assertEqual(mailbox.retire_superseded_goals(
+            self.where, {"project-1": "board-a-new-jobs"}, workspace="board-a"), 1)
+
+    def test_mail_that_names_no_board_is_settled_by_its_project_as_before(self) -> None:
+        # Mail written before handoffs named their board must still drain, or a
+        # mailbox already full of it would refuse every new handoff for ever.
+        with mock.patch.object(mailbox, "MOST_MESSAGES", 3):
+            for _ in range(2):
+                self.queued("old-jobs", workspace="")
+            current = self.queued("current-jobs", workspace="")
+            self.assertEqual(mailbox.retire_superseded_goals(
+                self.where, {"project-1": "current-jobs"}, workspace="board-a"), 2)
+            self.assertEqual([one.message_id for one in mailbox.pending(
+                self.where, shared_goal_id="current-jobs", receiver="agent-2", allowed_senders=["agent-1"],
+            )], [current.message_id], "board-less mail still matching its project's goal stays deliverable")
+            # The full mailbox takes a new handoff: the jobs changed again.
+            self.queued("old-jobs", workspace="")
+            self.queued("new-jobs", workspace="board-a")
+        states = {one["message_id"]: one["state"]
+                  for one in json.loads(self.where.read_text(encoding="utf-8"))["messages"]}
+        self.assertEqual(states[current.message_id], "superseded")
+        self.assertEqual(sorted(states.values()).count("queued"), 1)
+
+    def test_mail_from_a_board_that_is_gone_is_settled_but_a_saved_boards_is_kept(self) -> None:
+        gone = self.queued("their-jobs", workspace="board-deleted")
+        saved = self.queued("their-jobs", workspace="board-saved")
+        mine = self.queued("my-jobs", workspace="board-a")
+        # Without the list of boards nothing from another board is touched.
+        self.assertEqual(mailbox.retire_superseded_goals(
+            self.where, {"project-1": "my-jobs"}, workspace="board-a"), 0)
+        self.assertEqual(mailbox.retire_superseded_goals(
+            self.where, {}, workspace="board-a", known_workspaces=["board-saved"]), 1)
+        states = {one["message_id"]: one["state"]
+                  for one in json.loads(self.where.read_text(encoding="utf-8"))["messages"]}
+        self.assertEqual(states, {gone.message_id: "superseded", saved.message_id: "queued",
+                                  mine.message_id: "queued"})
+
+    def test_pruning_at_exactly_the_limit_keeps_no_settled_history(self) -> None:
+        settled = [{"message_id": "done", "state": "acknowledged"},
+                   {"message_id": "left", "state": "superseded"}]
+        queued = [{"message_id": f"q{number}", "state": "queued"} for number in range(3)]
+        with mock.patch.object(mailbox, "MOST_MESSAGES", 3):
+            self.assertEqual(mailbox._pruned(settled + queued), queued)
+        with mock.patch.object(mailbox, "MOST_MESSAGES", 4):
+            self.assertEqual(mailbox._pruned(settled + queued), settled[1:] + queued)
 
     def test_a_removed_communication_line_cannot_receive_old_mail(self) -> None:
         self.queued()

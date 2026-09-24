@@ -8,8 +8,13 @@ import re
 from .models import HarnessError
 
 CONTRACT = "goal-directed-messages/v1"
-MAX_MESSAGES = 128
-MAX_CHARACTERS = 240_000
+# Per-message and pending-delivery bounds protect the machine and the
+# recipients' prompts. The lifetime history bound only protects the durable
+# goal record from runaway growth; no real goal reaches it.
+MAX_MESSAGE_CHARACTERS = 20_000
+MAX_PENDING_CHARACTERS = 240_000
+MAX_MESSAGES = 50_000
+MAX_HISTORY_CHARACTERS = 50_000_000
 
 
 def digest(value: object) -> str:
@@ -89,9 +94,9 @@ def submission(goal: dict, payload: dict) -> tuple[dict, str, str, str]:
             "The message recipient no longer owns this task; refresh before sending."
         )
     text = payload.get("text")
-    if not isinstance(text, str) or not text.strip() or len(text.strip()) > 20_000:
+    if not isinstance(text, str) or not text.strip() or len(text.strip()) > MAX_MESSAGE_CHARACTERS:
         raise HarnessError(
-            "Agent messages require between 1 and 20,000 text characters."
+            f"Agent messages require between 1 and {MAX_MESSAGE_CHARACTERS:,} text characters."
         )
     request = payload.get("request_id", "")
     if not isinstance(request, str) or (
@@ -187,17 +192,18 @@ def accept(goal: dict, payload: dict, *, safe_text: str) -> dict:
     ]
     if (
         len(all_records) >= MAX_MESSAGES
-        or sum(len(one["text"]) for one in all_records) + len(text) > MAX_CHARACTERS
+        or sum(len(one["text"]) for one in all_records) + len(text) > MAX_HISTORY_CHARACTERS
     ):
         raise HarnessError(
-            "This goal has reached its bounded directed-message history; fork it to continue. Nothing was discarded."
+            "This goal's saved directed-message history is too large to grow safely. "
+            "Nothing was discarded; continue in a follow-up goal."
         )
     active_text = sum(
         len(one["text"])
         for candidate in goal["tasks"]
         for one in pending(goal, candidate)
     )
-    if active_text + len(safe_text.strip()) > MAX_CHARACTERS:
+    if active_text + len(safe_text.strip()) > MAX_PENDING_CHARACTERS:
         raise HarnessError(
             "Pending private messages exceed the bounded delivery context. Let the recipients read them before sending more."
         )

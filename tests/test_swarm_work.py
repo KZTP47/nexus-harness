@@ -63,6 +63,17 @@ class SwarmWorkTests(unittest.TestCase):
             "talks_to": [{"one": "agent-1", "other": "agent-2"}],
         }
 
+    @staticmethod
+    def hints_met(evidence: dict) -> bool:
+        """Whether every inferred (advisory) and explicit requirement was met.
+
+        Under "Agents lead; Nexus only supports" (AGENTS.md) requirements that
+        Nexus infers from goal wording are hints: an unmet hint is reported in
+        ``advisory_unmet`` but never makes ``passed`` false.
+        """
+
+        return not evidence.get("unmet") and not evidence.get("advisory_unmet")
+
     def test_long_team_conversation_is_not_silently_tail_sliced(self) -> None:
         first = "BEGIN-OF-CONVERSATION:" + ("a" * 170_000)
         second = "END-OF-CONVERSATION:" + ("b" * 40_000)
@@ -144,19 +155,26 @@ class SwarmWorkTests(unittest.TestCase):
                     self.config, self.board, "agent-1", "Create output/result.txt",
                     allowed_write_roots=["output", "Z:/outside/project/output"],
                 )
-            with self.assertRaisesRegex(Exception, "outside the selected project"):
-                swarm_work.work_together(
-                    self.config, self.board, "agent-1",
-                    "Create all result files in:\nZ:\\outside\\project\\output",
-                )
             ask.assert_not_called()
+        # An outside destination named only in the goal text is not an
+        # explicit UI restriction: it is reported to the agents (Nexus still
+        # cannot write outside the project) instead of refusing the run. See
+        # tests/test_agents_lead_policy.py for the end-to-end check.
+        authority = swarm_work._path_authority_from_goal(
+            self.project, "Create all result files in:\nZ:\\outside\\project\\output",
+        )
+        self.assertEqual(["Z:\\outside\\project\\output"], authority["invalid_writable"])
+        with self.assertRaises(HarnessError):
+            swarm_work._validated_changes(
+                self.project, [{"path": "Z:/outside/project/output/x.txt", "content": "x"}],
+            )
 
     def test_project_work_rejects_oversized_or_control_text_before_any_side_effect(self) -> None:
-        with mock.patch.object(swarm_work, "_project_participants", side_effect=RuntimeError("boundary reached")) as participants:
+        with mock.patch.object(swarm_work, "_project_participants_and_left_out", side_effect=RuntimeError("boundary reached")) as participants:
             with self.assertRaisesRegex(RuntimeError, "boundary reached"):
                 swarm_work.work_together(self.config, self.board, "agent-1", "x" * 200_000)
             self.assertEqual(participants.call_count, 1)
-        with mock.patch.object(swarm_work, "_project_participants") as participants, mock.patch.object(chat, "ask_once") as ask:
+        with mock.patch.object(swarm_work, "_project_participants_and_left_out") as participants, mock.patch.object(chat, "ask_once") as ask:
             with self.assertRaisesRegex(Exception, "200,001 characters"):
                 swarm_work.work_together(self.config, self.board, "agent-1", "x" * 200_001)
             with self.assertRaisesRegex(Exception, "control character"):
@@ -343,7 +361,9 @@ class SwarmWorkTests(unittest.TestCase):
             "Claude", "Codex", "Claude", "Codex",
         ])
 
-    def test_unlimited_collaboration_stops_reworded_no_progress_cycles(self) -> None:
+    def test_reworded_no_progress_cycles_never_stop_the_team(self) -> None:
+        # Nexus never stops agents on a progress heuristic (AGENTS.md "Agents
+        # lead"); only the user's round limit ends this run.
         discussion_calls = 0
         remaining = [
             "Await the missing provider reply from the connected peer.",
@@ -367,16 +387,15 @@ class SwarmWorkTests(unittest.TestCase):
         with mock.patch.object(chat, "ask_once", side_effect=answer):
             result = swarm_work.collaborate(
                 self.config, self.board, "agent-1", "Solve this together",
-                round_limit=None,
+                round_limit=20,
             )
 
         self.assertFalse(result["goal_complete"])
-        self.assertEqual(result["discussion_rounds"], 14)
-        self.assertEqual(result["stopped_because"], "stalled")
-        self.assertIsNone(result["round_limit"])
-        self.assertTrue(any("no-progress cycle" in one for one in result["remaining"]))
+        self.assertEqual(result["discussion_rounds"], 20)
+        self.assertEqual(result["stopped_because"], "round_limit")
+        self.assertFalse(any("no-progress cycle" in one for one in result["remaining"]))
 
-    def test_incident_rewording_cannot_hide_the_same_file_capability_blocker(self) -> None:
+    def test_a_reworded_blocker_keeps_the_team_talking_until_the_user_limit(self) -> None:
         discussion_calls = 0
         rounds = [
             [
@@ -440,12 +459,12 @@ class SwarmWorkTests(unittest.TestCase):
             result = swarm_work.collaborate(
                 self.config, self.board, "agent-1",
                 "Claude, delegate a small verifiable task to GPT Codex.",
-                round_limit=None,
+                round_limit=16,
             )
 
-        self.assertEqual(result["discussion_rounds"], 14)
-        self.assertEqual(result["stopped_because"], "stalled")
-        self.assertEqual(discussion_calls, 28)
+        self.assertEqual(result["discussion_rounds"], 16)
+        self.assertEqual(result["stopped_because"], "round_limit")
+        self.assertEqual(discussion_calls, 32)
 
     def test_ask_once_preserves_user_cancellation_for_the_collaboration_engine(self) -> None:
         class StoppedProvider:
@@ -464,6 +483,39 @@ class SwarmWorkTests(unittest.TestCase):
         with mock.patch.object(chat, "create_provider", return_value=VanishedProvider()):
             with self.assertRaisesRegex(ProviderOutcomeUnknown, "unreconciled provider turn"):
                 chat.ask_once(self.config, "claude", "continue")
+
+    def test_a_reply_in_the_wrong_format_never_marks_the_route_broken(self) -> None:
+        class WrongShapeProvider:
+            structured_retry_is_safe = True
+
+            def complete(self, _request):
+                return ProviderResponse("not json at all")
+
+        response_format = ResponseFormat("shape-test", {
+            "type": "object", "properties": {"done": {"type": "boolean"}},
+            "required": ["done"], "additionalProperties": False,
+        })
+        remembered: list[str] = []
+        with mock.patch.object(chat, "create_provider", return_value=WrongShapeProvider()),                 mock.patch.object(chat, "_write_down_that_it_would_not",
+                                  side_effect=lambda _c, _r, why: remembered.append(why)):
+            with self.assertRaises(chat.StructuredReplyError) as raised:
+                chat.ask_once(self.config, "claude", "return JSON", response_format=response_format)
+
+        self.assertIn("wrong format", str(raised.exception))
+        # The provider answered, so its route stays ready: nothing is remembered.
+        self.assertEqual(remembered, [""])
+
+        class DownProvider:
+            def complete(self, _request):
+                raise HarnessError("connection refused")
+
+        remembered.clear()
+        with mock.patch.object(chat, "create_provider", return_value=DownProvider()),                 mock.patch.object(chat, "_write_down_that_it_would_not",
+                                  side_effect=lambda _c, _r, why: remembered.append(why)):
+            with self.assertRaises(chat.ChatError) as down:
+                chat.ask_once(self.config, "claude", "continue")
+        self.assertNotIsInstance(down.exception, chat.StructuredReplyError)
+        self.assertTrue(remembered and remembered[0])
 
     def test_schema_repair_journals_each_physical_provider_call(self) -> None:
         responses = iter([
@@ -625,13 +677,19 @@ class SwarmWorkTests(unittest.TestCase):
             "",
         )
 
-    def test_initial_provider_failure_preserves_the_successful_agent_answer(self) -> None:
+    def test_initial_provider_failure_continues_with_the_agents_that_answered(self) -> None:
+        # Item 2: one failed agent in the first answers no longer ends the
+        # collaboration with zero rounds. It is asked again each round and
+        # stops holding up consensus after three failures in a row.
         calls: list[tuple[str, object]] = []
 
         def answer(_config, route, _text, **kwargs):
             calls.append((route, kwargs.get("response_format")))
             if route == "codex":
                 raise swarm_work.HarnessError("the web submit control rejected the turn")
+            if kwargs.get("response_format") is swarm_work.DISCUSSION_FORMAT:
+                value = {"message": "done", "goal_complete": True, "remaining": []}
+                return {"text": json.dumps(value), "milliseconds": 1, "model": route}
             return {"text": "lead draft", "milliseconds": 1, "model": route}
 
         with mock.patch.object(chat, "ask_once", side_effect=answer):
@@ -640,19 +698,21 @@ class SwarmWorkTests(unittest.TestCase):
                 round_limit=None,
             )
 
-        self.assertEqual(len(calls), 2)
-        self.assertTrue(all(response_format is None for _route, response_format in calls))
+        self.assertEqual(sum(route == "codex" for route, _format in calls), 4)
+        self.assertEqual(result["discussion_rounds"], 3)
         self.assertEqual(result["answer"]["text"], "lead draft")
         self.assertEqual(result["stopped_because"], "partial_provider_failure")
         ledger = next((self.root / ".harness" / "chats").glob("*.collaboration.md"))
         saved = ledger.read_text(encoding="utf-8")
-        self.assertIn("partial_provider_failure", saved)
         self.assertIn("the web submit control rejected the turn", saved)
 
     def test_lead_failure_preserves_peer_answer_under_the_peer_identity(self) -> None:
-        def answer(_config, route, _text, **_kwargs):
+        def answer(_config, route, _text, **kwargs):
             if route == "claude":
                 raise HarnessError("lead provider rejected the turn")
+            if kwargs.get("response_format") is swarm_work.DISCUSSION_FORMAT:
+                value = {"message": "done", "goal_complete": True, "remaining": []}
+                return {"text": json.dumps(value), "milliseconds": 1, "model": route}
             return {"text": "peer answer", "milliseconds": 1, "model": route}
 
         with mock.patch.object(chat, "ask_once", side_effect=answer):
@@ -665,12 +725,15 @@ class SwarmWorkTests(unittest.TestCase):
         self.assertEqual(result["answer"]["speaker_id"], "agent-2")
         self.assertEqual(result["answer"]["speaker_name"], "Codex")
         self.assertFalse(result["goal_complete"])
-        self.assertTrue(result["remaining"])
+        self.assertEqual(result["stopped_because"], "partial_provider_failure")
 
     def test_arbitrary_adapter_exception_is_one_participant_failure_not_fanout_loss(self) -> None:
-        def answer(_config, route, _text, **_kwargs):
+        def answer(_config, route, _text, **kwargs):
             if route == "claude":
                 raise RuntimeError("adapter callback exploded")
+            if kwargs.get("response_format") is swarm_work.DISCUSSION_FORMAT:
+                value = {"message": "done", "goal_complete": True, "remaining": []}
+                return {"text": json.dumps(value), "milliseconds": 1, "model": route}
             return {"text": "peer survived", "milliseconds": 1, "model": route}
 
         with mock.patch.object(chat, "ask_once", side_effect=answer):
@@ -690,12 +753,11 @@ class SwarmWorkTests(unittest.TestCase):
         self.assertEqual(by_id["agent-2"]["status"], "answered")
         self.assertIn("adapter callback exploded", by_id["agent-1"]["provider_reason"])
         transcript = chat.read_it(self.config, "claude", "Claude")
-        self.assertEqual([one.phase for one in transcript], [
-            "user_prompt", "final_answer", "participant_outcome",
-        ])
-        self.assertEqual(
-            sum(one.text == "peer survived" for one in transcript), 1,
-        )
+        # The healthy peer kept working through the discussion; its final
+        # answer is saved once as the final answer.
+        self.assertEqual(transcript[-1].phase, "participant_outcome")
+        self.assertEqual(transcript[-2].phase, "final_answer")
+        self.assertEqual(transcript[-2].text, "peer survived")
 
     def test_zero_answers_are_a_durable_paused_participant_outcome(self) -> None:
         def answer(_config, route, _text, **_kwargs):
@@ -893,7 +955,7 @@ class SwarmWorkTests(unittest.TestCase):
                     round_limit=1,
                 )
 
-    def test_unlimited_collaboration_stops_a_two_state_oscillation(self) -> None:
+    def test_a_two_state_oscillation_is_not_stopped_by_nexus(self) -> None:
         discussion_calls = 0
 
         def answer(_config, route, _text, **kwargs):
@@ -912,14 +974,14 @@ class SwarmWorkTests(unittest.TestCase):
         with mock.patch.object(chat, "ask_once", side_effect=answer):
             result = swarm_work.collaborate(
                 self.config, self.board, "agent-1", "Agree on one design",
-                round_limit=None,
+                round_limit=18,
             )
 
         self.assertFalse(result["goal_complete"])
-        # Provider-authored alpha/beta wording is not authenticated progress,
-        # so it follows the conservative stable-state threshold.
-        self.assertEqual(result["discussion_rounds"], 14)
-        self.assertEqual(result["stopped_because"], "stalled")
+        # Alternating positions are the agents' business; only the user's
+        # round limit ends the run.
+        self.assertEqual(result["discussion_rounds"], 18)
+        self.assertEqual(result["stopped_because"], "round_limit")
 
     def test_unlimited_collaboration_can_reach_eighteen_advancing_checkpoints(self) -> None:
         discussion_calls = 0
@@ -1236,7 +1298,7 @@ class SwarmWorkTests(unittest.TestCase):
         self.assertIn("made-by-team.txt", transcript[-1].text)
         self.assertIn("deterministic checks passed", transcript[-1].text)
 
-    def test_incomplete_run_rolls_back_all_applied_transactions(self) -> None:
+    def test_incomplete_run_keeps_all_applied_transactions(self) -> None:
         target = self.project / "existing.txt"
         target.write_text("original\n", encoding="utf-8")
 
@@ -1267,10 +1329,14 @@ class SwarmWorkTests(unittest.TestCase):
             result = swarm_work.work_together(
                 self.config, self.board, "agent-1", "Edit existing.txt", round_limit=1,
             )
-        self.assertEqual(target.read_text(encoding="utf-8"), "original\n")
-        self.assertEqual(result["changed"], [])
-        self.assertEqual(result["mutation_recovery"]["status"], "rolled_back")
+        # Item 1: an incomplete run keeps the agents' applied work.
+        self.assertEqual(target.read_text(encoding="utf-8"), "changed by codex\n")
+        self.assertEqual(result["changed"], ["existing.txt"])
+        self.assertEqual(result["mutation_recovery"]["status"], "kept")
+        self.assertEqual(len(result["mutation_recovery"]["kept_transaction_ids"]), 2)
         self.assertFalse(result["goal_complete"])
+        self.assertEqual(result["status"], "incomplete")
+        self.assertTrue(result["resume_token"])
 
     def test_rollback_conflict_preserves_external_content_and_reports_uncertainty(self) -> None:
         target = self.project / "conflict.txt"
@@ -1298,7 +1364,7 @@ class SwarmWorkTests(unittest.TestCase):
                     "contribution": "edit", "message_to_lead": "ready",
                     "needs_files": [], "ready_to_execute": True, "remaining": [],
                 }
-            elif response_format is swarm_work.WORK_FORMAT:
+            elif response_format is swarm_work.EXECUTION_FORMAT:
                 work_calls += 1
                 if work_calls == 2:
                     raise cancellation.ChatCancelled(cancellation.STOPPED_MESSAGE)
@@ -1318,7 +1384,7 @@ class SwarmWorkTests(unittest.TestCase):
                 )
         self.assertFalse((self.project / "partial.txt").exists())
 
-    def test_provider_failure_after_staging_names_the_rolled_back_file_truthfully(self) -> None:
+    def test_provider_failure_after_staging_keeps_and_names_the_applied_file(self) -> None:
         work_calls = 0
         live_turns: list[dict[str, object]] = []
 
@@ -1332,7 +1398,7 @@ class SwarmWorkTests(unittest.TestCase):
                     "contribution": "create", "message_to_lead": "ready",
                     "needs_files": [], "ready_to_execute": True, "remaining": [],
                 }
-            elif response_format is swarm_work.WORK_FORMAT:
+            elif response_format is swarm_work.EXECUTION_FORMAT:
                 work_calls += 1
                 if work_calls == 2:
                     raise chat.ChatError("provider unavailable")
@@ -1350,19 +1416,21 @@ class SwarmWorkTests(unittest.TestCase):
         with mock.patch.object(chat, "ask_once", side_effect=answer):
             with self.assertRaisesRegex(
                 swarm_work.SwarmError,
-                r"rolled back.*index\.html.*provisional changes are not applied",
-            ):
+                r"kept the project changes.*index\.html.*resuming continues",
+            ) as paused:
                 swarm_work.work_together(
                     self.config, self.board, "agent-1", "Create index.html",
                     live_turn=live_turns.append,
                 )
 
-        self.assertFalse((self.project / "index.html").exists())
-        staged = "\n".join(str(one.get("text") or "") for one in live_turns)
-        self.assertIn("Staged provisionally", staged)
-        self.assertNotIn("Applied in this turn", staged)
+        # Item 1: a provider pause keeps the applied file and records it.
+        self.assertEqual((self.project / "index.html").read_text(encoding="utf-8"), "<p>complete</p>\n")
+        self.assertEqual(paused.exception.payload["changed"], ["index.html"])
+        self.assertEqual(paused.exception.payload["mutation_recovery"]["status"], "kept")
+        applied = "\n".join(str(one.get("text") or "") for one in live_turns)
+        self.assertIn("Applied in this turn", applied)
 
-    def test_crashed_process_saga_is_compensated_before_the_next_run(self) -> None:
+    def test_crashed_process_saga_keeps_its_applied_work_on_the_next_run(self) -> None:
         target = self.project / "crash.txt"
         target.write_text("before\n", encoding="utf-8")
         script = r'''import os, sys
@@ -1384,12 +1452,15 @@ os._exit(23)
         self.assertEqual(process.returncode, 23)
         self.assertEqual(target.read_text(encoding="utf-8"), "after\n")
         recovered = swarm_work._MutationSaga.recover_orphans(self.project)
-        self.assertEqual(recovered[0]["status"], "rolled_back")
-        self.assertEqual(target.read_text(encoding="utf-8"), "before\n")
+        # The fully applied transaction of the dead run is kept.
+        self.assertEqual(recovered[0]["status"], "recovered")
+        self.assertEqual(recovered[0]["kept_files"], ["crash.txt"])
+        self.assertEqual(target.read_text(encoding="utf-8"), "after\n")
         journal = json.loads(next(
             (self.project / ".harness" / "swarm-mutation-sagas").glob("*.json")
         ).read_text(encoding="utf-8"))
-        self.assertEqual(journal["phase"], "compensated")
+        self.assertEqual(journal["phase"], "recovered_after_crash")
+        self.assertEqual(swarm_work._MutationSaga.recover_orphans(self.project), [])
 
     def test_crash_after_mutation_commit_leaves_a_resumable_checkpoint(self) -> None:
         def answer(_config, route, _text, **kwargs):
@@ -1424,7 +1495,7 @@ os._exit(23)
                     (self.project / ".harness" / "swarm-mutation-sagas").glob("*.json")]
         self.assertTrue(any(value.get("phase") == "committed" for value in journals))
 
-    def test_saga_conflict_is_durable_and_blocks_later_mutation_recovery(self) -> None:
+    def test_saga_conflict_is_durable_and_acknowledged_by_the_next_run(self) -> None:
         target = self.project / "saga-conflict.txt"
         target.write_text("before\n", encoding="utf-8")
         saga = swarm_work._MutationSaga(self.project, "durable-conflict")
@@ -1438,8 +1509,65 @@ os._exit(23)
         result = saga.compensate("test_conflict")
         self.assertEqual(result["status"], "rollback_conflict")
         self.assertEqual(target.read_text(encoding="utf-8"), "external\n")
-        blocked = swarm_work._MutationSaga.recover_orphans(self.project)
-        self.assertEqual(blocked[0]["status"], "rollback_conflict")
+        acknowledged = swarm_work._MutationSaga.recover_orphans(self.project)
+        self.assertEqual(acknowledged[0]["status"], "rollback_conflict_acknowledged")
+        self.assertEqual(acknowledged[0]["conflicting_files"], ["saga-conflict.txt"])
+        self.assertIn("durable-conflict.json", acknowledged[0]["journal_path"])
+        self.assertEqual(target.read_text(encoding="utf-8"), "external\n")
+        # Reporting writes nothing: until a run has recorded the notice, the
+        # conflict is reported again.
+        self.assertEqual(
+            swarm_work._MutationSaga.recover_orphans(self.project)[0]["status"],
+            "rollback_conflict_acknowledged",
+        )
+        swarm_work._MutationSaga.acknowledge_conflicts(acknowledged)
+        self.assertEqual(swarm_work._MutationSaga.recover_orphans(self.project), [])
+
+    @unittest.skipUnless(os.name == "nt", "Windows process access rules")
+    def test_access_denied_live_owner_is_not_treated_as_dead(self) -> None:
+        # PID 4 (System) always exists and refuses PROCESS_QUERY_LIMITED_INFORMATION
+        # to a normal user, the same as an elevated Nexus owning a run.
+        finished = subprocess.Popen([sys.executable, "-c", "pass"])
+        finished.wait()
+        self.assertTrue(swarm_work._MutationSaga._owner_alive(4))
+        self.assertTrue(swarm_work._MutationSaga._owner_alive(os.getpid()))
+        self.assertFalse(swarm_work._MutationSaga._owner_alive(finished.pid))
+
+    def test_saga_complete_does_not_overwrite_a_compensation_outcome(self) -> None:
+        # work_together calls complete() after compensate("incomplete"); the
+        # conflict must stay durable so the next run still blocks on it.
+        target = self.project / "saga-terminal.txt"
+        target.write_text("before\n", encoding="utf-8")
+        saga = swarm_work._MutationSaga(self.project, "terminal-conflict")
+        transaction_id = FileTransaction.new_transaction_id()
+        saga.prepare(transaction_id)
+        manifest = FileTransaction(self.project).apply([ChangePlan(
+            "saga-terminal.txt", file_sha256(target), "after\n", reason="test"
+        )], transaction_id=transaction_id)
+        saga.applied(transaction_id, swarm_work._manifest_sha256(manifest))
+        target.write_text("external\n", encoding="utf-8")
+        self.assertEqual(saga.compensate("incomplete")["status"], "rollback_conflict")
+        saga.complete("no_mutations")
+        journal = json.loads(saga.path.read_text(encoding="utf-8"))
+        self.assertEqual(journal["phase"], "rollback_conflict")
+        self.assertNotIn("terminal-conflict", swarm_work._active_mutation_sagas)
+        acknowledged = swarm_work._MutationSaga.recover_orphans(self.project)
+        self.assertEqual(acknowledged[0]["status"], "rollback_conflict_acknowledged")
+
+        clean = self.project / "saga-clean.txt"
+        clean.write_text("before\n", encoding="utf-8")
+        rolled = swarm_work._MutationSaga(self.project, "terminal-compensated")
+        clean_id = FileTransaction.new_transaction_id()
+        rolled.prepare(clean_id)
+        clean_manifest = FileTransaction(self.project).apply([ChangePlan(
+            "saga-clean.txt", file_sha256(clean), "after\n", reason="test"
+        )], transaction_id=clean_id)
+        rolled.applied(clean_id, swarm_work._manifest_sha256(clean_manifest))
+        self.assertEqual(rolled.compensate("incomplete")["status"], "rolled_back")
+        rolled.complete("no_mutations")
+        rolled_journal = json.loads(rolled.path.read_text(encoding="utf-8"))
+        self.assertEqual(rolled_journal["phase"], "compensated")
+        self.assertEqual(rolled_journal["compensation_reason"], "incomplete")
 
     def test_project_work_reports_planning_validation_and_application(self) -> None:
         stages: list[str] = []
@@ -1535,7 +1663,7 @@ os._exit(23)
                     "message_to_lead": "Ready.", "needs_files": [],
                     "ready_to_execute": True, "remaining": [],
                 }
-            elif response_format is swarm_work.WORK_FORMAT:
+            elif response_format is swarm_work.EXECUTION_FORMAT:
                 work_routes.append(route)
                 if route == "claude":
                     value = {
@@ -1582,7 +1710,7 @@ os._exit(23)
         self.assertEqual(codex_execution[0].speaker_name, "Codex")
         self.assertIn("I populated my assigned file", codex_execution[0].text)
 
-    def test_two_no_change_team_passes_stop_even_when_feedback_is_paraphrased(self) -> None:
+    def test_no_change_passes_continue_until_the_user_limit(self) -> None:
         work_calls = 0
         verification_calls = 0
 
@@ -1600,7 +1728,7 @@ os._exit(23)
                     "message_to_lead": "ready", "needs_files": [],
                     "ready_to_execute": True, "remaining": [],
                 }
-            elif response_format is swarm_work.WORK_FORMAT:
+            elif response_format is swarm_work.EXECUTION_FORMAT:
                 work_calls += 1
                 value = {"reply": "Waiting for somebody else.", "changes": []}
             else:
@@ -1615,16 +1743,14 @@ os._exit(23)
         with mock.patch.object(chat, "ask_once", side_effect=answer):
             result = swarm_work.work_together(
                 self.config, self.board, "agent-1", "Create stalled.txt",
+                round_limit=16,
             )
 
         self.assertFalse(result["goal_complete"])
-        self.assertEqual(result["work_passes"], 14)
-        self.assertEqual(work_calls, 28)
-        self.assertEqual(verification_calls, 28)
-        self.assertIn(
-            "Nexus detected a repeated end-of-pass project state with unchanged deterministic verification; the run can be resumed after new evidence or user input.",
-            result["remaining"],
-        )
+        self.assertEqual(result["work_passes"], 16)
+        self.assertEqual(work_calls, 32)
+        self.assertEqual(verification_calls, 32)
+        self.assertEqual(result["stopped_because"], "round_limit")
 
     def test_project_phases_do_not_resend_the_original_question_as_each_new_turn(self) -> None:
         original = (
@@ -1648,7 +1774,7 @@ os._exit(23)
                     "message_to_lead": "ready", "needs_files": [],
                     "ready_to_execute": True, "remaining": [],
                 }
-            elif response_format is swarm_work.WORK_FORMAT:
+            elif response_format is swarm_work.EXECUTION_FORMAT:
                 work_calls += 1
                 value = {
                     "reply": "Created the requested marker." if work_calls == 1 else "No new change needed.",
@@ -1775,44 +1901,37 @@ os._exit(23)
                 }
             return {"text": json.dumps(value), "milliseconds": 1, "model": route}
 
-        with mock.patch.object(chat, "ask_once", side_effect=answer):
-            with self.assertRaisesRegex(
-                swarm_work.SwarmError,
-                "paused this collaboration.*not counted as agent speech",
-            ):
-                swarm_work.work_together(
-                    self.config, self.board, "agent-1", "Create marker.txt"
-                )
-
-        self.assertEqual(review_calls, 1)
+        # Read leniently, the review without ready_to_execute is "not ready".
+        # Nexus does not pause on the format; only the machine guard for a
+        # long stretch with no change at all ends the unlimited planning, and
+        # no file transaction is opened.
+        with mock.patch.object(chat, "ask_once", side_effect=answer), \
+                mock.patch.object(swarm_work, "NO_CHANGE_GUARD_ROUNDS", 4):
+            result = swarm_work.work_together(
+                self.config, self.board, "agent-1", "Create marker.txt"
+            )
+        self.assertEqual(result["stopped_because"], "plan_no_change_guard")
+        self.assertEqual(result["plan_rounds"], 4)
+        self.assertEqual(result["transaction_ids"], [])
         self.assertFalse((self.project / "marker.txt").exists())
-        ledger_paths = list(
-            (self.root / ".harness" / "chats").glob("*.collaboration.jsonl")
-        )
-        self.assertEqual(len(ledger_paths), 1)
-        events = [
-            json.loads(line)
-            for line in ledger_paths[0].read_text(encoding="utf-8").splitlines()
-        ]
-        self.assertTrue(any(
-            event.get("phase") == "provider_transport_failure"
-            and event.get("state", {}).get("stage") == "plan_review"
-            and event.get("state", {}).get("round") == 1
-            for event in events
-        ))
-        rendered = "\n".join(str(event.get("text") or "") for event in events)
-        self.assertIn("invalid nexus_board_plan_review_v1", rendered)
-        self.assertNotIn("Plan review failed", rendered)
+        self.assertTrue(any("without a new outcome" in one for one in result["remaining"]))
 
-    def test_structured_web_style_json_fence_is_accepted_but_schema_stays_strict(self) -> None:
+    def test_structured_web_style_json_fence_is_accepted_and_extra_keys_are_ignored(self) -> None:
         answer = {"text": "```json\n{\"contribution\":\"plan\",\"message_to_lead\":\"go\",\"needs_files\":[]}\n```"}
         decoded = swarm_work._decode(answer, "ChatGPT", swarm_work.PLAN_FORMAT)
         self.assertEqual(decoded["contribution"], "plan")
 
+        # Agents lead: one extra key never fails a reply; it is ignored.
+        extra = swarm_work._decode(
+            {"text": "```json\n{\"contribution\":\"plan\",\"message_to_lead\":\"go\",\"needs_files\":[],\"extra\":true}\n```"},
+            "ChatGPT", swarm_work.PLAN_FORMAT,
+        )
+        self.assertNotIn("extra", extra)
+        # The strict v1 contract that long-horizon goals decode is unchanged.
         with self.assertRaisesRegex(Exception, "unexpected extra"):
             swarm_work._decode(
-                {"text": "```json\n{\"contribution\":\"plan\",\"message_to_lead\":\"go\",\"needs_files\":[],\"extra\":true}\n```"},
-                "ChatGPT", swarm_work.PLAN_FORMAT,
+                {"text": "{\"reply\":\"r\",\"changes\":[],\"extra\":true}"},
+                "ChatGPT", swarm_work.WORK_FORMAT,
             )
 
     def test_work_tool_call_schema_accepts_each_closed_argument_contract(self) -> None:
@@ -1905,17 +2024,29 @@ os._exit(23)
         rejected = (
             "Here is JSON\n" + payload,
             "JSON " + payload,
-            "JSON\n" + payload + "\nFinished.",
             "note\nJSON\n" + payload,
         )
 
+        # Agents lead: prose before a JSON object that ends the reply is
+        # skipped, never a failed reply (item 3). An object followed by more
+        # prose is not unambiguously the reply (F5), so a correction is asked
+        # for. The strict v1 contract long-horizon goals decode still refuses
+        # all of these.
+        with self.assertRaises(swarm_work.StructuredCollaborationError):
+            swarm_work._decode(
+                {"text": "JSON\n" + payload + "\nFinished."}, "Web provider", swarm_work.PLAN_FORMAT,
+            )
         for text in rejected:
-            with self.subTest(text=text[:20]), self.assertRaises(
-                swarm_work.StructuredCollaborationError
-            ):
-                swarm_work._decode(
+            with self.subTest(text=text[:20]):
+                decoded = swarm_work._decode(
                     {"text": text}, "Web provider", swarm_work.PLAN_FORMAT,
                 )
+                self.assertEqual(decoded["contribution"], "plan")
+                with self.assertRaises(swarm_work.StructuredCollaborationError):
+                    swarm_work._decode(
+                        {"text": text.replace(payload, json.dumps({"reply": "r", "changes": []}))},
+                        "Web provider", swarm_work.WORK_FORMAT,
+                    )
 
     def test_fenced_web_file_payload_preserves_source_operators_exactly(self) -> None:
         source = "const width = Math.round(canvas.width * dpr);\nbody{height:100vh}"
@@ -1987,7 +2118,11 @@ os._exit(23)
                 self.config, board, "agent-1", "Create a marker file"
             )
 
-    def test_provider_consensus_never_becomes_complete_without_deterministic_verification(self) -> None:
+    def test_provider_consensus_completes_but_is_not_called_machine_verified(self) -> None:
+        # Policy "Agents lead; Nexus only supports": when no deterministic
+        # check can run (here: an unapproved discovered command), the agents'
+        # consensus completes the goal, and Nexus says it was not
+        # machine-verified instead of vetoing the work. No pass is invented.
         board = copy.deepcopy(self.board)
         board["projects"][0].pop("test_commands")
 
@@ -2014,11 +2149,14 @@ os._exit(23)
                 self.config, board, "agent-1", "Create claimed.txt",
             )
 
-        self.assertFalse(result["goal_complete"])
-        self.assertFalse(result["verified"])
-        self.assertEqual(result["status"], "applied_unverified")
-        self.assertEqual(result["verification_status"], "applied_unverified")
-        self.assertTrue(result["resume_token"])
+        self.assertTrue(result["goal_complete"])
+        self.assertTrue(result["verified"])
+        self.assertFalse(result["machine_verified"])
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["verification_status"], "agent_verified")
+        self.assertEqual(result["deterministic_verification"]["status"], "unavailable")
+        self.assertNotEqual(result["deterministic_verification"]["status"], "passed")
+        self.assertIn("not machine-verified", result["answer"]["text"])
         self.assertTrue((self.project / "claimed.txt").is_file())
 
     def test_complex_project_false_green_and_missing_runner_dependencies_fail_preflight(self) -> None:
@@ -2122,10 +2260,12 @@ os._exit(23)
             ["tests/UNIT/test_only.py"], None,
             requirement_contract=contract,
         )
-        self.assertEqual(result["status"], "failed")
-        self.assertEqual(result["basis"], "requirement_contract")
-        self.assertIn("traceability", result["reason"])
-        self.assertIn("durable_memory", result["reason"])
+        # Inferred artifact kinds are hints: they are reported, never a veto.
+        self.assertEqual(result["status"], "passed", result)
+        artifacts = result["requirement_evidence"]["artifacts"]
+        self.assertTrue(artifacts["passed"])
+        self.assertIn("traceability", artifacts["advisory_unmet"])
+        self.assertIn("durable_memory", artifacts["advisory_unmet"])
 
     def test_novel_coordinated_artifacts_get_independent_requirement_evidence(self) -> None:
         goal = "Create a PDF report and a deployment manifest"
@@ -2139,14 +2279,15 @@ os._exit(23)
         evidence = swarm_work._requirement_artifact_evidence(
             self.project, contract, ["audit-report.pdf"]
         )
-        self.assertFalse(evidence["passed"])
-        self.assertEqual(len(evidence["unmet"]), 1)
+        self.assertTrue(evidence["passed"])
+        self.assertFalse(self.hints_met(evidence))
+        self.assertEqual(len(evidence["advisory_unmet"]), 1)
         (self.project / "deployment-manifest.json").write_text("{}", encoding="utf-8")
         complete = swarm_work._requirement_artifact_evidence(
             self.project, contract,
             ["audit-report.pdf", "deployment-manifest.json"],
         )
-        self.assertTrue(complete["passed"], complete)
+        self.assertTrue(self.hints_met(complete), complete)
 
     def test_independent_artifact_contract_rejects_cross_kind_and_name_collisions(self) -> None:
         test_path = self.project / "tests" / "UNIT" / "test_only.py"
@@ -2168,8 +2309,8 @@ os._exit(23)
                 evidence = swarm_work._requirement_artifact_evidence(
                     self.project, contract, ["tests/UNIT/test_only.py"]
                 )
-                self.assertFalse(evidence["passed"], evidence)
-                self.assertTrue(any(one != "tests" for one in evidence["unmet"]), evidence)
+                self.assertFalse(self.hints_met(evidence), evidence)
+                self.assertTrue(any(one != "tests" for one in evidence["advisory_unmet"]), evidence)
 
         collision_goal = (
             "Create an upload bundle with a commit message and lasting Obsidian memory"
@@ -2181,8 +2322,8 @@ os._exit(23)
         collision_evidence = swarm_work._requirement_artifact_evidence(
             self.project, collision_contract, ["upload_bundle/commit-message-memory.md"]
         )
-        self.assertFalse(collision_evidence["passed"], collision_evidence)
-        self.assertIn("durable_memory", collision_evidence["unmet"])
+        self.assertFalse(self.hints_met(collision_evidence), collision_evidence)
+        self.assertIn("durable_memory", collision_evidence["advisory_unmet"])
 
         generic_contract = swarm_work._derive_requirement_contract(
             self.project, "Create a PDF report and a deployment manifest"
@@ -2191,13 +2332,13 @@ os._exit(23)
         one_generic = swarm_work._requirement_artifact_evidence(
             self.project, generic_contract, ["deployment-report.pdf"]
         )
-        self.assertFalse(one_generic["passed"], one_generic)
+        self.assertFalse(self.hints_met(one_generic), one_generic)
         (self.project / "deployment-manifest.json").write_text("{}", encoding="utf-8")
         two_generic = swarm_work._requirement_artifact_evidence(
             self.project, generic_contract,
             ["deployment-report.pdf", "deployment-manifest.json"],
         )
-        self.assertTrue(two_generic["passed"], two_generic)
+        self.assertTrue(self.hints_met(two_generic), two_generic)
 
         novel_contract = swarm_work._derive_requirement_contract(
             self.project, "Create a dependency provenance ledger"
@@ -2206,12 +2347,13 @@ os._exit(23)
         unrelated = swarm_work._requirement_artifact_evidence(
             self.project, novel_contract, ["unrelated.txt"]
         )
-        self.assertFalse(unrelated["passed"], unrelated)
+        self.assertFalse(self.hints_met(unrelated), unrelated)
+        self.assertTrue(unrelated["passed"], unrelated)
         (self.project / "dependency-provenance-ledger.json").write_text("{}", encoding="utf-8")
         named = swarm_work._requirement_artifact_evidence(
             self.project, novel_contract, ["dependency-provenance-ledger.json"]
         )
-        self.assertTrue(named["passed"], named)
+        self.assertTrue(self.hints_met(named), named)
 
     def test_local_imperative_artifacts_survive_long_background_and_ignore_relational_words(self) -> None:
         background = "Background context only. " + ("constraint detail " * 70)
@@ -2240,19 +2382,20 @@ os._exit(23)
                     near_miss = swarm_work._requirement_artifact_evidence(
                         self.project, contract, ["unrelated.txt"]
                     )
-                    self.assertTrue(positive["passed"], positive)
-                    self.assertFalse(near_miss["passed"], near_miss)
+                    self.assertTrue(self.hints_met(positive), positive)
+                    self.assertFalse(self.hints_met(near_miss), near_miss)
+                    self.assertTrue(near_miss["passed"], near_miss)
 
         multiple_goal = background + " Create an SBOM and a migration guide. " + background
         multiple = swarm_work._derive_requirement_contract(self.project, multiple_goal)
         generic = [one for one in multiple["requirements"] if one["kind"] == "generic_artifact"]
         self.assertEqual(len(generic), 2, multiple)
-        self.assertFalse(swarm_work._requirement_artifact_evidence(
+        self.assertFalse(self.hints_met(swarm_work._requirement_artifact_evidence(
             self.project, multiple, ["software-sbom.json"]
-        )["passed"])
-        self.assertTrue(swarm_work._requirement_artifact_evidence(
+        )))
+        self.assertTrue(self.hints_met(swarm_work._requirement_artifact_evidence(
             self.project, multiple, ["software-sbom.json", "migration-guide.md"]
-        )["passed"])
+        )))
 
     def test_terminal_punctuation_preserves_exact_filename_and_extension_contracts(self) -> None:
         cases = (
@@ -2264,7 +2407,7 @@ os._exit(23)
             ("Update parser.py?", "parser.py"),
             ("Update (parser.py)", "parser.py"),
             ("Update config.test.py.", "config.test.py"),
-            ("Update folder/dir with spaces/config.test.py.", "folder/dir with spaces/config.test.py"),
+            ('Update "folder/dir with spaces/config.test.py".', "folder/dir with spaces/config.test.py"),
             ("Create notes.md.", "notes.md"),
         )
         for goal, relative in cases:
@@ -2275,13 +2418,13 @@ os._exit(23)
                 path = self.project / Path(relative)
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text("changed", encoding="utf-8")
-                self.assertTrue(swarm_work._requirement_artifact_evidence(
+                self.assertTrue(self.hints_met(swarm_work._requirement_artifact_evidence(
                     self.project, contract, [relative]
-                )["passed"])
+                )))
                 near = str(Path(relative).with_suffix(".txt")).replace("\\", "/")
-                self.assertFalse(swarm_work._requirement_artifact_evidence(
+                self.assertFalse(self.hints_met(swarm_work._requirement_artifact_evidence(
                     self.project, contract, [near]
-                )["passed"])
+                )))
 
     def test_coordinated_imperative_verbs_do_not_become_phantom_artifact_nouns(self) -> None:
         cases = (
@@ -2307,9 +2450,9 @@ os._exit(23)
                 )
                 for relative in changed:
                     (self.project / relative).write_text("evidence", encoding="utf-8")
-                self.assertTrue(swarm_work._requirement_artifact_evidence(
+                self.assertTrue(self.hints_met(swarm_work._requirement_artifact_evidence(
                     self.project, contract, sorted(changed)
-                )["passed"])
+                )))
 
         noun_coordination = swarm_work._derive_requirement_contract(
             self.project, "Create a compliance report and a deployment guide."
@@ -2336,9 +2479,9 @@ os._exit(23)
                 self.assertEqual([["report"]], [one["artifact_terms"] for one in generic], contract)
                 self.assertNotIn(forbidden, str(contract).casefold())
                 (self.project / "findings-report.pdf").write_bytes(b"%PDF evidence")
-                self.assertTrue(swarm_work._requirement_artifact_evidence(
+                self.assertTrue(self.hints_met(swarm_work._requirement_artifact_evidence(
                     self.project, contract, ["findings-report.pdf"]
-                )["passed"])
+                )))
 
         for goal in (
             "Create a report and a findings log.",
@@ -2375,19 +2518,21 @@ os._exit(23)
                 self.assertEqual(1, len(generic), contract)
                 self.assertNotEqual(["project_effect"], [one["id"] for one in contract["requirements"]])
                 (self.project / relative).write_text("evidence", encoding="utf-8")
-                self.assertTrue(swarm_work._requirement_artifact_evidence(
+                self.assertTrue(self.hints_met(swarm_work._requirement_artifact_evidence(
                     self.project, contract, [relative]
-                )["passed"])
-                self.assertFalse(swarm_work._requirement_artifact_evidence(
+                )))
+                self.assertFalse(self.hints_met(swarm_work._requirement_artifact_evidence(
                     self.project, contract, ["unrelated.txt"]
-                )["passed"])
+                )))
 
     def test_explicit_goal_paths_support_spaces_unicode_and_extensionless_names(self) -> None:
+        # Spaced names are paths only when quoted; unquoted, only the
+        # well-formed file token is taken ("release notes.md" -> "notes.md").
         cases = (
-            ("Update release notes.md.", "release notes.md"),
+            ("Update release notes.md.", "notes.md"),
             ('Update "release notes.md".', "release notes.md"),
-            ("Update release notes.md; preserve formatting", "release notes.md"),
-            ("Update folder/dir with spaces/config.test.py.", "folder/dir with spaces/config.test.py"),
+            ('Update "release notes.md"; preserve formatting', "release notes.md"),
+            ('Update "folder/dir with spaces/config.test.py".', "folder/dir with spaces/config.test.py"),
             ("Update Makefile.", "Makefile"),
             ("Update Dockerfile.", "Dockerfile"),
             ("Update résumé.md.", "résumé.md"),
@@ -2402,13 +2547,13 @@ os._exit(23)
                 target = self.project / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text("changed", encoding="utf-8")
-                self.assertTrue(swarm_work._requirement_artifact_evidence(
+                self.assertTrue(self.hints_met(swarm_work._requirement_artifact_evidence(
                     self.project, contract, [relative]
-                )["passed"])
+                )))
                 near = "notes.md" if relative == "release notes.md" else "unrelated.txt"
-                self.assertFalse(swarm_work._requirement_artifact_evidence(
+                self.assertFalse(self.hints_met(swarm_work._requirement_artifact_evidence(
                     self.project, contract, [near]
-                )["passed"])
+                )))
 
         for reference in (
             "Update https://example.com/file.md",
@@ -2419,9 +2564,12 @@ os._exit(23)
                 self.assertEqual([], swarm_work._goal_named_paths(reference))
 
     def test_named_path_roles_separate_required_effects_from_protected_references(self) -> None:
+        # Reviewing a file never protects it; only explicit wording does.
+        reviewed = swarm_work._goal_path_roles("Review reference.md and update parser.py")
+        self.assertEqual(["parser.py"], reviewed["effects"], reviewed)
+        self.assertEqual([], reviewed["protected"], reviewed)
         cases = (
             ("Do not change reference.md; update parser.py.", ["parser.py"], ["reference.md"]),
-            ("Review reference.md and update parser.py", ["parser.py"], ["reference.md"]),
             ("Update parser.py without changing API.md", ["parser.py"], ["API.md"]),
             ("Using reference.md as a read-only reference, update parser.py", ["parser.py"], ["reference.md"]),
             ("Fix parser.py; review notes.md, but do not modify notes.md.", ["parser.py"], ["notes.md"]),
@@ -2440,9 +2588,9 @@ os._exit(23)
                 ]
                 self.assertEqual(effects, exact, contract)
                 self.assertEqual(protected, contract["protected_paths"], contract)
-                self.assertTrue(swarm_work._requirement_artifact_evidence(
+                self.assertTrue(self.hints_met(swarm_work._requirement_artifact_evidence(
                     self.project, contract, effects
-                )["passed"])
+                )))
                 violated = swarm_work._requirement_artifact_evidence(
                     self.project, contract, effects + protected
                 )
@@ -2502,25 +2650,32 @@ os._exit(23)
                 self.assertFalse(any("and" in one["artifact_terms"] for one in generic), generic)
                 for relative in changed:
                     (self.project / relative).write_text("evidence", encoding="utf-8")
-                self.assertTrue(swarm_work._requirement_artifact_evidence(
+                self.assertTrue(self.hints_met(swarm_work._requirement_artifact_evidence(
                     self.project, contract, changed
-                )["passed"])
-                self.assertFalse(swarm_work._requirement_artifact_evidence(
+                )))
+                self.assertFalse(self.hints_met(swarm_work._requirement_artifact_evidence(
                     self.project, contract, changed[:-1]
-                )["passed"])
+                )))
 
     def test_goal_path_spans_are_longest_coordinated_and_fail_closed(self) -> None:
+        # Only well-formed path tokens become paths: a name with spaces must be
+        # quoted, so unquoted prose around a path is never absorbed into it.
         cases = (
             ('Update "docs.v2/release notes.md".', ["docs.v2/release notes.md"]),
-            ("Update docs.v2/release notes.md.", ["docs.v2/release notes.md"]),
             ("Update .github/workflows/TEST-ci.yml.", [".github/workflows/TEST-ci.yml"]),
             (
-                "Create docs/release notes.md and docs/setup guide.md.",
+                'Create "docs/release notes.md" and "docs/setup guide.md".',
                 ["docs/release notes.md", "docs/setup guide.md"],
             ),
             ("Fix the bug. Review notes.md", ["notes.md"]),
-            ("Update My Report v2.1.md.", ["My Report v2.1.md"]),
+            ('Update "My Report v2.1.md".', ["My Report v2.1.md"]),
         )
+        for goal, not_absorbed in (
+            ("Update docs.v2/release notes.md.", "docs.v2/release notes.md"),
+            ("Create docs/release notes.md and docs/setup guide.md.", "docs/release notes.md"),
+        ):
+            with self.subTest(unquoted=goal):
+                self.assertNotIn(not_absorbed, swarm_work._goal_named_paths(goal))
         for goal, expected in cases:
             with self.subTest(goal=goal):
                 self.assertEqual(expected, swarm_work._goal_named_paths(goal))
@@ -2530,15 +2685,18 @@ os._exit(23)
                     for path in one["effect_paths"]
                 ]
                 if goal.startswith("Fix the bug"):
+                    # A reviewed file is neither a required effect nor protected.
                     self.assertEqual([], exact)
-                    self.assertEqual(["notes.md"], contract["protected_paths"])
+                    self.assertEqual([], contract["protected_paths"])
                 else:
                     self.assertEqual(expected, exact, contract)
 
+        # Unsafe spellings never refuse the goal (item 8); they never become
+        # a named path either.
         for goal in ("Update ../outside.md.", r"Update ..\outside.md", "Update file.md:stream"):
             with self.subTest(unsafe=goal):
-                with self.assertRaises(HarnessError):
-                    swarm_work._goal_named_paths(goal)
+                named = swarm_work._goal_named_paths(goal)
+                self.assertFalse(any(".." in one or ":" in one for one in named), named)
 
     def test_artifact_complements_are_content_and_named_files_are_exact(self) -> None:
         cases = (
@@ -2551,12 +2709,12 @@ os._exit(23)
                 generic = [one for one in contract["requirements"] if one["kind"] == "generic_artifact"]
                 self.assertEqual([terms], [one["artifact_terms"] for one in generic], contract)
                 (self.project / "report.pdf").write_bytes(b"%PDF")
-                self.assertTrue(swarm_work._requirement_artifact_evidence(
+                self.assertTrue(self.hints_met(swarm_work._requirement_artifact_evidence(
                     self.project, contract, ["report.pdf"]
-                )["passed"])
-                self.assertFalse(swarm_work._requirement_artifact_evidence(
+                )))
+                self.assertFalse(self.hints_met(swarm_work._requirement_artifact_evidence(
                     self.project, contract, ["findings.txt"]
-                )["passed"])
+                )))
 
         named = swarm_work._derive_requirement_contract(
             self.project, "Create a report named final-report.md."
@@ -2574,25 +2732,27 @@ os._exit(23)
         self.assertEqual(0, ignored.returncode, ignored.stderr)
 
     def test_clause_roles_cover_reference_preservation_and_transfer_semantics(self) -> None:
+        # Only explicit preserve/negation wording protects a path. A reference,
+        # a consulted file, or a copy/replace source is merely mentioned.
         cases = (
             ("Update app.py, but preserve README.md unchanged.", ["app.py"], ["README.md"]),
             ("Update app.py and keep README.md unchanged.", ["app.py"], ["README.md"]),
             ("Update app.py and leave README.md untouched.", ["app.py"], ["README.md"]),
-            ("Fix parser.py and use notes.md only as reference.", ["parser.py"], ["notes.md"]),
-            ("Use reference.md to update parser.py.", ["parser.py"], ["reference.md"]),
-            ("Consult notes.md as reference, then fix parser.py.", ["parser.py"], ["notes.md"]),
-            ("Read notes.md as reference and update parser.py.", ["parser.py"], ["notes.md"]),
-            ("Fix parser.py using notes.md as reference.", ["parser.py"], ["notes.md"]),
-            ("Update parser.py from notes.md.", ["parser.py"], ["notes.md"]),
-            ("Fix parser.py based on notes.md.", ["parser.py"], ["notes.md"]),
-            ("Fix parser.py after reviewing notes.md.", ["parser.py"], ["notes.md"]),
+            ("Fix parser.py and use notes.md only as reference.", ["parser.py"], []),
+            ("Use reference.md to update parser.py.", ["parser.py"], []),
+            ("Consult notes.md as reference, then fix parser.py.", ["parser.py"], []),
+            ("Read notes.md as reference and update parser.py.", ["parser.py"], []),
+            ("Fix parser.py using notes.md as reference.", ["parser.py"], []),
+            ("Update parser.py from notes.md.", ["parser.py"], []),
+            ("Fix parser.py based on notes.md.", ["parser.py"], []),
+            ("Fix parser.py after reviewing notes.md.", ["parser.py"], []),
             ("Fix parser.py with notes.md as a read-only reference.", ["parser.py"], ["notes.md"]),
             ("Fix parser.py without changing API.md.", ["parser.py"], ["API.md"]),
-            ("Update parser.py, not API.md.", ["parser.py"], ["API.md"]),
-            ("Rename old name.md to new name.md.", ["old name.md", "new name.md"], []),
-            ("Move old name.md to new name.md.", ["old name.md", "new name.md"], []),
-            ("Replace old name.md with new name.md.", ["old name.md"], ["new name.md"]),
-            ("Copy source file.md to destination file.md.", ["destination file.md"], ["source file.md"]),
+            ("Update parser.py, not API.md.", ["parser.py"], []),
+            ("Rename old-name.md to new-name.md.", ["old-name.md", "new-name.md"], []),
+            ("Move old-name.md to new-name.md.", ["old-name.md", "new-name.md"], []),
+            ("Replace old-name.md with new-name.md.", ["old-name.md"], []),
+            ("Copy source-file.md to destination-file.md.", ["destination-file.md"], []),
         )
         for goal, effects, protected in cases:
             with self.subTest(goal=goal):
@@ -2622,11 +2782,16 @@ os._exit(23)
                     for path in one["effect_paths"]
                 ]
                 self.assertEqual(["parser.py"], exact, contract)
-                self.assertFalse(swarm_work._goal_effect_evidence(
-                    self.project, goal, ["unrelated.py"]
-                )["passed"])
+                # The named target is a hint: leaving it alone is reported,
+                # not a veto on the agents' own judgement.
+                effect = swarm_work._goal_effect_evidence(self.project, goal, ["unrelated.py"])
+                self.assertTrue(effect["passed"], effect)
+                self.assertEqual(["parser.py"], effect["unchanged_hints"])
 
-    def test_informational_questions_and_advice_are_read_only(self) -> None:
+    def test_informational_questions_and_advice_are_not_read_only_runs(self) -> None:
+        # A question never forbids changes and never demands them either:
+        # nothing is mandatory, a no-change answer completes, and a change
+        # the agents decide on is allowed.
         for goal in (
             "Can parser.py create reports?",
             "Does parser.py need a fix?",
@@ -2637,13 +2802,20 @@ os._exit(23)
             "Tell me whether to update parser.py.",
         ):
             with self.subTest(goal=goal):
-                self.assertEqual("read_only", swarm_work._goal_intent(goal))
+                self.assertNotEqual("read_only", swarm_work._goal_intent(goal))
                 contract = swarm_work._derive_requirement_contract(self.project, goal)
-                self.assertEqual([], contract["requirements"], contract)
-                self.assertEqual([], swarm_work._explicit_created_artifacts(goal))
+                self.assertFalse(any(one.get("mandatory") for one in contract["requirements"]), contract)
+                self.assertEqual([], contract["protected_paths"], contract)
                 self.assertTrue(swarm_work._goal_effect_evidence(
                     self.project, goal, []
                 )["passed"])
+                self.assertTrue(swarm_work._goal_effect_evidence(
+                    self.project, goal, ["parser.py"]
+                )["passed"])
+        explicit = "Explain how to create a report from parser.py. Do not change anything."
+        self.assertEqual("read_only", swarm_work._goal_intent(explicit))
+        self.assertEqual([], swarm_work._derive_requirement_contract(self.project, explicit)["requirements"])
+        self.assertFalse(swarm_work._goal_effect_evidence(self.project, explicit, ["parser.py"])["passed"])
 
     def test_implementation_purpose_infinitives_do_not_create_output_artifacts(self) -> None:
         for goal in (
@@ -2702,8 +2874,11 @@ os._exit(23)
             self.config, self.project, stale, goal, ["retry.py"], None,
             requirement_contract=contract,
         )
-        self.assertEqual("failed", negative["status"], negative)
-        self.assertEqual("requirement_execution_evidence", negative["basis"], negative)
+        # Behaviour receipts are a bonus Nexus reports; missing ones never
+        # veto completion. Self-asserted stdout still proves nothing.
+        self.assertEqual("passed", negative["status"], negative)
+        self.assertIn(behavior["id"], negative["requirement_evidence"]["execution"]["advisory_unmet"])
+        self.assertFalse(negative["requirement_evidence"]["execution"]["behavior_proof"])
 
         changed_hash = __import__("hashlib").sha256(
             json.dumps(["retry.py"], separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -2712,8 +2887,9 @@ os._exit(23)
             self.config, self.project, project_for(changed_hash), goal, ["retry.py"], None,
             requirement_contract=contract,
         )
-        self.assertEqual("failed", positive["status"], positive)
+        self.assertEqual("passed", positive["status"], positive)
         self.assertFalse(positive["requirement_evidence"]["execution"]["behavior_proof"])
+        self.assertIn(behavior["id"], positive["requirement_evidence"]["execution"]["advisory_unmet"])
 
     def test_unsafe_path_shapes_and_protected_effect_conflicts_fail_closed(self) -> None:
         for goal in (
@@ -2723,8 +2899,11 @@ os._exit(23)
             r"Update docs\\\\notes.md.",
         ):
             with self.subTest(goal=goal):
-                with self.assertRaises(HarnessError):
-                    swarm_work._goal_named_paths(goal)
+                named = swarm_work._goal_named_paths(goal)
+                self.assertFalse(any(
+                    ".." in one or ":" in one or "//" in one or "\\" in one for one in named
+                ), named)
+                self.assertTrue(swarm_work._compile_goal_spec(self.project, goal)["ignored_path_tokens"])
 
         coordinated = swarm_work._derive_requirement_contract(
             self.project, "Update config.py, .env, and README.md."
@@ -2735,14 +2914,21 @@ os._exit(23)
         ]
         self.assertEqual(["config.py", "README.md", ".env"], exact, coordinated)
 
+        # A plan that names a protected path is only a hint: it never raises.
+        # The protection itself is enforced when an agent tries to write it.
         protected_goal = "Fix parser.py using notes.md as a read-only reference."
-        with self.assertRaisesRegex(HarnessError, "conflicts with protected"):
-            swarm_work._derive_requirement_contract(
-                self.project, protected_goal, required_effect_paths=["notes.md"]
-            )
-        with self.assertRaisesRegex(HarnessError, "conflicts with protected"):
-            swarm_work._goal_effect_evidence(
-                self.project, protected_goal, ["parser.py"], required_effect_paths=["notes.md"]
+        contract = swarm_work._derive_requirement_contract(
+            self.project, protected_goal, required_effect_paths=["notes.md"]
+        )
+        self.assertEqual(["notes.md"], contract["protected_paths"])
+        self.assertEqual([], contract["planned_effect_paths"])
+        self.assertTrue(swarm_work._goal_effect_evidence(
+            self.project, protected_goal, ["parser.py"], required_effect_paths=["notes.md"]
+        )["passed"])
+        with self.assertRaisesRegex(HarnessError, "protected"):
+            swarm_work._validated_changes(
+                self.project, [{"path": "notes.md", "content": "x"}],
+                protected_paths=contract["protected_paths"],
             )
 
     def test_complex_contract_has_no_procedural_phantom_artifacts_and_exact_ci_path_is_exact(self) -> None:
@@ -2775,8 +2961,9 @@ os._exit(23)
             {"requirements": [ci_requirement]},
             [],
         )
-        self.assertTrue(present["passed"], present)
-        self.assertFalse(absent["passed"], absent)
+        self.assertTrue(self.hints_met(present), present)
+        self.assertFalse(self.hints_met(absent), absent)
+        self.assertTrue(absent["passed"], absent)
 
         deliverables = {
             "repository variants/qa workspace/tests/UNIT/test_unit.py": (
@@ -2802,13 +2989,13 @@ os._exit(23)
         ideal = swarm_work._requirement_artifact_evidence(
             self.project, contract, list(deliverables)
         )
-        self.assertTrue(ideal["passed"], ideal)
+        self.assertTrue(self.hints_met(ideal), ideal)
         missing_ci = swarm_work._requirement_artifact_evidence(
             self.project, contract,
             [path for path in deliverables if path != ci_relative],
         )
-        self.assertFalse(missing_ci["passed"], missing_ci)
-        self.assertIn(ci_requirement["id"], missing_ci["unmet"])
+        self.assertFalse(self.hints_met(missing_ci), missing_ci)
+        self.assertIn(ci_requirement["id"], missing_ci["advisory_unmet"])
 
     def test_provider_claims_cannot_terminalize_multi_artifact_goal_and_contract_survives_resume(self) -> None:
         goal = (
@@ -2816,6 +3003,7 @@ os._exit(23)
             "an upload bundle, and lasting Obsidian memory"
         )
         made_test = False
+        agree = False
 
         def answer(_config, route, _text, **kwargs):
             nonlocal made_test
@@ -2825,7 +3013,11 @@ os._exit(23)
             elif response_format is swarm_work.PLAN_REVIEW_FORMAT:
                 value = {"contribution": "reviewed all", "message_to_lead": "ready", "needs_files": [], "effect_paths": [], "ready_to_execute": True, "remaining": []}
             elif response_format is swarm_work.WORK_VERIFICATION_FORMAT:
-                value = {"goal_complete": True, "feedback": "Everything is complete.", "remaining": []}
+                value = (
+                    {"goal_complete": True, "feedback": "Everything is complete.", "remaining": []}
+                    if agree else
+                    {"goal_complete": False, "feedback": "Not yet.", "remaining": ["finish it"]}
+                )
             else:
                 changes = []
                 if not made_test:
@@ -2838,15 +3030,24 @@ os._exit(23)
                 value = {"reply": "All requested artifacts are complete.", "changes": changes}
             return {"text": json.dumps(value), "milliseconds": 1, "model": route}
 
+        # Provider claims alone still cannot complete while the agents
+        # disagree. Once they agree, inferred artifact kinds (traceability,
+        # LangGraph, upload bundle, memory) are hints: reported, never a veto.
         with mock.patch.object(chat, "ask_once", side_effect=answer):
-            first = swarm_work.work_together(self.config, self.board, "agent-1", goal)
+            first = swarm_work.work_together(
+                self.config, self.board, "agent-1", goal, round_limit=1,
+            )
+            agree = True
+            made_test = False
             second = swarm_work.work_together(
                 self.config, self.board, "agent-1", goal,
                 resume_session_id=first["resume_token"],
             )
         self.assertFalse(first["goal_complete"])
-        self.assertFalse(second["goal_complete"])
-        self.assertIn(first["status"], {"needs_verification", "applied_unverified"})
+        self.assertTrue(first["resume_token"])
+        self.assertTrue(second["goal_complete"], second["remaining"])
+        advisory = second["deterministic_verification"]["requirement_evidence"]["artifacts"]["advisory_unmet"]
+        self.assertIn("traceability", advisory)
         ledger = CollaborationLedger(
             self.config, "claude", "Claude", session_id=first["resume_token"]
         )
@@ -2873,9 +3074,12 @@ os._exit(23)
             self.config, self.project, self.board["projects"][0], goal,
             ["langgraph_notes.md", "test_langgraph_placeholder.py"], None,
         )
-        self.assertEqual(negative["status"], "failed", negative)
-        self.assertEqual(negative["basis"], "requirement_execution_evidence", negative)
+        # Names are still no proof, but a missing proof is reported, not a veto.
+        self.assertEqual(negative["status"], "passed", negative)
         self.assertFalse(negative["requirement_evidence"]["execution"]["behavior_proof"])
+        self.assertIn(
+            "langgraph_enforcement", negative["requirement_evidence"]["execution"]["advisory_unmet"],
+        )
 
         command = [
             sys.executable, "-c",
@@ -3012,7 +3216,7 @@ os._exit(23)
                     "needs_files": [], "effect_paths": ["provider-retry.txt"],
                     "ready_to_execute": True, "remaining": [],
                 }
-            elif response_format is swarm_work.WORK_FORMAT:
+            elif response_format is swarm_work.EXECUTION_FORMAT:
                 value = {
                     "reply": "created", "changes": ([{
                         "path": "provider-retry.txt", "content": "recovered\n",
@@ -3069,6 +3273,9 @@ os._exit(23)
         self.assertEqual(result["duplicates"][0]["agents"], ["Coder", "Reviewer"])
 
     def test_mutation_goal_cannot_complete_when_agents_make_no_effect(self) -> None:
+        # Renamed intent: agents concluding that no change is needed is a
+        # valid completion ("Agents lead; Nexus only supports"); the project
+        # checks still ran and passed.
         def answer(_config, route, _text, **kwargs):
             response_format = kwargs.get("response_format")
             if response_format is swarm_work.PLAN_FORMAT:
@@ -3083,9 +3290,11 @@ os._exit(23)
 
         with mock.patch.object(chat, "ask_once", side_effect=answer):
             result = swarm_work.work_together(self.config, self.board, "agent-1", "Create marker.txt")
-        self.assertFalse(result["goal_complete"])
+        self.assertTrue(result["goal_complete"], result["remaining"])
+        self.assertEqual([], result["changed"])
         self.assertFalse((self.project / "marker.txt").exists())
-        self.assertIn("no project-file effect", result["deterministic_verification"]["reason"])
+        self.assertEqual("passed", result["deterministic_verification"]["status"])
+        self.assertTrue(result["deterministic_verification"]["goal_effect"]["no_change"])
 
     def test_zero_test_output_never_passes_for_non_test_worded_goal(self) -> None:
         (self.project / "feature.py").write_text("enabled = True\n", encoding="utf-8")
@@ -3111,12 +3320,17 @@ os._exit(23)
                     self.config, self.project, self.board["projects"][0],
                     f"{verb} parser.py", [], None,
                 )
-                self.assertEqual(result["basis"], "goal_effect")
-                self.assertEqual(result["status"], "failed")
+                # "No change was needed" is a valid outcome; it is not vetoed.
+                self.assertNotEqual(result["basis"], "goal_effect")
+                self.assertEqual(result["status"], "passed", result)
         read_only = swarm_work._goal_effect_evidence(
             self.project, "Read-only inspect parser.py", [],
         )
         self.assertTrue(read_only["passed"])
+        changed_read_only = swarm_work._goal_effect_evidence(
+            self.project, "Read-only inspect parser.py", ["parser.py"],
+        )
+        self.assertFalse(changed_read_only["passed"])
 
     def test_preservation_constraints_never_turn_mutation_goals_read_only(self) -> None:
         (self.project / "parser.py").write_text("value = 1\n", encoding="utf-8")
@@ -3130,9 +3344,13 @@ os._exit(23)
         for goal in mutating_goals:
             with self.subTest(goal=goal):
                 evidence = swarm_work._goal_effect_evidence(self.project, goal, [])
-                self.assertFalse(evidence["passed"])
                 self.assertEqual(evidence["intent"], "mutation")
-                self.assertTrue(evidence["effect_required"])
+                # A change is never mechanically required; agents decide.
+                self.assertTrue(evidence["passed"])
+                self.assertFalse(evidence["effect_required"])
+                self.assertTrue(swarm_work._goal_effect_evidence(
+                    self.project, goal, ["parser.py"],
+                )["passed"])
 
     def test_positive_exception_imperatives_override_outer_prohibitions(self) -> None:
         (self.project / "parser.py").write_text("value = 1\n", encoding="utf-8")
@@ -3148,29 +3366,38 @@ os._exit(23)
                 self.assertEqual(parsed["intent"], "mutation")
                 self.assertTrue(parsed["mutation_actions"])
                 self.assertTrue(parsed["exceptions"] or "update" in parsed["mutation_actions"])
-                self.assertFalse(evidence["passed"])
+                self.assertTrue(evidence["passed"])
+                self.assertTrue(swarm_work._goal_effect_evidence(
+                    self.project, goal, ["parser.py"],
+                )["passed"])
 
     def test_affirmative_informational_goals_are_read_only(self) -> None:
         (self.project / "parser.py").write_text("value = 1\n", encoding="utf-8")
         (self.project / "update.py").write_text("value = 2\n", encoding="utf-8")
-        for goal in (
-            "Review parser.py and explain the findings",
-            "Analyze parser.py; report its status",
-            "Inspect parser.py without making any changes",
-            "Diagnose parser.py and update me on its status without changing any files",
-            "Review update.py and report the status of the update",
+        # Only explicit "no changes" wording makes a run read-only; review
+        # and report verbs alone never forbid a change the agents decide on.
+        for goal, expected in (
+            ("Review parser.py and explain the findings", "project_work"),
+            ("Analyze parser.py; report its status", "project_work"),
+            ("Inspect parser.py without making any changes", "read_only"),
+            ("Diagnose parser.py and update me on its status without changing any files", "read_only"),
+            ("Review update.py and report the status of the update", "project_work"),
         ):
             with self.subTest(goal=goal):
                 evidence = swarm_work._goal_effect_evidence(self.project, goal, [])
                 self.assertTrue(evidence["passed"])
-                self.assertEqual(evidence["intent"], "read_only")
+                self.assertEqual(evidence["intent"], expected)
                 self.assertFalse(evidence["effect_required"])
+                changed = swarm_work._goal_effect_evidence(self.project, goal, ["parser.py"])
+                self.assertEqual(changed["passed"], expected != "read_only")
 
     def test_mutation_nouns_inside_read_only_imperatives_stay_read_only(self) -> None:
         (self.project / "parser.py").write_text("value = 1\n", encoding="utf-8")
+        not_explicit = "Review parser.py and report whether the repair is correct"
+        self.assertEqual("project_work", swarm_work._parse_goal_intent(not_explicit)["intent"])
+        self.assertEqual([], swarm_work._parse_goal_intent(not_explicit)["mutation_actions"])
         for goal in (
             "Verify the fix in parser.py without making changes",
-            "Review parser.py and report whether the repair is correct",
             "Analyze whether a refactor of parser.py is necessary; do not make changes",
             "Explain the update and whether the change is safe without editing files",
         ):
@@ -3202,14 +3429,16 @@ os._exit(23)
             ("mutation", "Avoid changes barring a necessary repair to parser.py"),
             ("read_only", "Check whether to fix parser.py; do not make changes"),
             ("read_only", "Evaluate whether repairing parser.py would be appropriate without editing files"),
-            ("read_only", "Decide if parser.py should be fixed and report the recommendation only"),
+            ("project_work", "Decide if parser.py should be fixed and report the recommendation only"),
             ("read_only", "Analyze whether a change to parser.py is needed; never modify it"),
             ("read_only", "Review the proposed fix and determine whether to apply it; read-only"),
             ("read_only", "Review parser.py aside from explaining the findings; do not edit files"),
             ("read_only", "Check whether to fix parser.py besides evaluating the evidence; make no changes"),
-            ("read_only", "Excluding any modifications, inspect parser.py and report status"),
-            ("read_only", "Do not modify parser.py"),
-            ("read_only", "Never change unrelated files"),
+            # Not explicit project-wide read-only wording: the agents decide.
+            ("project_work", "Excluding any modifications, inspect parser.py and report status"),
+            # Protects parser.py only; the rest of the project stays writable.
+            ("project_work", "Do not modify parser.py"),
+            ("project_work", "Never change unrelated files"),
             ("project_work", "Parser.py behavior expectations"),
         )
         for expected, goal in cases:
@@ -3217,7 +3446,8 @@ os._exit(23)
                 parsed = swarm_work._parse_goal_intent(goal)
                 evidence = swarm_work._goal_effect_evidence(self.project, goal, [])
                 self.assertEqual(parsed["intent"], expected)
-                self.assertEqual(evidence["passed"], expected == "read_only")
+                # No change is always a valid outcome.
+                self.assertTrue(evidence["passed"])
                 if expected == "mutation":
                     self.assertTrue(parsed["mutation_actions"])
                 elif expected == "read_only":
@@ -3229,8 +3459,9 @@ os._exit(23)
                     )
                 else:
                     self.assertEqual(parsed["mutation_actions"], [])
-                    self.assertEqual(parsed["read_only_actions"], [])
-                    self.assertEqual(parsed["constraints"], [])
+        self.assertEqual(
+            ["parser.py"], swarm_work._goal_path_roles("Do not modify parser.py")["protected"],
+        )
 
     def test_exception_action_noun_inflection_and_polarity_matrix(self) -> None:
         cases = (
@@ -3242,9 +3473,9 @@ os._exit(23)
             ("mutation", "Keep files unchanged aside from modifications to parser.py"),
             ("mutation", "No edits besides corrections to parser.py"),
             ("mutation", "Avoid changes apart from migrations of parser.py"),
-            ("read_only", "Review parser.py, excluding modifying any files"),
+            ("project_work", "Review parser.py, excluding modifying any files"),
             ("read_only", "Excluding updating dependencies, review parser.py without making changes"),
-            ("read_only", "Inspect parser.py aside from changing any source files"),
+            ("project_work", "Inspect parser.py aside from changing any source files"),
             ("read_only", "Review the proposed repairs; never make changes"),
         )
         for expected, goal in cases:
@@ -3261,16 +3492,19 @@ os._exit(23)
             ("mutation", "Make no edits; nonetheless, repair parser.py"),
             ("read_only", "Do not modify anything. However, repairs are described in the report"),
             ("read_only", "Never edit files. However, fixes are only being reviewed"),
-            ("read_only", "Review parser.py. However, repairs are described in the report"),
-            ("read_only", "Inspect parser.py; nevertheless, the fixes are only being reviewed"),
-            ("read_only", "Analyze parser.py. Nonetheless, report whether a repair is needed"),
+            # No explicit prohibition at all: ordinary project work.
+            ("project_work", "Review parser.py. However, repairs are described in the report"),
+            ("project_work", "Inspect parser.py; nevertheless, the fixes are only being reviewed"),
+            ("project_work", "Analyze parser.py. Nonetheless, report whether a repair is needed"),
         )
         for expected, goal in cases:
             with self.subTest(goal=goal):
                 parsed = swarm_work._parse_goal_intent(goal)
                 evidence = swarm_work._goal_effect_evidence(self.project, goal, [])
                 self.assertEqual(expected, parsed["intent"], parsed)
-                self.assertEqual(expected == "read_only", evidence["passed"], evidence)
+                self.assertTrue(evidence["passed"], evidence)
+                changed = swarm_work._goal_effect_evidence(self.project, goal, ["parser.py"])
+                self.assertEqual(expected != "read_only", changed["passed"], changed)
                 self.assertEqual(bool(parsed["mutation_actions"]), expected == "mutation", parsed)
 
     def test_missing_selected_runner_is_classified_without_crashing(self) -> None:
@@ -3349,6 +3583,91 @@ os._exit(23)
                 self.assertNotEqual("missing_runner", result.get("basis"), result)
                 run_contained.assert_called()
 
+    def test_glob_query_skips_control_paths_instead_of_failing(self) -> None:
+        (self.project / ".git").mkdir(exist_ok=True)
+        (self.project / ".git" / "config").write_text("[core]\n", encoding="utf-8")
+        (self.project / "src").mkdir(exist_ok=True)
+        (self.project / "src" / "a.py").write_text("x = 1\n", encoding="utf-8")
+        matches, note = swarm_work._safe_query_paths(self.project, "glob:**/*")
+        relative = {one.relative_to(self.project).as_posix() for one in matches}
+        self.assertIn("src/a.py", relative, note)
+        self.assertFalse(any(one.split("/")[0] == ".git" for one in relative), relative)
+        self.assertNotIn("glob request failed", note)
+        control, control_note = swarm_work._safe_query_paths(self.project, "glob:.git/*")
+        self.assertEqual([], control)
+        self.assertIn("matched no readable files", control_note)
+        _escape, escape_note = swarm_work._safe_query_paths(self.project, "glob:../*")
+        self.assertIn("unsafe glob request rejected", escape_note)
+
+    def test_dot_slash_change_paths_match_write_roots_and_exact_grants(self) -> None:
+        (self.project / "src").mkdir(exist_ok=True)
+        (self.project / "secret.txt").write_text("keep\n", encoding="utf-8")
+        for spelling in ("./src/a.py", "src//a.py", "src/./a.py", ".\\src\\a.py"):
+            with self.subTest(spelling=spelling):
+                by_root = swarm_work._validated_changes(
+                    self.project, [{"path": spelling, "content": "x = 1\n"}],
+                    allowed_write_roots=["src"],
+                )
+                self.assertEqual(["src/a.py"], [one.path for one in by_root])
+                by_grant = swarm_work._validated_changes(
+                    self.project, [{"path": spelling, "content": "x = 1\n"}],
+                    allowed_write_roots=None, exact_write_grants={"src/a.py": {"CREATE"}},
+                )
+                self.assertEqual(["src/a.py"], [one.path for one in by_grant])
+        with self.assertRaisesRegex(HarnessError, "duplicate"):
+            swarm_work._validated_changes(self.project, [
+                {"path": "src/a.py", "content": "1\n"},
+                {"path": "./src/a.py", "content": "2\n"},
+            ])
+        for protected in ("./secret.txt", "src/../secret.txt"):
+            with self.subTest(protected=protected), self.assertRaisesRegex(
+                HarnessError, "protected",
+            ):
+                swarm_work._validated_changes(
+                    self.project, [{"path": protected, "content": "changed\n"}],
+                    protected_paths=["secret.txt"],
+                )
+        for unsafe in ("../outside.txt", "./../outside.txt", "src/../../outside.txt",
+                       str(self.root / "outside.txt"), "/outside.txt"):
+            with self.subTest(unsafe=unsafe), self.assertRaises(HarnessError):
+                swarm_work._validated_changes(
+                    self.project, [{"path": unsafe, "content": "escape\n"}],
+                )
+        self.assertFalse((self.root / "outside.txt").exists())
+
+    def test_missing_module_warning_on_a_passing_command_is_not_a_missing_dependency(self) -> None:
+        (self.project / "feature.py").write_text("enabled = True\n", encoding="utf-8")
+        project = copy.deepcopy(self.board["projects"][0])
+        project["test_commands"] = [["python", "-m", "unittest", "discover"]]
+
+        def contained(exit_code):
+            def run(_config, _root, command, **_kwargs):
+                return {
+                    "argv": list(command), "cwd": ".", "exit_code": exit_code,
+                    "stdout": "",
+                    "stderr": (
+                        "warning: No module named optional_accel, using fallback\n"
+                        "Ran 1 test in 0.001s\n\nOK\n"
+                    ),
+                    "duration_ms": 1, "timed_out": False, "output_truncated": False,
+                    "disposable_snapshot": True,
+                    "containment_profile": "bounded-test-containment",
+                }
+            return run
+
+        for exit_code, missing in ((0, False), (1, True)):
+            with self.subTest(exit_code=exit_code), mock.patch.object(
+                swarm_work, "_run_disposable_verification_command",
+                side_effect=contained(exit_code),
+            ):
+                result = swarm_work._run_selected_project_verification(
+                    self.config, self.project, project,
+                    "Create feature.py", ["feature.py"], None,
+                )
+            self.assertEqual(
+                missing, result.get("basis") == "missing_test_dependency", result,
+            )
+
     def test_empty_host_path_leaves_node_availability_to_containment_broker(self) -> None:
         (self.project / "feature.py").write_text("enabled = True\n", encoding="utf-8")
         project = copy.deepcopy(self.board["projects"][0])
@@ -3421,6 +3740,49 @@ os._exit(23)
         self.assertIn("MOST RECENT OMITTED EVIDENCE FIRST", summary)
         self.assertLessEqual(len(summary), 4_000)
 
+    def test_semantic_summary_keeps_structured_state_of_turns_without_text(self) -> None:
+        contributions = [{
+            "speaker_name": "Agent", "speaker_route": "route", "phase": "plan",
+            "text": "",
+            "semantic_state": {
+                "remaining": ["STRUCTURED REMAINING SENTINEL"],
+                "needs_files": ["src/needed_sentinel.py"],
+            },
+        }]
+        summary = swarm_work._semantic_history_summary(contributions, 4_000)
+        self.assertIn("STRUCTURED REMAINING SENTINEL", summary)
+        self.assertIn("src/needed_sentinel.py", summary)
+
+    def test_oversized_newest_turn_does_not_wipe_recent_complete_turns(self) -> None:
+        contributions = [
+            {
+                "speaker_name": f"Agent {index}", "speaker_route": "route",
+                "phase": "work", "text": f"RECENT COMPLETE TURN {index} " + ("r" * 500),
+            }
+            for index in range(5)
+        ]
+        contributions.append({
+            "speaker_name": "Newest", "speaker_route": "route", "phase": "work",
+            "text": "NEWEST HEAD SENTINEL " + ("n" * 200_000)
+            + " NEWEST TAIL DECISION: must keep the verification step",
+            "semantic_state": {"remaining": ["NEWEST STRUCTURED REMAINING"]},
+        })
+        prompt = swarm_work._prompt_conversation(contributions)
+        self.assertLessEqual(len(prompt), swarm_work.PROMPT_TRANSCRIPT_CHARACTERS)
+        newest_section = prompt.split("NEWEST COMPLETE TURNS", 1)[1]
+        for index in range(5):
+            self.assertIn(f"RECENT COMPLETE TURN {index} " + ("r" * 500), newest_section)
+        self.assertIn("NEWEST HEAD SENTINEL", newest_section)
+        self.assertIn("turn clipped to fit the prompt budget", newest_section)
+        self.assertLess(
+            newest_section.index("RECENT COMPLETE TURN 4"),
+            newest_section.index("NEWEST HEAD SENTINEL"),
+        )
+        self.assertIn("newest complete turns below: 5; newest turn clipped to fit: 1", prompt)
+        summary_section = prompt.split("NEWEST COMPLETE TURNS", 1)[0]
+        self.assertIn("NEWEST STRUCTURED REMAINING", summary_section)
+        self.assertIn("turn 6 · Newest", summary_section)
+
     def test_every_long_horizon_phase_uses_the_disclosed_projection(self) -> None:
         source = Path(swarm_work.__file__).read_text(encoding="utf-8")
         self.assertNotIn("+ _actual_conversation(contributions)", source)
@@ -3443,23 +3805,20 @@ os._exit(23)
         self.assertIn("not valid UTF-8", snapshot)
         self.assertIn("1 path(s) omitted", snapshot)
 
-    def test_changed_remaining_requirements_advance_without_optional_progress(self) -> None:
-        guard = swarm_work._ProgressGuard()
-        stopped = []
-        for index in range(1, 6):
-            state = swarm_work._canonical_progress_state(
-                "agent", False, False, {"remaining": [f"Implement requirement {index}"]}
-            )
-            stopped.append(guard.stalled((state,)))
-        self.assertEqual(stopped, [False] * 5)
-
+    def test_changing_replies_never_earn_a_repetition_notice(self) -> None:
+        notice = swarm_work._RepetitionNotice()
+        said = [
+            notice.observe([["agent", f"Implement requirement {index}"]])
+            for index in range(1, 30)
+        ]
+        self.assertEqual(said, [""] * 29)
     def test_read_only_verification_never_executes_discovered_project_code(self) -> None:
         marker = self.project / "DISCOVERED_CODE_RAN"
         (self.project / "test_untrusted.py").write_text(
             "from pathlib import Path\nPath('DISCOVERED_CODE_RAN').write_text('yes')\n", encoding="utf-8",
         )
         result = swarm_work._run_selected_project_verification(
-            self.config, self.project, {"path": str(self.project)}, "Read-only inspect behavior", [], None,
+            self.config, self.project, {"path": str(self.project)}, "Read-only: inspect behavior", [], None,
         )
         self.assertEqual(result["basis"], "read_only_zero_write")
         self.assertEqual(result["commands"], [])
@@ -3551,7 +3910,7 @@ os._exit(23)
                 value = {"contribution": "inspect", "message_to_lead": "ready", "needs_files": []}
             elif response_format is swarm_work.PLAN_REVIEW_FORMAT:
                 value = {"contribution": "review", "message_to_lead": "ready", "needs_files": [], "ready_to_execute": True, "remaining": []}
-            elif response_format is swarm_work.WORK_FORMAT:
+            elif response_format is swarm_work.EXECUTION_FORMAT:
                 work_calls += 1
                 if work_calls <= 2:
                     # A provider-local ID may name a corrected request in the
@@ -3570,6 +3929,46 @@ os._exit(23)
         self.assertTrue(saw_result)
         ledger = next((self.root / ".harness" / "chats").glob("*.collaboration.jsonl"))
         self.assertIn('"phase":"context_tool_result"', ledger.read_text(encoding="utf-8"))
+
+    def test_tool_call_limit_is_told_to_the_agent_without_rolling_back_work(self) -> None:
+        (self.project / "source.txt").write_text("needed evidence\n", encoding="utf-8")
+        self.config.data["workflow"]["max_tool_calls"] = 1
+        work_calls: dict[str, int] = {}
+        limit_seen: dict[str, bool] = {}
+
+        def answer(_config, route, _text, **kwargs):
+            response_format = kwargs.get("response_format")
+            if response_format is swarm_work.PLAN_FORMAT:
+                value = {"contribution": "inspect", "message_to_lead": "ready", "needs_files": []}
+            elif response_format is swarm_work.PLAN_REVIEW_FORMAT:
+                value = {"contribution": "review", "message_to_lead": "ready", "needs_files": [], "ready_to_execute": True, "remaining": []}
+            elif response_format is swarm_work.EXECUTION_FORMAT:
+                count = work_calls[route] = work_calls.get(route, 0) + 1
+                if "tool_call_limit_reached" in kwargs.get("context", ""):
+                    limit_seen[route] = True
+                read = {"name": "read_file", "arguments": {"path": "source.txt", "start_line": 1, "end_line": 5, "max_bytes": 2_000}}
+                if route == "claude" and count >= 2:
+                    value = {"reply": "created", "changes": [{"path": "limit-kept.txt", "content": "kept\n", "reason": "requested"}], "tool_calls": []}
+                else:
+                    # Codex keeps asking for tools even after being told.
+                    value = {"reply": "need context", "changes": [], "tool_calls": [{"call_id": f"{route}-{count}", **read}]}
+            else:
+                value = {"goal_complete": True, "feedback": "done", "remaining": []}
+            return {"text": json.dumps(value), "milliseconds": 1, "model": route}
+
+        with mock.patch.object(chat, "ask_once", side_effect=answer):
+            result = swarm_work.work_together(self.config, self.board, "agent-1", "Create limit-kept.txt")
+        self.assertTrue(result["goal_complete"], result)
+        self.assertEqual((self.project / "limit-kept.txt").read_text(encoding="utf-8"), "kept\n")
+        self.assertTrue(limit_seen.get("codex"), work_calls)
+        # Told once, asked again, then its turn ends: never an endless loop.
+        self.assertLessEqual(work_calls["codex"], 3)
+        ledger = next((self.root / ".harness" / "chats").glob("*.collaboration.jsonl")).read_text(encoding="utf-8")
+        self.assertIn('"phase":"context_tool_call_limit_reached"', ledger)
+        self.assertNotIn('"phase":"provider_transport_failure"', ledger)
+        journals = [json.loads(path.read_text(encoding="utf-8")) for path in
+                    (self.project / ".harness" / "swarm-mutation-sagas").glob("*.json")]
+        self.assertFalse(any(value.get("phase") == "compensated" for value in journals), journals)
 
     def test_selected_verification_tool_uses_budget_idempotence_and_durable_replay(self) -> None:
         config = LoadedConfig(copy.deepcopy(self.config.data), self.root, [], {})
@@ -3701,6 +4100,10 @@ os._exit(23)
                 path="unrelated.tmp", baseline_sha256=None,
                 content="churn\n", reason="unrelated churn",
             ))
+            # Any real applied project edit counts as progress, so behaviour
+            # goals and goals Nexus cannot map to a path are never starved.
+            self.assertTrue(tools.renew_after_progress([unrelated_id]))
+            self.assertEqual(tools.epoch, 2)
             self.assertFalse(tools.renew_after_progress([unrelated_id]))
 
             same = parser.read_bytes()
@@ -3717,7 +4120,7 @@ os._exit(23)
                 content=original_bytes.replace(b"1", b"2"), reason="real fix",
             ))
             self.assertTrue(tools.renew_after_progress([changed_id]))
-            self.assertEqual(tools.epoch, 2)
+            self.assertEqual(tools.epoch, 3)
             self.assertFalse(tools.renew_after_progress([changed_id]))
 
             manifest_path = (
@@ -3749,7 +4152,7 @@ os._exit(23)
                 content=original_bytes, reason="revert",
             ))
             self.assertFalse(tools.renew_after_progress([reverted_id]))
-            self.assertEqual(tools.epoch, 2)
+            self.assertEqual(tools.epoch, 3)
         finally:
             tools.close()
 
@@ -3758,9 +4161,9 @@ os._exit(23)
             "Fix parser.py", [], None,
         )
         try:
-            self.assertEqual(reopened.epoch, 2)
+            self.assertEqual(reopened.epoch, 3)
             self.assertFalse(reopened.renew_after_progress([reverted_id]))
-            self.assertEqual(reopened.epoch, 2)
+            self.assertEqual(reopened.epoch, 3)
         finally:
             reopened.close()
             saga.complete("test_complete")
@@ -4192,29 +4595,41 @@ os._exit(23)
             "Is it necessary to update parser.py?", "Do we need to update parser.py?",
             "Please tell me if parser.py should be updated",
         )
+        # Named files are hints that add to what may be written; the write
+        # policy stays OPEN (no restriction) unless the user said "only".
         for goal in actions:
             with self.subTest(action=goal):
                 spec = swarm_work._compile_goal_spec(self.project, goal)
-                self.assertEqual("SCOPED", spec["write_policy"]["mode"], spec)
+                self.assertEqual("OPEN", spec["write_policy"]["mode"], spec)
                 self.assertTrue(spec["write_policy"]["grants"], spec)
+        # A question never becomes a read-only run by itself.
         for goal in information:
             with self.subTest(information=goal):
+                spec = swarm_work._compile_goal_spec(self.project, goal)
+                self.assertEqual("OPEN", spec["write_policy"]["mode"], spec)
+        for goal in (
+            "How do I update parser.py? Do not change anything.",
+            "Read-only: explain how to update parser.py",
+            "Explain how to update parser.py without making any changes",
+        ):
+            with self.subTest(explicit_read_only=goal):
                 spec = swarm_work._compile_goal_spec(self.project, goal)
                 self.assertEqual("DENY_ALL", spec["write_policy"]["mode"], spec)
                 self.assertEqual([], spec["write_policy"]["grants"], spec)
 
     def test_goal_spec_operation_frames_preserve_directional_path_roles(self) -> None:
         cases = (
-            ("Consult ref.md before updating target.py", ["target.py"], ["ref.md"]),
-            ("Update target.py using ref.md", ["target.py"], ["ref.md"]),
-            ("Update target.py according to ref.md", ["target.py"], ["ref.md"]),
+            # References and sources are mentions, never protections.
+            ("Consult ref.md before updating target.py", ["target.py"], []),
+            ("Update target.py using ref.md", ["target.py"], []),
+            ("Update target.py according to ref.md", ["target.py"], []),
             ("Preserve README.md unchanged while updating app.py", ["app.py"], ["README.md"]),
             ("Update app.py but do not touch README.md", ["app.py"], ["README.md"]),
-            ("Move old file.md to archive/old file.md", ["old file.md", "archive/old file.md"], []),
-            ("Copy source.md to dest.md", ["dest.md"], ["source.md"]),
-            ("Copy dest.md from source.md", ["dest.md"], ["source.md"]),
-            ("Replace contents of target.md with source.md", ["target.md"], ["source.md"]),
-            ("Replace source.md in target.md", ["target.md"], ["source.md"]),
+            ("Move old-file.md to archive/old-file.md", ["old-file.md", "archive/old-file.md"], []),
+            ("Copy source.md to dest.md", ["dest.md"], []),
+            ("Copy dest.md from source.md", ["dest.md"], []),
+            ("Replace contents of target.md with source.md", ["target.md"], []),
+            ("Replace source.md in target.md", ["target.md"], []),
             ("Rename old.md as new.md", ["old.md", "new.md"], []),
             ("Do not change anything; yet parser.py requires repair", ["parser.py"], []),
             ("Do not change anything; still parser.py requires repair", ["parser.py"], []),
@@ -4225,19 +4640,52 @@ os._exit(23)
                 self.assertEqual(effects, roles["effects"], roles)
                 self.assertEqual(protected, roles["protected"], roles)
 
-    def test_unsafe_wrapped_paths_fail_before_any_provider_call(self) -> None:
+    def test_unsafe_wrapped_paths_never_refuse_the_goal_and_grant_nothing(self) -> None:
+        # Item 8: such tokens are reported to the agents and ignored as
+        # grants; project confinement still refuses writes through them.
         unsafe = (
             '../outside.md', '..\\outside.md', '"../outside.md"',
             '`../outside.md`', '(../outside.md)', 'dir//file.md',
             'file.md:stream', 'C:relative.md',
         )
         for candidate in unsafe:
-            with self.subTest(candidate=candidate), mock.patch.object(chat, "ask_once") as ask:
-                with self.assertRaisesRegex(HarnessError, "Unsafe explicit project path"):
-                    swarm_work.work_together(
-                        self.config, self.board, "agent-1", f"Update {candidate}"
-                    )
-                ask.assert_not_called()
+            with self.subTest(candidate=candidate):
+                spec = swarm_work._compile_goal_spec(self.project, f"Update {candidate}")
+                self.assertFalse(any(
+                    ".." in one or "//" in one or ":" in one
+                    for one in spec["write_policy"]["grants"]
+                ), spec["write_policy"]["grants"])
+        self.assertIn("dir//file.md", swarm_work._compile_goal_spec(
+            self.project, "Update dir//file.md",
+        )["ignored_path_tokens"])
+
+    def test_prose_that_is_not_a_path_never_stops_a_goal(self) -> None:
+        cases = (
+            ("Fix the crash on localhost:3000 in server.py", ["server.py"]),
+            ("Fix the crash on localhost:3000/login in server.py", ["server.py"]),
+            ("Use std::vector in engine.cpp", ["engine.cpp"]),
+            ("Use std::chrono::duration.count() in timer.cpp", ["timer.cpp"]),
+            ("Meeting at 10:30, update notes.md", ["notes.md"]),
+            ("Replace // comments in main.js", ["main.js"]),
+            ("Fix the error at parser.py:120", ["parser.py"]),
+        )
+        for goal, expected in cases:
+            with self.subTest(goal=goal):
+                self.assertEqual(expected, swarm_work._goal_named_paths(goal))
+                spec = swarm_work._compile_goal_spec(self.project, goal)
+                self.assertTrue(
+                    all(":" not in one for one in spec["write_policy"]["grants"]), spec,
+                )
+        for goal in (
+            "Update file.txt::$DATA", "Update localhost:3000/../secret.md",
+            "Update x::y/../../z.md", "Update a::b:c.md",
+        ):
+            with self.subTest(unsafe=goal):
+                spec = swarm_work._compile_goal_spec(self.project, goal)
+                self.assertTrue(spec["ignored_path_tokens"], spec)
+                self.assertFalse(any(
+                    ".." in one or ":" in one for one in spec["write_policy"]["grants"]
+                ))
 
     def test_read_only_work_rejects_provider_mutations_and_proves_zero_write(self) -> None:
         (self.project / "parser.py").write_text("value = 1\n", encoding="utf-8")
@@ -4360,7 +4808,12 @@ os._exit(23)
             ["calc.py", "test_calc_rejects_empty_input.py"],
             causal_receipts=receipts, root=self.project,
         )
-        self.assertFalse(stale["passed"], stale)
+        # A stale receipt is rejected; the missing proof is reported as an
+        # unmet hint rather than vetoing completion.
+        self.assertEqual([], stale["causal_receipts"], stale)
+        self.assertFalse(stale["behavior_proof"], stale)
+        self.assertTrue(stale["advisory_unmet"], stale)
+        self.assertTrue(stale["passed"], stale)
 
     def test_actual_playwright_e2e_receipt_uses_fresh_v8_causal_trace(self) -> None:
         playwright_cli = Path.cwd() / "node_modules" / "playwright" / "cli.js"
@@ -4442,70 +4895,26 @@ os._exit(23)
                         command[0], [command[1]], cover / Path(command[1]).stem, self.project
                     ))
 
-    def test_progress_guard_uses_exact_state_and_conservative_cycle_thresholds(self) -> None:
-        guard = swarm_work._ProgressGuard()
-        states = [
-            (swarm_work._canonical_progress_state(
-                "agent", False, False, {"remaining": [f"requirement-{index}"]}
-            ),)
-            for index in range(8)
-        ]
-        self.assertEqual([False] * 8, [guard.stalled(state) for state in states])
-        stable = swarm_work._ProgressGuard()
-        one = states[0]
-        results = [stable.stalled(one) for _ in range(14)]
-        self.assertEqual([False] * 13 + [True], results)
-        cycle = swarm_work._ProgressGuard()
-        a, b = states[:2]
-        provider_cycle = (a, b) * 7
-        self.assertEqual(
-            [False] * 13 + [True],
-            [cycle.stalled(state) for state in provider_cycle],
-        )
-        evidence = swarm_work._ProgressGuard()
-        evidence_results = [
-            evidence.stalled((swarm_work._canonical_progress_state(
-                "agent", False, False,
-                {
-                    "remaining": ["same requirement"],
-                    "progress": [{
-                        "id": "diagnostic", "state": "observed",
-                        "evidence": f"engine-evidence-{index}",
-                    }],
-                },
-            ),))
-            for index in range(20)
-        ]
-        self.assertEqual([False] * 13 + [True] * 7, evidence_results)
-
-    def test_arbitrary_novel_checkpoint_state_churn_cannot_buy_rounds(self) -> None:
-        guard = swarm_work._ProgressGuard()
+    def test_repetition_notice_needs_exactly_identical_rounds_and_never_stops(self) -> None:
+        stable = swarm_work._RepetitionNotice()
+        results = [stable.observe(["same"]) for _ in range(13)]
+        self.assertEqual([bool(one) for one in results], [False] * 5 + [True] + [False] * 5 + [True, False])
+        # An A/B alternation is two different replies: never a notice.
+        cycle = swarm_work._RepetitionNotice()
+        self.assertEqual({cycle.observe([state]) for state in ("a", "b") * 10}, {""})
+        # Any change resets the count.
+        reset = swarm_work._RepetitionNotice()
+        for _ in range(5):
+            reset.observe(["same"])
+        self.assertEqual(reset.observe(["changed"]), "")
+        self.assertEqual(reset.identical, 1)
+    def test_new_checkpoint_states_count_as_change(self) -> None:
+        notice = swarm_work._RepetitionNotice()
         results = [
-            guard.stalled((swarm_work._canonical_progress_state(
-                "agent", False, False,
-                {
-                    "remaining": ["same unresolved requirement"],
-                    "progress": [{
-                        "id": "stable-checkpoint",
-                        "state": f"nonce-{index}",
-                        "evidence": f"provider claim {index}",
-                    }],
-                },
-            ),))
+            notice.observe([{"remaining": ["same"], "progress": [{"id": "c", "state": f"nonce-{index}"}]}])
             for index in range(1, 41)
         ]
-        self.assertEqual([False] * 13 + [True] * 27, results)
-        self.assertFalse(swarm_work._meaningful_checkpoint_advance(
-            "nonce-1", "nonce-2",
-        ))
-        self.assertTrue(swarm_work._meaningful_checkpoint_advance("17", "18"))
-        self.assertTrue(swarm_work._meaningful_checkpoint_advance(
-            "tested", "verified",
-        ))
-        self.assertFalse(swarm_work._meaningful_checkpoint_advance(
-            "verified", "working",
-        ))
-
+        self.assertEqual(set(results), {""})
     def test_loop14_exact_operation_capabilities_and_passive_requests(self) -> None:
         actions = (
             "Could parser.py be updated for me?",
@@ -4526,12 +4935,13 @@ os._exit(23)
                 {"app.py": ["MODIFY"]}, ["README.md"],
             ),
             (
-                "Move old name.md into archive/new name.md",
-                {"old name.md": ["DELETE"], "archive/new name.md": ["CREATE_OR_MODIFY"]}, [],
+                "Move old-name.md into archive/new-name.md",
+                {"old-name.md": ["DELETE"], "archive/new-name.md": ["CREATE_OR_MODIFY"]}, [],
             ),
             (
-                "Copy source file.md as destination file.md",
-                {"destination file.md": ["CREATE_OR_MODIFY"]}, ["source file.md"],
+                # A copy source is not protected; only explicit wording is.
+                "Copy source-file.md as destination-file.md",
+                {"destination-file.md": ["CREATE_OR_MODIFY"]}, [],
             ),
         )
         for goal, grants, protected in cases:
@@ -4540,7 +4950,7 @@ os._exit(23)
                 self.assertEqual(grants, spec["write_policy"]["exact_capabilities"], spec)
                 self.assertEqual(protected, spec["write_policy"]["protected"], spec)
 
-    def test_loop14_exact_scope_rejects_whole_unrelated_executor_proposal(self) -> None:
+    def test_loop14_exact_scope_refuses_only_the_unrelated_entry(self) -> None:
         (self.project / "parser.py").write_text("value = 1\n", encoding="utf-8")
 
         def answer(_config, route, _text, **kwargs):
@@ -4565,14 +4975,32 @@ os._exit(23)
                 ]}
             return {"text": json.dumps(value), "milliseconds": 1, "model": route}
 
+        # A named file never restricts writes: "Update parser.py" lets the
+        # agents change other files too.
         with mock.patch.object(chat, "ask_once", side_effect=answer):
-            result = swarm_work.work_together(
+            open_result = swarm_work.work_together(
                 self.config, self.board, "agent-1", "Update parser.py", round_limit=1,
             )
-        self.assertFalse(result["goal_complete"], result)
-        self.assertEqual("value = 1\n", (self.project / "parser.py").read_text(encoding="utf-8"))
+        self.assertTrue(open_result["goal_complete"], open_result)
+        self.assertEqual("value = 2\n", (self.project / "parser.py").read_text(encoding="utf-8"))
+        self.assertTrue((self.project / "unrelated.py").exists())
+        (self.project / "parser.py").write_text("value = 1\n", encoding="utf-8")
+        (self.project / "unrelated.py").unlink()
+
+        # An explicit "only" restriction still refuses the unrelated entry,
+        # and only that entry: the in-scope change is applied (item 7).
+        with mock.patch.object(chat, "ask_once", side_effect=answer):
+            result = swarm_work.work_together(
+                self.config, self.board, "agent-1", "Only update parser.py", round_limit=1,
+            )
+        self.assertTrue(result["write_scope_restricted"], result)
+        self.assertEqual(["parser.py"], result["allowed_write_roots"])
+        self.assertEqual("value = 2\n", (self.project / "parser.py").read_text(encoding="utf-8"))
         self.assertFalse((self.project / "unrelated.py").exists())
-        self.assertEqual([], result["transaction_ids"])
+        self.assertEqual(["parser.py"], result["changed"])
+        self.assertTrue(result["refused_changes"])
+        self.assertTrue(all(one["path"] == "unrelated.py" for one in result["refused_changes"]))
+        self.assertIn("outside the explicit write destinations", result["refused_changes"][0]["reason"])
 
     def test_loop14_semantic_witness_rejects_version_and_source_inspection_decoys(self) -> None:
         (self.project / "calc.py").write_text(
@@ -4675,8 +5103,8 @@ os._exit(23)
                 ), contract)
 
     def test_loop14_transfer_transactions_enforce_directional_postconditions(self) -> None:
-        (self.project / "old name.md").write_text("payload\n", encoding="utf-8")
-        move_goal = "Move old name.md into archive/new name.md"
+        (self.project / "old-name.md").write_text("payload\n", encoding="utf-8")
+        move_goal = "Move old-name.md into archive/new-name.md"
         move_spec = swarm_work._compile_goal_spec(self.project, move_goal)
         move_contract = swarm_work._derive_requirement_contract(self.project, move_goal)
         move_grants = {
@@ -4686,8 +5114,8 @@ os._exit(23)
         move_plans = swarm_work._validated_changes(
             self.project,
             [
-                {"path": "old name.md", "delete": True, "reason": "move source"},
-                {"path": "archive/new name.md", "content": "payload\n", "reason": "move destination"},
+                {"path": "old-name.md", "delete": True, "reason": "move source"},
+                {"path": "archive/new-name.md", "content": "payload\n", "reason": "move destination"},
             ],
             exact_write_grants=move_grants,
         )
@@ -4695,14 +5123,14 @@ os._exit(23)
             move_plans, allowed_exact_capabilities=move_grants,
         )
         move_evidence = swarm_work._requirement_artifact_evidence(
-            self.project, move_contract, ["old name.md", "archive/new name.md"],
+            self.project, move_contract, ["old-name.md", "archive/new-name.md"],
         )
-        self.assertTrue(move_evidence["passed"], move_evidence)
-        self.assertFalse((self.project / "old name.md").exists())
-        self.assertEqual("payload\n", (self.project / "archive/new name.md").read_text(encoding="utf-8"))
+        self.assertTrue(self.hints_met(move_evidence), move_evidence)
+        self.assertFalse((self.project / "old-name.md").exists())
+        self.assertEqual("payload\n", (self.project / "archive/new-name.md").read_text(encoding="utf-8"))
 
-        (self.project / "source file.md").write_text("copy\n", encoding="utf-8")
-        copy_goal = "Copy source file.md as destination file.md"
+        (self.project / "source-file.md").write_text("copy\n", encoding="utf-8")
+        copy_goal = "Copy source-file.md as destination-file.md"
         copy_spec = swarm_work._compile_goal_spec(self.project, copy_goal)
         copy_contract = swarm_work._derive_requirement_contract(self.project, copy_goal)
         copy_grants = {
@@ -4711,7 +5139,7 @@ os._exit(23)
         }
         copy_plans = swarm_work._validated_changes(
             self.project,
-            [{"path": "destination file.md", "content": "copy\n", "reason": "copy destination"}],
+            [{"path": "destination-file.md", "content": "copy\n", "reason": "copy destination"}],
             protected_paths=copy_spec["write_policy"]["protected"],
             exact_write_grants=copy_grants,
         )
@@ -4720,10 +5148,10 @@ os._exit(23)
             protected_paths=copy_spec["write_policy"]["protected"],
         )
         copy_evidence = swarm_work._requirement_artifact_evidence(
-            self.project, copy_contract, ["destination file.md"],
+            self.project, copy_contract, ["destination-file.md"],
         )
-        self.assertTrue(copy_evidence["passed"], copy_evidence)
-        self.assertEqual("copy\n", (self.project / "source file.md").read_text(encoding="utf-8"))
+        self.assertTrue(self.hints_met(copy_evidence), copy_evidence)
+        self.assertEqual("copy\n", (self.project / "source-file.md").read_text(encoding="utf-8"))
 
     def test_loop15_root_and_exact_capabilities_compose_without_broadening(self) -> None:
         roots = [
@@ -4753,22 +5181,23 @@ os._exit(23)
             allowed_exact_capabilities=exact,
         )
         self.assertEqual(len(raw), len(manifest["changes"]))
-        with self.assertRaisesRegex(HarnessError, "not authorized"):
-            swarm_work._validated_changes(
-                self.project, [{
-                    "path": "repository variants/qa workspace/TEST-ci.yml",
-                    "content": "name: changed\n",
-                }], allowed_write_roots=roots,
-                exact_write_grants={
-                    "repository variants/qa workspace/test-ci.yml": {"CREATE"},
-                },
-            )
-        with self.assertRaisesRegex(HarnessError, "not authorized"):
-            swarm_work._validated_changes(
-                self.project,
-                [{"path": "unrelated.py", "content": "bad = True\n"}],
-                exact_write_grants={"parser.py": {"MODIFY"}},
-            )
+        # The kind of change is the agent's call: a CREATE grant also
+        # allows modifying the (now existing) file.
+        self.assertEqual(1, len(swarm_work._validated_changes(
+            self.project, [{
+                "path": "repository variants/qa workspace/TEST-ci.yml",
+                "content": "name: changed\n",
+            }], allowed_write_roots=roots,
+            exact_write_grants={
+                "repository variants/qa workspace/test-ci.yml": {"CREATE"},
+            },
+        )))
+        # Named-file grants alone never restrict writes to those files.
+        self.assertEqual(1, len(swarm_work._validated_changes(
+            self.project,
+            [{"path": "unrelated.py", "content": "bad = True\n"}],
+            exact_write_grants={"parser.py": {"MODIFY"}},
+        )))
         with self.assertRaisesRegex(HarnessError, "outside"):
             swarm_work._validated_changes(
                 self.project,
@@ -4817,10 +5246,15 @@ os._exit(23)
         )
         for goal in prohibitions:
             with self.subTest(goal=goal):
+                # An explicit prohibition on one file protects that file; it
+                # is not a project-wide read-only run.
                 spec = swarm_work._compile_goal_spec(self.project, goal)
-                self.assertEqual("read_only", spec["intent"], spec)
-                self.assertEqual("DENY_ALL", spec["write_policy"]["mode"], spec)
+                self.assertNotEqual("read_only", spec["intent"], spec)
+                self.assertEqual("OPEN", spec["write_policy"]["mode"], spec)
                 self.assertEqual([], spec["write_policy"]["grants"], spec)
+                self.assertEqual(
+                    ["parser.py"], [one.casefold() for one in spec["write_policy"]["protected"]], spec,
+                )
         requests = (
             "Parser.py ought to be updated.",
             "It is requested that parser.py be updated.",
@@ -4874,12 +5308,13 @@ os._exit(23)
         wrong = swarm_work._requirement_artifact_evidence(
             self.project, contract, ["target.md"],
         )
-        self.assertFalse(wrong["passed"], wrong)
+        self.assertFalse(self.hints_met(wrong), wrong)
+        self.assertTrue(wrong["passed"], wrong)
         (self.project / "target.md").write_text("source\n", encoding="utf-8")
         correct = swarm_work._requirement_artifact_evidence(
             self.project, contract, ["target.md"],
         )
-        self.assertTrue(correct["passed"], correct)
+        self.assertTrue(self.hints_met(correct), correct)
 
     def test_loop15_selected_verification_runs_side_effecting_tests_only_in_disposable_copy(self) -> None:
         (self.project / "verification-modify.txt").write_text("before\n", encoding="utf-8")
@@ -5061,11 +5496,12 @@ os._exit(23)
         for goal in actionable:
             with self.subTest(actionable=goal):
                 spec = swarm_work._compile_goal_spec(self.project, goal)
-                self.assertEqual("SCOPED", spec["write_policy"]["mode"])
+                self.assertEqual("OPEN", spec["write_policy"]["mode"])
                 self.assertIn("parser.py", [one.casefold() for one in spec["write_policy"]["grants"]])
+        # Questions and "does not need to be changed" are not read-only runs.
         for goal in informational:
             with self.subTest(informational=goal):
-                self.assertEqual("DENY_ALL", swarm_work._compile_goal_spec(
+                self.assertNotEqual("DENY_ALL", swarm_work._compile_goal_spec(
                     self.project, goal,
                 )["write_policy"]["mode"])
 
@@ -5078,19 +5514,17 @@ os._exit(23)
         goal = "Fix calc.py so empty input is rejected"
         spec = swarm_work._compile_goal_spec(self.project, goal)
         decision = swarm_work._acceptance_target_decision(self.project, goal, spec)
-        self.assertEqual("needs_clarification", decision["status"])
+        # Behaviour evidence is optional, so an ambiguous probe target never
+        # pauses the agents to ask the user; the providers are contacted.
+        self.assertEqual("ambiguous", decision["status"])
+        self.assertNotIn("question", decision)
         self.assertEqual({"parse", "unrelated"}, {
             one["qualname"] for one in decision["candidates"]
         })
-        with mock.patch.object(chat, "ask_once") as ask:
-            paused = swarm_work.work_together(
-                self.config, self.board, "agent-1", goal,
-            )
-        ask.assert_not_called()
-        self.assertEqual("paused_for_user", paused["status"])
-        self.assertFalse(paused["goal_complete"])
-        self.assertEqual([], paused["changed"])
-        self.assertIn("parse", paused["questions"][0]["prompt"])
+        with mock.patch.object(chat, "ask_once", side_effect=RuntimeError("providers contacted")) as ask:
+            with self.assertRaisesRegex(RuntimeError, "providers contacted"):
+                swarm_work.work_together(self.config, self.board, "agent-1", goal)
+        self.assertTrue(ask.called)
         ratified = swarm_work._acceptance_target_decision(
             self.project, goal, spec, "Use parse",
         )
@@ -5189,8 +5623,11 @@ os._exit(23)
         ):
             with self.subTest(goal=goal):
                 spec = swarm_work._compile_goal_spec(self.project, goal)
-                self.assertEqual("read_only", spec["intent"], spec)
-                self.assertEqual("DENY_ALL", spec["write_policy"]["mode"], spec)
+                self.assertNotEqual("read_only", spec["intent"], spec)
+                self.assertEqual("OPEN", spec["write_policy"]["mode"], spec)
+                self.assertEqual(
+                    ["parser.py"], [one.casefold() for one in spec["write_policy"]["protected"]], spec,
+                )
 
     def test_loop16_context_progress_requires_requirement_relevance(self) -> None:
         contract = {
@@ -5647,19 +6084,6 @@ for executable in (project_child,nested_child):
         self.assertFalse(receipt["direct_acceptance_probe"]["baseline_observation"]["passed"])
 
     def test_loop15_provider_prose_and_call_ids_are_not_progress_evidence(self) -> None:
-        left = swarm_work._canonical_progress_state(
-            "agent", False, False,
-            {"progress": [{"id": "one", "state": "working", "evidence": "claim A"}],
-             "remaining": ["first wording"]},
-            ["provider-claimed.py"],
-        )
-        right = swarm_work._canonical_progress_state(
-            "agent", False, False,
-            {"progress": [{"id": "two", "state": "working", "evidence": "claim B"}],
-             "remaining": ["different wording"]},
-            ["another-claim.py"],
-        )
-        self.assertTrue(swarm_work._progress_states_match((left,), (right,)))
         first = {
             "call_id": "read-1", "name": "read_file", "arguments_sha256": "a" * 64,
             "result": {
@@ -5721,9 +6145,13 @@ for executable in (project_child,nested_child):
             verification_session_id=ledger.session_id,
             transaction_ids=[transaction_id],
         )
-        self.assertEqual("failed", result["status"], result)
-        self.assertEqual("requirement_execution_evidence", result["basis"], result)
-        self.assertEqual([], result["requirement_evidence"]["execution"]["causal_receipts"])
+        # The decoy still earns no causal receipt; the missing (optional)
+        # behaviour proof is reported instead of vetoing completion.
+        self.assertEqual("passed", result["status"], result)
+        execution = result["requirement_evidence"]["execution"]
+        self.assertEqual([], execution["causal_receipts"])
+        self.assertFalse(execution["behavior_proof"])
+        self.assertTrue(execution["advisory_unmet"], execution)
 
     def test_loop15_runtime_callable_identity_rejects_same_module_unrelated_function(self) -> None:
         goal = "Fix calc.py so empty input is rejected"
@@ -5765,12 +6193,16 @@ for executable in (project_child,nested_child):
             verification_session_id=ledger.session_id,
             transaction_ids=[transaction_id],
         )
-        self.assertEqual("failed", result["status"], result)
         if result.get("basis") == "verification_containment_denied":
+            self.assertEqual("failed", result["status"], result)
             self.assertIn("outside its disposable", result["reason"])
         else:
+            # No receipt for an unrelated function; the missing optional proof
+            # is reported, not a veto.
+            self.assertEqual("passed", result["status"], result)
             execution = result.get("requirement_evidence", {}).get("execution", {})
             self.assertEqual([], execution.get("causal_receipts", []), result)
+            self.assertTrue(execution.get("advisory_unmet"), result)
 
     def test_loop15_playwright_callable_identity_rejects_local_rebinding(self) -> None:
         playwright_cli = Path.cwd() / "node_modules" / "playwright" / "cli.js"

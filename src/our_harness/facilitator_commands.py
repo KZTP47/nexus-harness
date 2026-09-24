@@ -9,7 +9,6 @@ import os
 from pathlib import Path
 import shutil
 
-from .config import LoadedConfig
 from .execution import CommandRunner
 from .models import HarnessError
 from .safety import confined_path
@@ -19,13 +18,17 @@ def tool_command_digest(root, arguments, config):
     """Identify the exact native request, including cwd and timeout authority."""
     if not isinstance(arguments, dict) or set(arguments) - {"argv", "cwd", "timeout_seconds"}:
         raise HarnessError("Unknown command tool argument")
+    from .goal_tools import command_timeout
     argv = arguments.get("argv")
     cwd = arguments.get("cwd", ".")
+    command_timeout(arguments)
+    # Identity marker only: an omitted timeout keeps the digest it always had,
+    # so existing approvals stay valid. The runtime default is generous.
     timeout = arguments.get("timeout_seconds", 30)
     if not isinstance(argv, list) or not 1 <= len(argv) <= 100 or any(
         not isinstance(one, str) or not one or len(one) > 32000 or "\0" in one for one in argv
-    ) or not isinstance(cwd, str) or len(cwd) > 240 or type(timeout) is not int or not 1 <= timeout <= 60:
-        raise HarnessError("run_command needs bounded argv, relative cwd and a 1–60 second timeout")
+    ) or not isinstance(cwd, str) or len(cwd) > 240:
+        raise HarnessError("run_command needs bounded argv and a relative cwd")
     working = confined_path(root, cwd, allow_missing=False)
     if not working.is_dir():
         raise HarnessError("Command cwd must be an existing directory")
@@ -46,11 +49,13 @@ def authorize_tool(store, goal, root, arguments):
     return result
 
 
-def run_command(config, root: Path, argv, *, cwd=".", timeout=None, max_output_bytes=10000):
+def run_command(config, root: Path, argv, *, cwd=".", timeout=None, max_output_bytes=None):
     """Run granted argv with the configured backend, denials and cleanup."""
-    data = copy.deepcopy(config.data)
-    rebound = LoadedConfig(data, root.resolve(), list(config.sources),
-                           dict(config.provenance), copy.deepcopy(config.trusted_floor))
+    from .goal_tools import COMMAND_CAPTURE_BYTES, command_config
+    # Callers without an agent's explicit request keep the configured timeout.
+    timeout = float(config.get("execution.timeout_seconds")) if timeout is None else timeout
+    max_output_bytes = COMMAND_CAPTURE_BYTES if max_output_bytes is None else max_output_bytes
+    rebound = command_config(config, root, timeout)
     actual = list(argv)
     # CreateProcess does not search PATHEXT for bare npm/pnpm/yarn names.
     # Supply the installed executable spelling without expanding npm scripts.

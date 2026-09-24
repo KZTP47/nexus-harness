@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import copy
 import ast
+import fnmatch
 import hashlib
 import json
 import math
@@ -25,6 +26,7 @@ import tempfile
 import time
 import uuid
 import weakref
+from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable
@@ -32,7 +34,7 @@ from typing import Any, Callable
 from . import chat as chat_lab
 from . import cancellation, collaboration_outcomes, swarm_runs, user_questions
 from .changes import FileTransaction, atomic_write, file_sha256, sha256_bytes
-from .agent_tools import AgentToolSession
+from .agent_tools import AgentToolCallLimitReached, AgentToolSession
 from .bounded_file_read import READ_FILE_INPUT_SCHEMA
 from .collaboration_ledger import CollaborationLedger
 from .config import LoadedConfig
@@ -89,6 +91,70 @@ class StructuredCollaborationError(HarnessError):
 
 class ContextToolBudgetExhausted(DeadlineExpired):
     """Only active context-tool execution time exhausted its user-set budget."""
+
+
+_MALFORMED_REPLY_WORDING = re.compile(
+    r"returned malformed \S+ JSON|did not return the structured collaboration result"
+    r"|returned an invalid nexus_\w+ result|returned the wrong collaboration result shape",
+    re.IGNORECASE,
+)
+
+
+def _is_protocol_failure(exc: BaseException | None) -> bool:
+    """True when an agent replied but its reply did not fit the format.
+
+    That is a schema slip by a working agent, never a provider outage. CLI and
+    API routes report it from chat's one schema repair (StructuredReplyError,
+    re-wrapped by ask_once, so the cause chain is followed); web routes and
+    Nexus's own decoder report StructuredCollaborationError.
+    """
+
+    if exc is None or isinstance(exc, ProviderOutcomeUnknown):
+        return False
+    reply_error = getattr(chat_lab, "StructuredReplyError", None)
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, StructuredCollaborationError):
+            return True
+        if reply_error is not None and isinstance(current, reply_error):
+            return True
+        current = current.__cause__
+    return bool(_MALFORMED_REPLY_WORDING.search(str(exc)))
+
+
+def _failure_code(exc: BaseException | None) -> str:
+    if isinstance(exc, ProviderOutcomeUnknown):
+        return "provider_outcome_unknown"
+    if _is_protocol_failure(exc):
+        return "invalid_structured_result"
+    return "provider_turn_failed"
+
+
+def _kept_work_recovery(
+    mutation_root: Path | None,
+    transaction_ids: list[str] | None,
+    mutation_saga: _MutationSaga | None,
+    reason: str,
+) -> dict[str, Any] | None:
+    """Keep every applied transaction when a run pauses.
+
+    A pause (provider outage, a malformed reply, a context-tool budget) is a
+    harness-side stop, never a reason to discard the agents' applied work.
+    The saga is closed as ``kept`` so crash recovery never rolls it back
+    later, and the resumed run continues from the project as it is now.
+    """
+
+    if mutation_saga is not None:
+        return mutation_saga.keep(reason)
+    if mutation_root is not None and transaction_ids:
+        return {
+            "status": "kept",
+            "kept_transaction_ids": list(transaction_ids),
+            "reason": reason,
+        }
+    return None
 
 
 def _report(progress: Progress | None, stage: str, detail: str = "") -> None:
@@ -168,11 +234,19 @@ def _pause_provider_failure(
     transaction_ids: list[str] | None = None,
     mutation_saga: _MutationSaga | None = None,
 ) -> None:
-    """Stop orchestration without turning a transport failure into agent speech."""
+    """Pause orchestration without turning a failed turn into agent speech.
+
+    Applied project changes are kept and recorded in the checkpoint, so the
+    resumed run continues from the current project state instead of redoing
+    (or losing) work. The failure is reported as what it was: a provider
+    outage, an unreconciled delivery, or a reply that did not fit the format.
+    """
 
     failed_agents = failed if isinstance(failed, list) else [failed]
     names = [str(one.get("name") or "An agent") for one in failed_agents]
     safe_reason = _provider_reason(ledger, cause)
+    failure_code = _failure_code(cause)
+    protocol = failure_code == "invalid_structured_result"
     state: dict[str, Any] = {
         "stage": stage,
         "status": "paused",
@@ -181,7 +255,7 @@ def _pause_provider_failure(
                 "id": str(one.get("id") or ""),
                 "name": str(one.get("name") or "An agent"),
                 "route": str(one.get("who") or ""),
-                "failure_code": "provider_turn_failed",
+                "failure_code": failure_code,
                 **({"provider_reason": safe_reason} if safe_reason else {}),
             }
             for one in failed_agents
@@ -190,42 +264,62 @@ def _pause_provider_failure(
     state.update(checkpoint or {})
     if safe_reason:
         state["provider_reason"] = safe_reason
-    provisional_paths = _transaction_paths(mutation_root, transaction_ids or [])
-    if mutation_saga is not None:
-        state["mutation_recovery"] = mutation_saga.compensate("provider_failure")
-    elif mutation_root is not None and transaction_ids:
-        state["mutation_recovery"] = _rollback_transactions(mutation_root, transaction_ids)
-    recovery = state.get("mutation_recovery")
-    if provisional_paths:
-        state["provisional_paths"] = provisional_paths
-    ledger.record_state("provider_transport_failure", state)
-    remaining = [
-        f"Reconnect or reconcile {name}'s provider turn before resuming."
-        for name in names
-    ]
-    report = (
-        "Nexus paused this collaboration because "
-        + ", ".join(names)
-        + " could not complete a provider turn. The failure was not counted as "
-          "agent speech, reasoning progress, or a completed round."
+    kept_paths = _transaction_paths(mutation_root, transaction_ids or [])
+    recovery = _kept_work_recovery(
+        mutation_root, transaction_ids, mutation_saga,
+        "provider_protocol_pause" if protocol else "provider_pause",
     )
-    if safe_reason:
-        report += f" Provider reason: {safe_reason}"
-    if isinstance(recovery, dict) and recovery.get("status") == "rolled_back":
-        report += (
-            " Nexus rolled back the provisional project changes from this interrupted run"
-            + (": " + ", ".join(provisional_paths) if provisional_paths else "")
-            + ". Those provisional changes are not applied."
+    if recovery is not None:
+        state["mutation_recovery"] = recovery
+    if kept_paths:
+        state["kept_paths"] = kept_paths
+    checkpoint = dict(checkpoint or {})
+    if transaction_ids:
+        checkpoint["kept_transaction_ids"] = list(transaction_ids)
+    if kept_paths:
+        checkpoint["changed"] = list(dict.fromkeys([
+            *[str(one) for one in checkpoint.get("changed", []) if isinstance(one, str)],
+            *kept_paths,
+        ]))
+    ledger.record_state(
+        "provider_protocol_failure" if protocol else "provider_transport_failure", state,
+    )
+    if protocol:
+        remaining = [
+            f"Resume so {name} can answer again in the requested format."
+            for name in names
+        ]
+        report = (
+            "Nexus paused this collaboration because the reply from "
+            + ", ".join(names)
+            + " did not match the structured format Nexus asked for, even after a correction. "
+              "The provider did answer; this is a format problem, not an outage."
         )
-    elif isinstance(recovery, dict) and recovery.get("status") == "rollback_conflict":
+        if safe_reason:
+            report += f" Reason: {safe_reason}"
+    else:
+        remaining = [
+            f"Reconnect or reconcile {name}'s provider turn before resuming."
+            for name in names
+        ]
+        report = (
+            "Nexus paused this collaboration because "
+            + ", ".join(names)
+            + " could not complete a provider turn. The failure was not counted as "
+              "agent speech, reasoning progress, or a completed round."
+        )
+        if safe_reason:
+            report += f" Provider reason: {safe_reason}"
+    if kept_paths:
         report += (
-            " Nexus could not safely roll back every provisional project change because "
-            "the files changed again outside this run; reconcile the recorded mutation conflict before continuing."
+            " Nexus kept the project changes the agents already applied in this run ("
+            + ", ".join(kept_paths)
+            + "); resuming continues from the project as it is now."
         )
     ledger.finish(
         report,
         complete=False,
-        stopped_because="provider_unavailable",
+        stopped_because="provider_protocol_failure" if protocol else "provider_unavailable",
         remaining=remaining,
         status="paused_provider",
         state={
@@ -243,12 +337,16 @@ def _pause_provider_failure(
     )
     payload = {
         "status": "paused_provider",
-        "stopped_because": "provider_unavailable",
+        "stopped_because": "provider_protocol_failure" if protocol else "provider_unavailable",
+        "failure_code": failure_code,
         "goal_complete": False,
         "verified": False,
         "resume_token": ledger.session_id,
         "questions": remaining,
         "remaining": remaining,
+        "changed": list(kept_paths),
+        "transaction_ids": list(transaction_ids or []),
+        **({"mutation_recovery": recovery} if recovery is not None else {}),
         "checkpoint": dict(checkpoint or {}),
         "allowed_write_roots": list(checkpoint.get("allowed_write_roots", []))
         if isinstance(checkpoint, dict) and isinstance(checkpoint.get("allowed_write_roots"), list)
@@ -282,17 +380,22 @@ def _pause_context_tool_budget(
         "context_tool_budget": copy.deepcopy(budget),
     }
     state.update(checkpoint or {})
-    provisional_paths = _transaction_paths(mutation_root, transaction_ids or [])
-    if mutation_saga is not None:
-        state["mutation_recovery"] = mutation_saga.compensate(
-            "context_tool_budget_exhausted"
-        )
-    elif mutation_root is not None and transaction_ids:
-        state["mutation_recovery"] = _rollback_transactions(
-            mutation_root, transaction_ids
-        )
-    if provisional_paths:
-        state["provisional_paths"] = provisional_paths
+    kept_paths = _transaction_paths(mutation_root, transaction_ids or [])
+    recovery = _kept_work_recovery(
+        mutation_root, transaction_ids, mutation_saga, "context_tool_budget_exhausted",
+    )
+    if recovery is not None:
+        state["mutation_recovery"] = recovery
+    if kept_paths:
+        state["kept_paths"] = kept_paths
+    checkpoint = dict(checkpoint or {})
+    if transaction_ids:
+        checkpoint["kept_transaction_ids"] = list(transaction_ids)
+    if kept_paths:
+        checkpoint["changed"] = list(dict.fromkeys([
+            *[str(one) for one in checkpoint.get("changed", []) if isinstance(one, str)],
+            *kept_paths,
+        ]))
     ledger.record_state("context_tool_budget_exhausted", state)
     remaining = [
         "Use Reset tool time and resume on this saved run, or raise the displayed "
@@ -303,13 +406,11 @@ def _pause_context_tool_budget(
         "was exhausted. Provider thinking, network waits, user pauses, and time "
         "while Nexus was closed were not charged. The exact run remains resumable."
     )
-    recovery = state.get("mutation_recovery")
-    if isinstance(recovery, dict) and recovery.get("status") == "rolled_back":
-        report += " Nexus safely rolled back provisional changes from the interrupted pass."
-    elif isinstance(recovery, dict) and recovery.get("status") == "rollback_conflict":
+    if kept_paths:
         report += (
-            " Nexus could not safely roll back every provisional change because a file "
-            "changed outside this run; reconcile the recorded conflict before continuing."
+            " Nexus kept the project changes the agents already applied in this run ("
+            + ", ".join(kept_paths)
+            + "); resuming continues from the project as it is now."
         )
     finish_state = {
         "resume_token": ledger.session_id,
@@ -340,6 +441,9 @@ def _pause_context_tool_budget(
         "resume_token": ledger.session_id,
         "questions": [],
         "remaining": remaining,
+        "changed": list(kept_paths),
+        "transaction_ids": list(transaction_ids or []),
+        **({"mutation_recovery": recovery} if recovery is not None else {}),
         "checkpoint": dict(checkpoint or {}),
         "context_tool_budget": copy.deepcopy(budget),
         "allowed_write_roots": list(checkpoint.get("allowed_write_roots", []))
@@ -378,19 +482,72 @@ def _continuation_turn(label: str, instruction: str) -> str:
     )
 
 
-PLAN_FORMAT = ResponseFormat("nexus_board_contribution_v1", {
+@dataclass(frozen=True)
+class _AgentReplyFormat(ResponseFormat):
+    """A board-agent reply format whose received replies Nexus reads leniently.
+
+    The schema SENT to providers stays strict-compatible (closed objects, every
+    property listed; optional values nullable) because strict JSON-schema
+    providers require that shape. What Nexus RECEIVES is read tolerantly: extra
+    keys are ignored, omitted optional fields get defaults, prose or fences
+    around the JSON object are skipped, and an over-long free-text field is
+    truncated with a marker instead of failing the whole reply. chat.py's one
+    schema repair asks this format for its verdict (``received_problem``).
+    """
+
+    def received_problem(self, text: str) -> str:
+        try:
+            _lenient_reply_value(str(text or ""), self)
+        except StructuredCollaborationError as exc:
+            return str(exc)
+        return ""
+
+
+# Generous caps (ten times the original contract). They only guide the model:
+# a longer free-text field is truncated with a marker on receipt, a longer
+# list keeps its first items with a note, and file contents are never cut.
+_REPLY_TEXT_CHARACTERS = 120_000
+_REPLY_NOTE_CHARACTERS = 40_000
+_REPLY_ITEM_CHARACTERS = 5_000
+_REPLY_PATH_CHARACTERS = 2_400
+_REPLY_LIST_ITEMS = 120
+_REPLY_PROGRESS_ITEMS = 240
+_REPLY_EFFECT_PATHS = 240
+# Agent file work per reply. FileTransaction gets the same file ceiling.
+MOST_CHANGES_PER_REPLY = 200
+MOST_TOOL_CALLS_PER_REPLY = 64
+# Machine bound on ask/tool rounds in one executor turn (each round is one
+# provider request). Generous; applied work is always kept.
+MOST_TOOL_ROUNDS_PER_TURN = 200
+_CHANGE_CONTENT_CHARACTERS = 5_000_000
+_CHANGE_BASE64_CHARACTERS = 7_000_000
+
+_PROGRESS_ITEM_SCHEMA = {
     "type": "object",
     "properties": {
-        "contribution": {"type": "string", "maxLength": 8000},
-        "message_to_lead": {"type": "string", "maxLength": 4000},
-        "needs_files": {
-            "type": "array", "maxItems": 12,
-            "items": {"type": "string", "maxLength": 240},
-        },
-        "effect_paths": {
-            "type": "array", "maxItems": 24,
-            "items": {"type": "string", "maxLength": 240},
-        },
+        "id": {"type": "string", "maxLength": 1_600},
+        "state": {"type": "string", "maxLength": 1_600},
+        "evidence": {"type": "string", "maxLength": _REPLY_ITEM_CHARACTERS},
+    },
+    "required": ["id", "state", "evidence"],
+    "additionalProperties": False,
+}
+
+
+def _string_list(items: int, characters: int) -> dict[str, Any]:
+    return {
+        "type": "array", "maxItems": items,
+        "items": {"type": "string", "maxLength": characters},
+    }
+
+
+PLAN_FORMAT = _AgentReplyFormat("nexus_board_contribution_v1", {
+    "type": "object",
+    "properties": {
+        "contribution": {"type": "string", "maxLength": _REPLY_TEXT_CHARACTERS},
+        "message_to_lead": {"type": "string", "maxLength": _REPLY_NOTE_CHARACTERS},
+        "needs_files": _string_list(_REPLY_LIST_ITEMS, _REPLY_PATH_CHARACTERS),
+        "effect_paths": _string_list(_REPLY_EFFECT_PATHS, _REPLY_PATH_CHARACTERS),
     },
     "required": ["contribution", "message_to_lead", "needs_files"],
     "additionalProperties": False,
@@ -419,6 +576,46 @@ def _context_tool_call_schema(
     }
 
 
+def _nullable(schema: dict[str, Any]) -> dict[str, Any]:
+    copied = copy.deepcopy(schema)
+    kind = copied.get("type")
+    if isinstance(kind, str) and kind != "null":
+        copied["type"] = [kind, "null"]
+    elif isinstance(kind, list) and "null" not in kind:
+        copied["type"] = [*kind, "null"]
+    return copied
+
+
+def _optional_argument_tool_call_schema(
+    name: str, argument_properties: dict[str, Any], needed: list[str],
+) -> dict[str, Any]:
+    """A tool call whose optional arguments may be left out or sent as null.
+
+    Only ``needed`` arguments are required. Strict providers still receive
+    every property as required (the provider serializer closes the schema),
+    so optional ones are nullable there; Nexus fills defaults for both.
+    """
+
+    properties = {
+        key: (copy.deepcopy(value) if key in needed else _nullable(value))
+        for key, value in argument_properties.items()
+    }
+    schema = _context_tool_call_schema(name, properties, list(needed))
+    schema["required"] = ["name", "arguments"]
+    schema["properties"]["call_id"] = {"type": ["string", "null"], "maxLength": 160}
+    return schema
+
+
+# Defaults Nexus fills for omitted or null context-tool arguments.
+_TOOL_ARGUMENT_DEFAULTS: dict[str, dict[str, Any]] = {
+    "list_tree": {"path": ".", "max_depth": 3, "max_entries": 200},
+    "read_file": {"start_line": 1, "end_line": 10_000_000, "max_bytes": 32_000},
+    "search_workspace": {"max_results": 20},
+}
+
+# The original v1 work contract. Long-horizon goals embed its ``changes`` and
+# ``tool_calls`` sub-schemas, so it stays exactly as it was for them. Work
+# together itself sends EXECUTION_FORMAT below.
 WORK_FORMAT = ResponseFormat("nexus_board_file_work_v1", {
     "type": "object",
     "properties": {
@@ -469,66 +666,90 @@ WORK_FORMAT = ResponseFormat("nexus_board_file_work_v1", {
     "additionalProperties": False,
 })
 
-DISCUSSION_FORMAT = ResponseFormat("nexus_board_goal_discussion_v1", {
+EXECUTION_FORMAT = _AgentReplyFormat("nexus_board_file_work_v2", {
     "type": "object",
     "properties": {
-        "message": {"type": "string", "maxLength": 12000},
-        "goal_complete": {"type": "boolean"},
-        "remaining": {
-            "type": "array", "maxItems": 12,
-            "items": {"type": "string", "maxLength": 500},
-        },
-        "progress": {
-            "type": "array", "maxItems": 24,
+        "reply": {"type": "string", "maxLength": _REPLY_TEXT_CHARACTERS},
+        "changes": {
+            "type": "array", "maxItems": MOST_CHANGES_PER_REPLY,
             "items": {
                 "type": "object",
                 "properties": {
-                    "id": {"type": "string", "maxLength": 160},
-                    "state": {"type": "string", "maxLength": 160},
-                    "evidence": {"type": "string", "maxLength": 500},
+                    "path": {"type": "string", "maxLength": _REPLY_PATH_CHARACTERS},
+                    "content": {"type": ["string", "null"], "maxLength": _CHANGE_CONTENT_CHARACTERS},
+                    "content_base64": {"type": ["string", "null"], "maxLength": _CHANGE_BASE64_CHARACTERS},
+                    "mode": {"type": ["integer", "null"], "minimum": 0, "maximum": 511, "description": "Use null to preserve existing permissions."},
+                    "delete": {"type": ["boolean", "null"]},
+                    "reason": {"type": ["string", "null"], "maxLength": 10_000},
                 },
-                "required": ["id", "state", "evidence"],
+                "required": ["path"],
                 "additionalProperties": False,
             },
+        },
+        "tool_calls": {
+            "type": "array", "maxItems": MOST_TOOL_CALLS_PER_REPLY,
+            "description": (
+                "Context tools to run. You may return tool_calls together with changes: "
+                "Nexus applies the changes first, runs the tools, and gives you the results."
+            ),
+            "items": {
+                "anyOf": [
+                    _optional_argument_tool_call_schema("list_tree", {
+                        "path": {"type": "string"},
+                        "max_depth": {"type": "integer", "minimum": 0, "maximum": 8},
+                        "max_entries": {"type": "integer", "minimum": 1, "maximum": 500},
+                    }, []),
+                    _optional_argument_tool_call_schema(
+                        "read_file", copy.deepcopy(READ_FILE_INPUT_SCHEMA["properties"]),
+                        ["path"],
+                    ),
+                    _optional_argument_tool_call_schema("search_workspace", {
+                        "query": {"type": "string"},
+                        "max_results": {"type": "integer", "minimum": 1, "maximum": 50},
+                    }, ["query"]),
+                    _context_tool_call_schema(
+                        "run_selected_verification", {}, [],
+                    ),
+                    *[_context_tool_call_schema(one["name"], copy.deepcopy(one["input_schema"]["properties"]),
+                        list(one["input_schema"]["required"])) for one in [*RESEARCH_TOOL_DEFINITIONS, *HARNESS_TOOL_DEFINITIONS]],
+                ],
+            },
+        },
+    },
+    "required": ["reply", "changes"],
+    "additionalProperties": False,
+})
+
+DISCUSSION_FORMAT = _AgentReplyFormat("nexus_board_goal_discussion_v1", {
+    "type": "object",
+    "properties": {
+        "message": {"type": "string", "maxLength": _REPLY_TEXT_CHARACTERS},
+        "goal_complete": {"type": "boolean"},
+        "remaining": _string_list(_REPLY_LIST_ITEMS, _REPLY_ITEM_CHARACTERS),
+        "progress": {
+            "type": "array", "maxItems": _REPLY_PROGRESS_ITEMS,
+            "items": copy.deepcopy(_PROGRESS_ITEM_SCHEMA),
         },
     },
     "required": ["message", "goal_complete", "remaining"],
     "additionalProperties": False,
 })
 
-PLAN_REVIEW_FORMAT = ResponseFormat("nexus_board_plan_review_v1", {
+PLAN_REVIEW_FORMAT = _AgentReplyFormat("nexus_board_plan_review_v1", {
     "type": "object",
     "properties": {
-        "contribution": {"type": "string", "maxLength": 8000},
-        "message_to_lead": {"type": "string", "maxLength": 4000},
-        "needs_files": {
-            "type": "array", "maxItems": 12,
-            "items": {"type": "string", "maxLength": 240},
-        },
-        "effect_paths": {
-            "type": "array", "maxItems": 24,
-            "items": {"type": "string", "maxLength": 240},
-        },
+        "contribution": {"type": "string", "maxLength": _REPLY_TEXT_CHARACTERS},
+        "message_to_lead": {"type": "string", "maxLength": _REPLY_NOTE_CHARACTERS},
+        "needs_files": _string_list(_REPLY_LIST_ITEMS, _REPLY_PATH_CHARACTERS),
+        "effect_paths": _string_list(_REPLY_EFFECT_PATHS, _REPLY_PATH_CHARACTERS),
         "ready_to_execute": {"type": "boolean"},
-        "remaining": {
-            "type": "array", "maxItems": 12,
-            "items": {"type": "string", "maxLength": 500},
-        },
+        "remaining": _string_list(_REPLY_LIST_ITEMS, _REPLY_ITEM_CHARACTERS),
         "questions": {
             **copy.deepcopy(user_questions.QUESTIONS_SCHEMA),
         },
         "progress": {
-            "type": "array", "maxItems": 24,
-            "items": {
-                "type": "object",
-                "properties": {
-                    "id": {"type": "string", "maxLength": 160},
-                    "state": {"type": "string", "maxLength": 160},
-                    "evidence": {"type": "string", "maxLength": 500},
-                },
-                "required": ["id", "state", "evidence"],
-                "additionalProperties": False,
-            },
+            "type": "array", "maxItems": _REPLY_PROGRESS_ITEMS,
+            "items": copy.deepcopy(_PROGRESS_ITEM_SCHEMA),
         },
     },
     "required": [
@@ -538,15 +759,12 @@ PLAN_REVIEW_FORMAT = ResponseFormat("nexus_board_plan_review_v1", {
     "additionalProperties": False,
 })
 
-WORK_VERIFICATION_FORMAT = ResponseFormat("nexus_board_work_verification_v1", {
+WORK_VERIFICATION_FORMAT = _AgentReplyFormat("nexus_board_work_verification_v1", {
     "type": "object",
     "properties": {
         "goal_complete": {"type": "boolean"},
-        "feedback": {"type": "string", "maxLength": 8000},
-        "remaining": {
-            "type": "array", "maxItems": 12,
-            "items": {"type": "string", "maxLength": 500},
-        },
+        "feedback": {"type": "string", "maxLength": _REPLY_TEXT_CHARACTERS},
+        "remaining": _string_list(_REPLY_LIST_ITEMS, _REPLY_ITEM_CHARACTERS),
     },
     "required": ["goal_complete", "feedback", "remaining"],
     "additionalProperties": False,
@@ -597,8 +815,9 @@ _PROGRESS_ALIASES = {
 def user_round_limit(value: object) -> int | None:
     """Validate a user-selected per-phase round ceiling.
 
-    ``None`` is deliberately unlimited. It removes only the numeric ceiling;
-    the progress guard still stops a conversation that is demonstrably cycling.
+    ``None`` is deliberately unlimited: the agents decide when they are done.
+    Nexus never stops a run on a progress heuristic; after a long identical
+    stretch it only tells the agents they seem to be looping.
     """
 
     if value is None:
@@ -617,87 +836,6 @@ def _round_numbers(limit: int | None):
     while limit is None or number <= limit:
         yield number
         number += 1
-
-
-def _progress_terms(values: object) -> frozenset[str]:
-    items = values if isinstance(values, list) else [values]
-    return frozenset(
-        re.sub(r"\s+", " ", str(one or "").strip().casefold())
-        for one in items if str(one or "").strip()
-    )
-
-
-def _progress_terms_match(left: frozenset[str], right: frozenset[str]) -> bool:
-    return left == right
-
-
-def _canonical_progress_state(
-    agent_id: str,
-    complete: bool,
-    failed: bool,
-    value: dict[str, Any],
-    files: object = None,
-) -> tuple[
-    str, str, frozenset[str], tuple[tuple[str, str], ...], frozenset[str]
-]:
-    """Return engine-owned canonical state, never a similarity score over prose.
-
-    Provider prose is deliberately excluded.  ``remaining`` is retained only
-    so the engine can attest a monotonic reduction, and structured checkpoints
-    are retained only as stable ID/state pairs whose transitions the progress
-    guard tracks.  Evidence wording itself never buys another round.
-    """
-
-    checkpoints: dict[str, str] = {}
-    duplicate_checkpoint_ids: set[str] = set()
-    raw_progress = value.get("progress", [])
-    if isinstance(raw_progress, list):
-        for item in raw_progress:
-            if not isinstance(item, dict):
-                continue
-            identifier = re.sub(r"\s+", " ", str(item.get("id") or "").strip().casefold())
-            checkpoint_state = re.sub(
-                r"\s+", " ", str(item.get("state") or "").strip().casefold()
-            )
-            evidence = str(item.get("evidence") or "").strip()
-            # A checkpoint without all three schema fields is merely another
-            # provider claim. Duplicate IDs are ambiguous and therefore do not
-            # become engine-tracked progress in this round.
-            if not identifier or not checkpoint_state or not evidence:
-                continue
-            if identifier in duplicate_checkpoint_ids:
-                continue
-            if identifier in checkpoints:
-                checkpoints.pop(identifier, None)
-                duplicate_checkpoint_ids.add(identifier)
-                continue
-            checkpoints[identifier] = checkpoint_state
-    state = {
-        "complete": bool(complete),
-        "failed": bool(failed),
-    }
-    return (
-        agent_id,
-        hashlib.sha256(
-            json.dumps(state, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        ).hexdigest(),
-        frozenset(),
-        tuple(sorted(checkpoints.items())),
-        _progress_terms(_remaining(value)),
-    )
-
-
-def _progress_states_match(left: tuple[Any, ...], right: tuple[Any, ...]) -> bool:
-    if len(left) != len(right):
-        return False
-    for one, two in zip(left, right):
-        if not isinstance(one, tuple) or not isinstance(two, tuple) or one[:2] != two[:2]:
-            return False
-        one_remaining = one[2] if len(one) > 2 and isinstance(one[2], frozenset) else frozenset()
-        two_remaining = two[2] if len(two) > 2 and isinstance(two[2], frozenset) else frozenset()
-        if not _progress_terms_match(one_remaining, two_remaining):
-            return False
-    return True
 
 
 def _context_result_evidence_digest(
@@ -760,161 +898,111 @@ def _requirement_context_terms(contract: dict[str, Any]) -> set[str]:
     return {one for one in terms if one}
 
 
-_CHECKPOINT_STATUS_RANKS = {
-    "pending": 0,
-    "started": 1,
-    "investigating": 2,
-    "in progress": 2,
-    "working": 2,
-    "implemented": 3,
-    "ready": 3,
-    "tested": 4,
-    "validated": 4,
-    "verified": 5,
-    "complete": 6,
-    "completed": 6,
-    "done": 6,
-}
-_CHECKPOINT_TERMINAL_STATES = {"verified", "complete", "completed", "done"}
+class _RepetitionNotice:
+    """Notice a run in which every agent keeps sending exactly the same reply.
+
+    Nexus never stops agents on a progress heuristic. Only after a long
+    stretch in which the full replies of every agent (and, for project work,
+    the project state) were exactly identical round after round does it tell
+    the agents they seem to be looping; they continue either way. Any change
+    in any reply, applied edit, tool call or remaining item resets the count.
+    User-set round limits still apply.
+    """
+
+    ROUNDS = 6
+
+    def __init__(self, rounds: int | None = None) -> None:
+        self.rounds = max(2, int(rounds or self.ROUNDS))
+        self.last = ""
+        self.identical = 0
+        self.notices = 0
+
+    @staticmethod
+    def signature(parts: object) -> str:
+        return hashlib.sha256(json.dumps(
+            parts, sort_keys=True, default=str, ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+
+    def observe(self, parts: object) -> str:
+        """Record one round; return a notice for the agents, or ""."""
+
+        digest = self.signature(parts)
+        self.identical = self.identical + 1 if digest == self.last else 1
+        self.last = digest
+        if self.identical < self.rounds or self.identical % self.rounds:
+            return ""
+        self.notices += 1
+        return (
+            f"NEXUS NOTICE: the last {self.identical} rounds were exactly identical: every "
+            "agent sent the same reply and nothing else changed. You may be going in a "
+            "circle. Nexus is not stopping you. If the work is done, say so; if something "
+            "blocks you, name it (or ask the user); otherwise try a different approach."
+        )
 
 
-def _checkpoint_progress_value(state: str) -> tuple[str, int] | None:
-    """Recognise deterministic monotonic checkpoint state, not arbitrary prose."""
-
-    held = re.sub(r"[_-]+", " ", str(state or "").strip().casefold())
-    held = re.sub(r"\s+", " ", held)
-    if held in _CHECKPOINT_STATUS_RANKS:
-        return "status", _CHECKPOINT_STATUS_RANKS[held]
-    numbered = re.fullmatch(
-        r"(?:(?:step|checkpoint|phase)\s*)?(\d+)(?:\s*(?:/|of)\s*(\d+))?",
-        held,
-    )
-    if not numbered:
-        return None
-    current = int(numbered.group(1))
-    total = int(numbered.group(2)) if numbered.group(2) else None
-    if current < 0 or (total is not None and (total < 1 or current > total)):
-        return None
-    return (f"counter/{total}" if total is not None else "counter", current)
+# A peer that failed this many turns in a row stops being asked in a
+# discussion (a machine/account guard, not a judgement of its work).
+_MOST_FAILED_TURNS_IN_A_ROW = 3
+# Machine guard against a true loop burning the user's subscription. It looks
+# only at OUTCOMES, never at wording: completion/readiness flags, verification
+# status and the content of the files the run changed. It stops a run (keeping
+# all work, resumable) when the outcome has not produced a new state for this
+# many rounds, or, where the outcome includes project content, when the run
+# keeps returning to a state it already left (A -> B -> A -> B -> A edits).
+NO_CHANGE_GUARD_ROUNDS = 200
+# Entering an already-left outcome state this many more times is a cycle.
+OUTCOME_CYCLE_REVISITS = 2
 
 
-def _meaningful_checkpoint_advance(previous: str, current: str) -> bool:
-    """True only for a forward engine-recognised or terminal transition."""
+class _NoChangeGuard:
+    """Outcome-state guard: no new outcome for long, or a revisited cycle."""
 
-    before = _checkpoint_progress_value(previous)
-    after = _checkpoint_progress_value(current)
-    if after is None:
+    def __init__(self, rounds: int | None = None, *, detect_cycles: bool = False) -> None:
+        self.rounds = rounds
+        self.detect_cycles = detect_cycles
+        self.current = ""
+        self.seen: set[str] = set()
+        self.revisits: dict[str, int] = {}
+        self.since_new = 0
+        self.reason = ""
+
+    def stuck(self, outcome: object) -> bool:
+        """Record one round's outcome; True when the run should stop."""
+
+        digest = _RepetitionNotice.signature(outcome)
+        limit = self.rounds if self.rounds is not None else NO_CHANGE_GUARD_ROUNDS
+        if digest not in self.seen:
+            self.seen.add(digest)
+            self.current = digest
+            self.since_new = 1
+            return False
+        if digest != self.current:
+            self.revisits[digest] = self.revisits.get(digest, 0) + 1
+            self.current = digest
+            if self.detect_cycles and self.revisits[digest] >= OUTCOME_CYCLE_REVISITS:
+                self.reason = "cycle"
+                return True
+        self.since_new += 1
+        if self.since_new >= max(2, int(limit)):
+            self.reason = "no_new_outcome"
+            return True
         return False
-    normalized_current = re.sub(
-        r"\s+", " ", re.sub(r"[_-]+", " ", current.strip().casefold())
+
+
+def _no_change_guard_note(reason: str = "no_new_outcome") -> str:
+    if reason == "cycle":
+        return (
+            "Nexus paused because the run kept returning to a project state it had already "
+            "left (the same file contents, checks and completion flags came back again and "
+            "again). All work is kept; resume or rephrase the goal to continue."
+        )
+    return (
+        f"Nexus paused after {NO_CHANGE_GUARD_ROUNDS} rounds without a new outcome (no new "
+        "file content, verification result or completion state; rewording does not count). "
+        "All work is kept; resume or rephrase the goal to continue."
     )
-    if before is None:
-        return normalized_current in _CHECKPOINT_TERMINAL_STATES
-    return before[0] == after[0] and after[1] > before[1]
 
-
-class _ProgressGuard:
-    """Notice stable or oscillating actionable state without policing duration."""
-
-    def __init__(self) -> None:
-        self.recent: list[
-            tuple[tuple[Any, ...], ...]
-        ] = []
-        self.identical_run = 0
-        self._agents_seen: set[str] = set()
-        self._last_remaining: dict[str, frozenset[str]] = {}
-        self._tracked_checkpoint_ids: dict[str, set[str]] = {}
-        self._checkpoint_last: dict[str, dict[str, str]] = {}
-        self._checkpoint_seen_states: dict[str, dict[str, set[str]]] = {}
-        self._attested_epochs: dict[str, int] = {}
-        self._observations_seen: dict[str, set[str]] = {}
-
-    def _attest(
-        self, state: tuple[tuple[Any, ...], ...], observations: dict[str, set[str]] | None = None,
-    ) -> tuple[tuple[Any, ...], ...]:
-        """Project provider structure into monotonic engine-observed progress.
-
-        Arbitrary new prose or rotating checkpoint IDs cannot keep a run alive.
-        A round advances only when an existing unresolved set shrinks or a
-        stable checkpoint ID reaches a state that ID has never visited before.
-        Revisiting A/B states remains an oscillation and is stopped.
-        """
-
-        attested: list[tuple[Any, ...]] = []
-        for item in state:
-            if len(item) < 2:
-                continue
-            agent_id = str(item[0])
-            base = item[1]
-            remaining = (
-                item[4] if len(item) > 4 and isinstance(item[4], frozenset)
-                else frozenset()
-            )
-            checkpoints = dict(
-                item[3] if len(item) > 3 and isinstance(item[3], tuple) else ()
-            )
-            first = agent_id not in self._agents_seen
-            self._agents_seen.add(agent_id)
-            advanced = False
-            observed = (observations or {}).get(agent_id, set())
-            already_seen = self._observations_seen.setdefault(agent_id, set())
-            if observed - already_seen:
-                advanced = not first
-                already_seen.update(observed)
-            previous_remaining = self._last_remaining.get(agent_id, frozenset())
-            if not first and previous_remaining and remaining < previous_remaining:
-                advanced = True
-            self._last_remaining[agent_id] = remaining
-
-            tracked = self._tracked_checkpoint_ids.setdefault(agent_id, set())
-            last = self._checkpoint_last.setdefault(agent_id, {})
-            seen = self._checkpoint_seen_states.setdefault(agent_id, {})
-            if not tracked and checkpoints:
-                # Establish stable identities without treating the provider's
-                # first claim as completed work.
-                tracked.update(checkpoints)
-            current_terms: set[str] = set()
-            for identifier in sorted(tracked):
-                current = checkpoints.get(identifier, "<missing>")
-                previous = last.get(identifier)
-                visited = seen.setdefault(identifier, set())
-                if (
-                    previous is not None
-                    and current != previous
-                    and current != "<missing>"
-                    and current not in visited
-                    and _meaningful_checkpoint_advance(previous, current)
-                ):
-                    advanced = True
-                if current != "<missing>":
-                    visited.add(current)
-                last[identifier] = current
-            epoch = self._attested_epochs.get(agent_id, 0) + (1 if advanced else 0)
-            self._attested_epochs[agent_id] = epoch
-            current_terms.add(f"attested-epoch:{epoch}")
-            attested.append((agent_id, base, frozenset(current_terms)))
-        return tuple(attested)
-
-    def stalled(
-        self,
-        state: tuple[tuple[Any, ...], ...],
-        *, observations: dict[str, set[str]] | None = None,
-    ) -> bool:
-        state = self._attest(state, observations)
-        same_as_last = bool(self.recent) and _progress_states_match(self.recent[-1], state)
-        self.identical_run = self.identical_run + 1 if same_as_last else 1
-        self.recent.append(state)
-        if len(self.recent) > 12:
-            self.recent.pop(0)
-        # Long-horizon work defaults toward continuation. Fourteen identical
-        # engine-owned states are required for a stable loop. A/B oscillation
-        # needs four complete cycles; shorter patterns remain legitimate
-        # legitimate attempt sequence.
-        alternating = len(self.recent) >= 8 and all(
-            _progress_states_match(self.recent[-8 + index], self.recent[-6 + index])
-            for index in range(6)
-        ) and not _progress_states_match(self.recent[-1], self.recent[-2])
-        return self.identical_run >= 14 or alternating
 
 _DIRECT_COLLABORATION = re.compile(
     r"\b(?:work\s+together|collaborat(?:e|ion|ively)?|ask\s+(?:the\s+)?(?:other|connected)\s+agents?"
@@ -952,9 +1040,23 @@ def _agent(board: dict[str, Any], agent_id: str) -> dict[str, Any]:
     raise SwarmError("That agent is not on the board any more. Refresh the board.")
 
 
+# How many board agents one work-together run contacts at once. It protects
+# the machine and the user's provider accounts; it is generous, and when it
+# applies the user is told which agents were left out (never silently).
+MOST_PARTICIPANTS = 24
+
+
 def _participants(
     board: dict[str, Any], lead: dict[str, Any], peer_id: str = ""
 ) -> list[dict[str, Any]]:
+    return _participants_and_left_out(board, lead, peer_id)[0]
+
+
+def _participants_and_left_out(
+    board: dict[str, Any], lead: dict[str, Any], peer_id: str = ""
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Ready connected agents, plus any the participant cap left out."""
+
     found = [lead]
     for one in board.get("agents", []):
         if (
@@ -973,8 +1075,18 @@ def _participants(
             raise SwarmError(
                 "The other agent in this chat is not ready or no longer connected."
             )
-        return [lead, chosen]
-    return found[:chat_lab.MOST_AT_ONCE]
+        return [lead, chosen], []
+    return found[:MOST_PARTICIPANTS], found[MOST_PARTICIPANTS:]
+
+
+def _left_out_notice(left_out: list[dict[str, Any]]) -> str:
+    if not left_out:
+        return ""
+    return (
+        f"Nexus contacts at most {MOST_PARTICIPANTS} agents in one run, so "
+        + ", ".join(str(one.get("name") or one.get("id") or "an agent") for one in left_out)
+        + " did not take part in this run."
+    )
 
 
 def board_context(
@@ -1182,6 +1294,7 @@ _SEMANTIC_HISTORY_MARKER = re.compile(
 
 def _semantic_history_summary(
     contributions: list[dict[str, Any]], maximum: int,
+    turn_numbers: list[int] | None = None,
 ) -> str:
     """Keep deterministic semantic evidence from turns outside the recent tail.
 
@@ -1192,7 +1305,14 @@ def _semantic_history_summary(
     """
 
     candidates_by_turn: list[list[str]] = []
-    for index, one in enumerate(contributions, start=1):
+    for position, one in enumerate(contributions):
+        # Callers that summarize a non-prefix selection pass the real turn
+        # numbers so the quoted history still names the right turn.
+        index = (
+            turn_numbers[position]
+            if turn_numbers is not None and position < len(turn_numbers)
+            else position + 1
+        )
         turn_candidates: list[str] = []
         identity = (
             f"turn {index} · {one.get('speaker_name') or 'unknown'} · "
@@ -1213,6 +1333,9 @@ def _semantic_history_summary(
                     )
         text = re.sub(r"\s+", " ", str(one.get("text") or "")).strip()
         if not text:
+            # A turn with only structured progress (remaining work, needed
+            # files) still carries meaning; keep it even without prose.
+            candidates_by_turn.append(turn_candidates)
             continue
         matches = list(_SEMANTIC_HISTORY_MARKER.finditer(text))
         for match in matches[:8]:
@@ -1298,7 +1421,8 @@ def _prompt_conversation(contributions: list[dict[str, Any]]) -> str:
 
     Earlier turns remain in the collaboration ledger and its paged projections.
     Prompts receive an engine-owned rolling summary plus as many newest complete
-    turns as fit; no turn is silently clipped in the middle.
+    turns as fit; no turn is silently clipped in the middle. Only a newest turn
+    that alone exceeds the budget is clipped, and it says so explicitly.
     """
 
     full = _actual_conversation(contributions)
@@ -1325,23 +1449,48 @@ def _prompt_conversation(contributions: list[dict[str, Any]]) -> str:
     )
     kept: list[str] = []
     used = 0
-    for one in reversed(contributions):
+    newest_clipped = False
+    for position in range(len(contributions) - 1, -1, -1):
+        one = contributions[position]
         block = (
             f"{one.get('speaker_name') or 'An agent'} ({one.get('speaker_route') or 'unknown route'}):\n"
             f"{one.get('text') or ''}"
         )
-        if len(block) > remaining - used:
+        if len(block) <= remaining - used:
+            kept.append(block)
+            used += len(block) + 2
+            continue
+        if kept:
             break
-        kept.append(block)
-        used += len(block) + 2
+        # The newest turn alone is longer than the budget. Dropping it would
+        # also drop every recent complete turn behind it, so show its start
+        # with a clear marker and leave half the budget for earlier turns.
+        share = remaining // 2 if position else remaining
+        marker = (
+            f"\n[turn clipped to fit the prompt budget: {len(block)} characters "
+            "in full; the complete turn is in the canonical collaboration ledger "
+            "and its semantic evidence is summarized above]"
+        )
+        clipped = block[:max(0, share - len(marker))] + marker
+        kept.append(clipped)
+        used += len(clipped) + 2
+        newest_clipped = True
     omitted = max(0, len(contributions) - len(kept))
     older = contributions[:omitted]
+    turn_numbers = list(range(1, omitted + 1))
+    if newest_clipped:
+        # The clipped tail may hold decisions or structured progress, so the
+        # semantic summary keeps the whole newest turn as well.
+        older = older + [contributions[-1]]
+        turn_numbers.append(len(contributions))
     semantic_summary = _semantic_history_summary(
-        older, PROMPT_SEMANTIC_SUMMARY_CHARACTERS,
+        older, PROMPT_SEMANTIC_SUMMARY_CHARACTERS, turn_numbers,
     )
     return (
         header
-        + f"\n[older turns semantically summarized: {omitted}; newest complete turns below: {len(kept)}]\n\n"
+        + f"\n[older turns semantically summarized: {omitted}; newest complete turns below: {len(kept) - int(newest_clipped)}"
+        + ("; newest turn clipped to fit: 1" if newest_clipped else "")
+        + "]\n\n"
         + semantic_summary
         + "\n\nNEWEST COMPLETE TURNS\n"
         + "\n\n".join(reversed(kept))
@@ -1408,6 +1557,56 @@ class _MutationSaga:
         self.value["updated_at"] = int(time.time())
         self._write()
 
+    def touch(self) -> None:
+        """Heartbeat: the owning run is still working (see _owner_alive)."""
+
+        now = int(time.time())
+        if now - int(self.value.get("heartbeat_at") or 0) < 5:
+            return
+        self.value["heartbeat_at"] = now
+        self._write()
+
+    def abandon(self, transaction_id: str, reason: str, *, restored: bool) -> None:
+        """Record that one transaction failed to apply (the others stay)."""
+
+        for entry in self.value["transactions"]:
+            if entry.get("transaction_id") == transaction_id:
+                entry["phase"] = "restored" if restored else "conflict"
+                entry["reason"] = reason
+        self.value["updated_at"] = int(time.time())
+        self._write()
+
+    def keep(self, reason: str) -> dict[str, Any]:
+        """Close the saga keeping every applied transaction (a pause).
+
+        Nothing is rolled back. A kept saga is terminal, so crash recovery
+        never compensates it later; the resumed run starts a new saga from
+        the project as it is now.
+        """
+
+        kept = [
+            str(one.get("transaction_id")) for one in self.value["transactions"]
+            if one.get("phase") == "applied"
+        ]
+        if self.value.get("phase") in {"compensated", "rollback_conflict", "committed", "kept"}:
+            _active_mutation_sagas.pop(str(self.value["saga_id"]), None)
+            return {
+                "status": str(self.value.get("phase")),
+                "kept_transaction_ids": kept,
+                "saga_id": self.value["saga_id"],
+            }
+        self.value["phase"] = "kept"
+        self.value["kept_reason"] = reason
+        self.value["completed_at"] = int(time.time())
+        self._write()
+        _active_mutation_sagas.pop(str(self.value["saga_id"]), None)
+        return {
+            "status": "kept",
+            "kept_transaction_ids": kept,
+            "reason": reason,
+            "saga_id": self.value["saga_id"],
+        }
+
     def compensate(self, reason: str) -> dict[str, Any]:
         self.value["phase"] = "compensating"
         self.value["compensation_reason"] = reason
@@ -1460,6 +1659,12 @@ class _MutationSaga:
         }
 
     def complete(self, verification_status: str) -> None:
+        # A compensated or conflicted saga already has its final outcome.
+        # Relabelling it "committed" would hide a half-rolled-back tree from
+        # recovery, so keep the compensation result exactly as recorded.
+        if self.value.get("phase") in {"compensated", "rollback_conflict", "kept"}:
+            _active_mutation_sagas.pop(str(self.value["saga_id"]), None)
+            return
         self.value["phase"] = "committed"
         self.value["verification_status"] = verification_status
         self.value["completed_at"] = int(time.time())
@@ -1489,19 +1694,39 @@ class _MutationSaga:
         except (OSError, IndexError):
             return ""
 
+    # When Windows refuses even PROCESS_QUERY_LIMITED_INFORMATION (csrss,
+    # lsass, another user's or an elevated process), the owner's identity
+    # cannot be checked. Such a lease counts as alive only while its
+    # heartbeat is this recent; a reused PID can never hold it forever.
+    ACCESS_DENIED_LEASE_SECONDS = 2 * 60 * 60
+
     @classmethod
-    def _owner_alive(cls, pid: object, expected_identity: object = "") -> bool:
+    def _owner_alive(
+        cls, pid: object, expected_identity: object = "", last_seen: object = None,
+    ) -> bool:
         if not isinstance(pid, int) or pid <= 0:
             return False
         if os.name == "nt":
             import ctypes
 
-            process = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+            from ctypes import wintypes
+
+            # Only a library loaded with use_last_error records the error code.
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            process = kernel32.OpenProcess(0x1000, False, pid)
             if not process:
-                return False
+                # Access denied means some live process owns the PID, but its
+                # birth identity cannot be read, so it may be a reused PID
+                # (csrss, lsass). Trust it only while the lease heartbeat is
+                # fresh; a lease without any time (legacy) stays alive.
+                if int(ctypes.get_last_error()) != 5:
+                    return False
+                return cls._lease_is_fresh(last_seen)
             try:
                 exit_code = ctypes.c_ulong()
-                if not ctypes.windll.kernel32.GetExitCodeProcess(
+                if not kernel32.GetExitCodeProcess(
                     process, ctypes.byref(exit_code)
                 ):
                     return False
@@ -1511,16 +1736,44 @@ class _MutationSaga:
                     or cls._owner_identity(pid) == str(expected_identity)
                 )
             finally:
-                ctypes.windll.kernel32.CloseHandle(process)
+                kernel32.CloseHandle(process)
         try:
             os.kill(pid, 0)
+        except PermissionError:
+            return cls._lease_is_fresh(last_seen)
         except (OSError, ValueError):
             return False
         return not expected_identity or cls._owner_identity(pid) == str(expected_identity)
 
     @classmethod
+    def _lease_is_fresh(cls, last_seen: object) -> bool:
+        if last_seen is None or last_seen == "":
+            return True
+        try:
+            seen = float(last_seen)
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(seen):
+            return False
+        return time.time() - seen <= cls.ACCESS_DENIED_LEASE_SECONDS
+
+    @classmethod
     def recover_orphans(cls, root: Path) -> list[dict[str, Any]]:
-        folder = confined_path(root.resolve(), cls.FOLDER, allow_control=True)
+        """Settle journals left by earlier runs; never lock the project.
+
+        * An earlier rollback conflict: the user's current files are the
+          truth. The conflict (journal path, transactions, files) is recorded
+          as acknowledged and reported, and no further automatic rollback is
+          tried, so the next run proceeds.
+        * A run whose process died: its applied transactions are kept. Only a
+          transaction caught half-way (prepared or rolling back) is restored,
+          so nothing is left half-applied. A user-requested undo that was
+          interrupted is finished.
+        * A damaged journal is set aside (renamed, never deleted) and reported.
+        """
+
+        resolved = root.resolve()
+        folder = confined_path(resolved, cls.FOLDER, allow_control=True)
         if not folder.is_dir():
             return []
         recovered: list[dict[str, Any]] = []
@@ -1528,36 +1781,186 @@ class _MutationSaga:
             try:
                 value = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
-                recovered.append({"status": "journal_damaged", "path": path.name})
+                aside = path.with_name(path.name + ".damaged")
+                try:
+                    os.replace(path, aside)
+                except OSError:
+                    aside = path
+                recovered.append({
+                    "status": "journal_damaged", "path": path.name,
+                    "journal_path": str(aside),
+                    "message": (
+                        f"Nexus found an unreadable mutation journal and set it aside at {aside}; "
+                        "the project files were left exactly as they are."
+                    ),
+                })
                 continue
             if not isinstance(value, dict):
                 continue
+            saga_id = str(value.get("saga_id") or path.stem)
             if value.get("phase") == "rollback_conflict":
-                recovered.append({
-                    "status": "rollback_conflict",
-                    "saga_id": str(value.get("saga_id") or path.stem),
-                    "reason": "A prior compensation conflict still requires reconciliation.",
-                })
+                recovered.append(cls._acknowledge_conflict(resolved, path, value))
                 continue
             if value.get("phase") not in {"active", "compensating"}:
                 continue
-            saga_id = str(value.get("saga_id") or "")
             owner_pid = value.get("owner_pid")
             locally_active = (
                 owner_pid == os.getpid() and saga_id in _active_mutation_sagas
             )
             remotely_active = (
                 owner_pid != os.getpid()
-                and cls._owner_alive(owner_pid, value.get("owner_identity"))
+                and cls._owner_alive(
+                    owner_pid, value.get("owner_identity"),
+                    value.get("heartbeat_at") or value.get("updated_at") or value.get("created_at"),
+                )
             )
             if locally_active or remotely_active:
                 continue
             saga = object.__new__(cls)
-            saga.root = root.resolve()
+            saga.root = resolved
             saga.path = path
             saga.value = value
-            recovered.append(saga.compensate("process_crash_recovery"))
+            reason = str(value.get("compensation_reason") or "")
+            if value.get("phase") == "compensating" and reason.startswith("user_cancelled"):
+                result = saga.compensate(reason)
+                if result.get("status") == "rollback_conflict":
+                    result = cls._acknowledge_conflict(resolved, path, saga.value)
+                recovered.append(result)
+                continue
+            recovered.append(saga._recover_after_crash())
         return recovered
+
+    @staticmethod
+    def _acknowledge_conflict(
+        root: Path, path: Path, value: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Describe an earlier compensation conflict exactly; write nothing.
+
+        Compensation runs newest-first and stops at the first transaction it
+        cannot undo, so newer transactions were undone while the conflicting
+        one and every older one stay applied. The journal is marked
+        acknowledged only by ``acknowledge_conflicts`` once the notice is
+        durably recorded, so an early stop never loses it.
+        """
+
+        entries = [one for one in value.get("transactions", []) if isinstance(one, dict)]
+
+        def ids(*phases: str) -> list[str]:
+            return [
+                str(one.get("transaction_id") or "") for one in entries
+                if one.get("phase") in phases and one.get("transaction_id")
+            ]
+
+        conflict_ids = ids("conflict")
+        undone_ids = ids("compensated")
+        still_applied_ids = ids("applied", "prepared", "conflict")
+        conflict_files = _transaction_paths(root, conflict_ids)
+        undone_files = _transaction_paths(root, undone_ids)
+        still_applied_files = _transaction_paths(root, still_applied_ids)
+        reasons = [
+            str(one.get("reason") or "") for one in entries
+            if one.get("phase") == "conflict" and one.get("reason")
+        ]
+        return {
+            "status": "rollback_conflict_acknowledged",
+            "saga_id": str(value.get("saga_id") or path.stem),
+            "journal_path": str(path),
+            "conflict_transaction_ids": conflict_ids,
+            "conflicting_files": conflict_files,
+            "rolled_back_transaction_ids": undone_ids,
+            "rolled_back_files": undone_files,
+            "still_applied_transaction_ids": still_applied_ids,
+            "still_applied_files": still_applied_files,
+            "reason": "; ".join(reasons),
+            "message": (
+                "An earlier run's undo stopped because "
+                + (", ".join(conflict_files) if conflict_files else "some files")
+                + " changed afterwards. "
+                + ("It had already undone: " + ", ".join(undone_files) + ". "
+                   if undone_files else "Nothing had been undone yet. ")
+                + ("Still applied (kept exactly as they are now): "
+                   + ", ".join(still_applied_files) + ". "
+                   if still_applied_files else "")
+                + f"Nexus does not retry that undo; the conflict is recorded in {path}."
+            ),
+        }
+
+    @classmethod
+    def acknowledge_conflicts(cls, recovered: list[dict[str, Any]]) -> None:
+        """Mark reported conflict journals acknowledged (after the notice is saved)."""
+
+        for one in recovered:
+            if one.get("status") != "rollback_conflict_acknowledged":
+                continue
+            path = Path(str(one.get("journal_path") or ""))
+            try:
+                value = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(value, dict) or value.get("phase") != "rollback_conflict":
+                continue
+            value["phase"] = "conflict_acknowledged"
+            value["acknowledged_at"] = int(time.time())
+            value["acknowledgement"] = one.get("message")
+            try:
+                atomic_write(
+                    path, (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+                )
+            except OSError:
+                pass
+
+    def _recover_after_crash(self) -> dict[str, Any]:
+        """Keep applied work of a dead run; restore only half-applied transactions."""
+
+        kept: list[str] = []
+        restored: list[str] = []
+        conflicts: list[dict[str, Any]] = []
+        transaction = FileTransaction(self.root)
+        for entry in self.value.get("transactions", []):
+            transaction_id = str(entry.get("transaction_id") or "")
+            if not transaction_id or entry.get("phase") in {"compensated", "restored", "conflict", "kept"}:
+                continue
+            try:
+                manifest = transaction.load_manifest(transaction_id)
+            except HarnessError:
+                manifest = None
+            state = manifest.get("state") if isinstance(manifest, dict) else None
+            if state == "applied":
+                entry["phase"] = "kept"
+                kept.append(transaction_id)
+                continue
+            if state is None or state in {"aborted", "rolled_back"}:
+                entry["phase"] = "restored"
+                entry["reason"] = (
+                    "transaction_manifest_was_never_created" if state is None
+                    else f"transaction_already_{state}"
+                )
+                continue
+            try:
+                transaction.rollback(transaction_id)
+            except HarnessError as exc:
+                entry["phase"] = "conflict"
+                entry["reason"] = str(exc)
+                conflicts.append({
+                    "transaction_id": transaction_id, "reason": str(exc),
+                    "files": _transaction_paths(self.root, [transaction_id]),
+                })
+                continue
+            entry["phase"] = "restored"
+            restored.append(transaction_id)
+        self.value["phase"] = "recovered_after_crash"
+        self.value["completed_at"] = int(time.time())
+        self._write()
+        _active_mutation_sagas.pop(str(self.value.get("saga_id") or ""), None)
+        return {
+            "status": "recovered",
+            "saga_id": self.value.get("saga_id"),
+            "journal_path": str(self.path),
+            "kept_transaction_ids": kept,
+            "kept_files": _transaction_paths(self.root, kept),
+            "restored_transaction_ids": restored,
+            "conflicts": conflicts,
+        }
 
 
 def _manifest_sha256(manifest: dict[str, Any]) -> str:
@@ -1627,7 +2030,9 @@ def _share_turn(
 
 def _remaining(value: dict[str, Any]) -> list[str]:
     raw = value.get("remaining")
-    return [str(one).strip()[:500] for one in raw if str(one).strip()] if isinstance(raw, list) else []
+    return [
+        str(one).strip()[:_REPLY_ITEM_CHARACTERS] for one in raw if str(one).strip()
+    ] if isinstance(raw, list) else []
 
 
 def _schema_problem(value: object, schema: dict[str, Any], path: str = "result") -> str:
@@ -1702,26 +2107,34 @@ def _schema_problem(value: object, schema: dict[str, Any], path: str = "result")
     return ""
 
 
-def _decode(
-    answer: dict[str, Any], label: str, response_format: ResponseFormat
-) -> dict[str, Any]:
-    raw = str(answer.get("text") or "").strip()
+def _strip_leading_markers(raw: str) -> str:
     # Consumer web renderers sometimes prefix the visible answer with a BOM or
     # a private-use formatting glyph (the observed Claude marker is U+E056).
-    # Ignore only those leading marker code points; arbitrary prose remains a
-    # hard schema failure.
     while raw and (
-        raw[0] == "\ufeff"
+        raw[0] == "﻿"
         or 0xE000 <= ord(raw[0]) <= 0xF8FF
         or 0xF0000 <= ord(raw[0]) <= 0xFFFFD
         or 0x100000 <= ord(raw[0]) <= 0x10FFFD
     ):
         raw = raw[1:].lstrip()
+    return raw
+
+
+def _decode(
+    answer: dict[str, Any], label: str, response_format: ResponseFormat
+) -> dict[str, Any]:
+    if isinstance(response_format, _AgentReplyFormat):
+        try:
+            return _lenient_reply_value(str(answer.get("text") or ""), response_format)
+        except StructuredCollaborationError as exc:
+            raise StructuredCollaborationError(f"{label} {exc}") from exc
+    raw = _strip_leading_markers(str(answer.get("text") or "").strip())
     # API providers can enforce response_format natively; consumer web chats
     # cannot. ChatGPT and Gemini occasionally wrap an otherwise exact JSON
     # object in a Markdown JSON fence. Accept that presentation wrapper while
-    # retaining the same strict schema boundary below. Arbitrary prose around a
-    # payload is still rejected rather than silently reinterpreted as control.
+    # retaining the same strict schema boundary below. (Formats owned by work
+    # together are read leniently above; this strict path serves callers such
+    # as long-horizon goals that decode their own contracts.)
     fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", raw, re.IGNORECASE | re.DOTALL)
     if fenced:
         raw = fenced.group(1).strip()
@@ -1752,6 +2165,306 @@ def _decode(
             f"{label} returned an invalid {response_format.name} result: {problem}"
         )
     return value
+
+
+# -- lenient reading of what board agents send -------------------------------
+
+_TRUNCATION_MARKER = "\n[... Nexus shortened this field: {omitted} more characters were not kept ...]"
+# Never shortened: a cut file body or path would corrupt the project. Such an
+# entry is refused on its own (with the reason) if it is unusable.
+_NEVER_TRUNCATE = frozenset({"content", "content_base64", "path"})
+# Lists whose excess items are summarised by one marker item.
+_MARKED_LISTS = frozenset({"remaining"})
+_LENIENT_DROP = object()
+_JSON_OBJECT_ATTEMPTS = 400
+
+
+def _json_object_candidates(raw: str) -> list[dict[str, Any]]:
+    """The JSON object an agent's reply carries, when it is unambiguous.
+
+    Accepted: the whole reply (after trimming), one outer fence or a
+    language-label line, the LAST fenced block, or one object that ends the
+    reply after some prose. An object quoted in the middle of prose ("the
+    format asks for {...} when done. It is NOT done") is not the reply, so
+    nothing is returned and the caller asks for a format correction.
+    """
+
+    held = _strip_leading_markers(str(raw or "").strip())
+
+    def load(text: str) -> dict[str, Any] | None:
+        try:
+            value = json.loads(text)
+        except (json.JSONDecodeError, ValueError, RecursionError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    whole = load(held)
+    if whole is not None:
+        return [whole]
+    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", held, re.IGNORECASE | re.DOTALL)
+    if fenced and load(fenced.group(1).strip()) is not None:
+        return [load(fenced.group(1).strip())]  # type: ignore[list-item]
+    labelled = re.fullmatch(r"json[ \t]*\r?\n(?P<body>\{[\s\S]*\})", held, re.IGNORECASE)
+    if labelled and load(labelled.group("body").strip()) is not None:
+        return [load(labelled.group("body").strip())]  # type: ignore[list-item]
+    blocks = list(re.finditer(
+        r"```(?:json|JSON)?[ \t]*\r?\n(.*?)\r?\n[ \t]*```", held, re.DOTALL,
+    ))
+    if blocks:
+        last = load(blocks[-1].group(1).strip())
+        return [last] if last is not None else []
+    # One object that ends the reply: decode from each "{" and accept only
+    # an object whose end is the end of the text.
+    decoder = json.JSONDecoder()
+    attempts = 0
+    for match in re.finditer(r"\{", held):
+        if attempts >= _JSON_OBJECT_ATTEMPTS:
+            break
+        attempts += 1
+        try:
+            value, end = decoder.raw_decode(held, match.start())
+        except (json.JSONDecodeError, ValueError, RecursionError):
+            continue
+        if isinstance(value, dict) and not held[end:].strip():
+            return [value]
+    return []
+
+
+def _lenient_default(schema: dict[str, Any]) -> Any:
+    kind = schema.get("type")
+    kinds = kind if isinstance(kind, list) else [kind]
+    if "array" in kinds:
+        return []
+    if "boolean" in kinds:
+        return False
+    if "object" in kinds:
+        return {}
+    if "string" in kinds:
+        return ""
+    return None
+
+
+def _lenient_field(value: Any, schema: dict[str, Any], name: str) -> Any:
+    kind = schema.get("type")
+    kinds = [one for one in (kind if isinstance(kind, list) else [kind]) if one]
+    if value is None:
+        return None if "null" in kinds else _LENIENT_DROP
+    if "array" in kinds:
+        if isinstance(value, (str, dict)):
+            value = [value]
+        if not isinstance(value, list):
+            return _LENIENT_DROP
+        item_schema = schema.get("items", {}) if isinstance(schema.get("items"), dict) else {}
+        if "anyOf" in item_schema or name in {"changes", "tool_calls"}:
+            # Each change and tool call is checked on its own later, so one
+            # bad entry is refused alone instead of failing the whole reply.
+            return [_lenient_entry(one, name) for one in value]
+        items: list[Any] = []
+        for one in value:
+            normalized = _lenient_field(one, item_schema, name) if item_schema else one
+            if normalized is not _LENIENT_DROP and normalized is not None:
+                items.append(normalized)
+        limit = schema.get("maxItems")
+        if isinstance(limit, int) and len(items) > limit:
+            extra = len(items) - limit
+            items = items[:limit]
+            if name in _MARKED_LISTS:
+                items.append(f"[... {extra} more item(s) were listed; Nexus kept the first {limit} ...]")
+        return items
+    if "object" in kinds and isinstance(schema.get("properties"), dict):
+        if not isinstance(value, dict):
+            return _LENIENT_DROP
+        return _lenient_object(value, schema)
+    if "boolean" in kinds:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str) and value.strip().casefold() in {"true", "yes", "1"}:
+            return True
+        if isinstance(value, str) and value.strip().casefold() in {"false", "no", "0", ""}:
+            return False
+        if isinstance(value, (int, float)) and value in (0, 1):
+            return bool(value)
+        return _LENIENT_DROP
+    if "integer" in kinds:
+        if isinstance(value, bool):
+            return _LENIENT_DROP
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        if isinstance(value, str) and re.fullmatch(r"\s*-?\d+\s*", value):
+            return int(value)
+        return _LENIENT_DROP
+    if "string" in kinds:
+        if isinstance(value, bool):
+            value = "true" if value else "false"
+        elif isinstance(value, (int, float)):
+            value = str(value)
+        elif isinstance(value, (list, dict)):
+            if name in _NEVER_TRUNCATE:
+                return _LENIENT_DROP
+            value = json.dumps(value, ensure_ascii=False, sort_keys=True)
+        if not isinstance(value, str):
+            return _LENIENT_DROP
+        limit = schema.get("maxLength")
+        if isinstance(limit, int) and len(value) > limit and name not in _NEVER_TRUNCATE:
+            value = value[:limit] + _TRUNCATION_MARKER.format(omitted=len(value) - limit)
+        allowed = schema.get("enum")
+        if isinstance(allowed, list) and value not in allowed:
+            return _LENIENT_DROP
+        return value
+    return value
+
+
+def _lenient_object(value: dict[str, Any], schema: dict[str, Any]) -> dict[str, Any]:
+    """Known fields only (extras ignored); omitted or unusable ones defaulted."""
+
+    properties = schema.get("properties", {})
+    result: dict[str, Any] = {}
+    for key, child in properties.items():
+        if key not in value or not isinstance(child, dict):
+            continue
+        normalized = _lenient_field(value[key], child, key)
+        if normalized is _LENIENT_DROP:
+            continue
+        if normalized is None and key not in schema.get("required", []):
+            continue
+        result[key] = normalized
+    for key in schema.get("required", []):
+        if key not in result:
+            result[key] = _lenient_default(properties.get(key, {}))
+    return result
+
+
+def _lenient_entry(value: Any, kind: str) -> Any:
+    """One change or tool call: keep known keys; leave checking to its user."""
+
+    if not isinstance(value, dict):
+        return value
+    if kind == "changes":
+        allowed = {"path", "content", "content_base64", "mode", "delete", "reason"}
+        entry = {key: one for key, one in value.items() if key in allowed and one is not None}
+        if "delete" in entry and not isinstance(entry["delete"], bool):
+            entry["delete"] = str(entry["delete"]).strip().casefold() in {"true", "yes", "1"}
+        if isinstance(entry.get("mode"), str) and re.fullmatch(r"0?o?[0-7]{3}", entry["mode"].strip()):
+            entry["mode"] = int(entry["mode"].strip().lstrip("0o") or "0", 8)
+        return entry
+    arguments = value.get("arguments", value.get("args", value.get("input", {})))
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments) if arguments.strip() else {}
+        except json.JSONDecodeError:
+            pass
+    if arguments is None:
+        arguments = {}
+    entry = {
+        "name": str(value.get("name") or value.get("tool") or ""),
+        "arguments": arguments,
+    }
+    call_id = value.get("call_id", value.get("id"))
+    if call_id not in (None, ""):
+        entry["call_id"] = str(call_id)
+    return entry
+
+
+def _lenient_reply_value(text: str, response_format: ResponseFormat) -> dict[str, Any]:
+    """Read one agent reply the tolerant way; raise only when nothing usable came."""
+
+    schema = response_format.schema
+    properties = schema.get("properties", {})
+    candidates = _json_object_candidates(text)
+    if not candidates:
+        raise StructuredCollaborationError(
+            "did not return the structured collaboration result Nexus requested: "
+            "no JSON object was found in the reply"
+        )
+    chosen = next(
+        (one for one in candidates if any(key in one for key in properties)), None,
+    )
+    if chosen is None:
+        raise StructuredCollaborationError(
+            f"returned an invalid {response_format.name} result: the JSON object has none of "
+            + ", ".join(sorted(properties))
+        )
+    return _lenient_object(chosen, schema)
+
+
+def _tool_call_with_defaults(
+    call: dict[str, Any], index: int,
+) -> tuple[dict[str, Any], list[str]]:
+    """Fill omitted/null optional tool arguments; drop unknown ones.
+
+    Returns the call to run and a list of notes for the agent.
+    """
+
+    name = str(call.get("name") or "")
+    raw_arguments = call.get("arguments")
+    arguments = dict(raw_arguments) if isinstance(raw_arguments, dict) else {}
+    notes: list[str] = []
+    definition = next((
+        one for one in [*RESEARCH_TOOL_DEFINITIONS, *HARNESS_TOOL_DEFINITIONS]
+        if one.get("name") == name
+    ), None)
+    known: set[str] | None = None
+    if name == "read_file":
+        known = set(READ_FILE_INPUT_SCHEMA["properties"])
+    elif name == "list_tree":
+        known = {"path", "max_depth", "max_entries"}
+    elif name == "search_workspace":
+        known = {"query", "max_results"}
+    elif name == "run_selected_verification":
+        known = set()
+    elif definition is not None:
+        known = set(definition.get("input_schema", {}).get("properties", {}))
+    if known is not None:
+        ignored = sorted(key for key in arguments if key not in known)
+        if ignored:
+            notes.append("ignored unknown argument(s): " + ", ".join(ignored))
+        arguments = {key: one for key, one in arguments.items() if key in known}
+    arguments = {
+        key: one for key, one in arguments.items()
+        if one is not None or (name == "read_file" and key == "cursor")
+    }
+    for key, default in _TOOL_ARGUMENT_DEFAULTS.get(name, {}).items():
+        if key not in arguments:
+            arguments[key] = default
+    if name == "read_file":
+        for key in ("start_line", "end_line", "max_bytes"):
+            if isinstance(arguments.get(key), str) and arguments[key].strip().isdigit():
+                arguments[key] = int(arguments[key])
+        if isinstance(arguments.get("start_line"), int) and isinstance(arguments.get("end_line"), int) \
+                and arguments["end_line"] < arguments["start_line"]:
+            arguments["end_line"] = 10_000_000
+    call_id = str(call.get("call_id") or "") or f"call-{index + 1}"
+    return {"call_id": call_id, "name": name, "arguments": arguments}, notes
+
+
+# Only an explicit leading label makes an item non-blocking. Wording such as
+# "Could not run the tests", "May still crash" or "Minor bug: ..." is a real
+# problem report and still blocks.
+_ADVISORY_REMAINING = re.compile(
+    r"^\s*[\[(]?\s*(?:optional|advisory|non[- ]?blocking|follow[- ]?up)\s*[\])]?\s*[:\-\u2013\u2014]",
+    re.IGNORECASE,
+)
+_EMPTY_REMAINING = re.compile(
+    r"^\s*(?:none|n/?a|nil|nothing(?:\s+(?:remains|left))?|no\s+(?:remaining|outstanding)"
+    r"(?:\s+(?:work|items?|blockers?))?|-+|\u2014)\s*\.?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _blocking_remaining(items: list[str]) -> list[str]:
+    """Remaining items that still block completion.
+
+    "None", "N/A" or "nothing remains" are an empty list written as an item,
+    and items the agent itself marks optional/advisory/non-blocking/follow-up
+    do not block a finish that every agent agreed on.
+    """
+
+    return [
+        one for one in items
+        if not _EMPTY_REMAINING.match(one) and not _ADVISORY_REMAINING.match(one)
+    ]
 
 
 def _decode_with_one_web_repair(
@@ -2080,7 +2793,7 @@ def collaborate(
 ) -> dict[str, Any]:
     round_limit = user_round_limit(round_limit)
     lead = _agent(board, agent_id)
-    participants = _participants(board, lead, peer_id)
+    participants, left_out = _participants_and_left_out(board, lead, peer_id)
     if len(participants) < 2:
         raise SwarmError(
             "This agent has no ready connected agent. Draw a green communicates line first."
@@ -2090,6 +2803,16 @@ def collaborate(
         str(lead.get("who") or ""),
         filed_as or str(lead.get("name") or ""),
     ).begin(text, participants, mode="goal_collaboration")
+    left_out_notice = _left_out_notice(left_out)
+    if left_out_notice:
+        ledger.record_state("participants_capped", {
+            "limit": MOST_PARTICIPANTS,
+            "left_out": [
+                {"id": str(one.get("id") or ""), "name": str(one.get("name") or "")}
+                for one in left_out
+            ],
+        })
+        _report(progress, "Some agents were not included", left_out_notice)
     public, provider_files, attachment_text = chat_lab.keep_attachments(
         config, str(lead.get("who") or ""), attachments,
         filed_as or str(lead.get("name") or "")
@@ -2171,66 +2894,108 @@ def collaborate(
             }
             _show_turn(live_turn, live)
             _share_turn(ledger, live, {"stage": "team_discussion"})
+    successful_results = [
+        (one, draft) for one, draft in (
+            completed.get(str(candidate.get("id") or ""), (candidate, {}))
+            for candidate in participants
+        )
+        if not draft.get("_provider_failed") and str(draft.get("text") or "").strip()
+    ]
+    # Failures still unresolved at the end of the run. An agent that fails a
+    # turn stays in the team and is asked again next round; a later good turn
+    # clears its entry here.
+    unresolved_failures: dict[str, dict[str, Any]] = {}
     if provider_failures:
         failed_names = [str(one.get("name") or "An agent") for one in provider_failures]
-        lead_result = completed.get(str(lead.get("id") or ""))
-        lead_answer = lead_result[1] if lead_result else {}
-        successful_results = [
-            (one, draft) for one, draft in (
-                completed.get(str(candidate.get("id") or ""), (candidate, {}))
-                for candidate in participants
-            )
-            if not draft.get("_provider_failed") and str(draft.get("text") or "").strip()
-        ]
-        selected_result = (
-            lead_result if lead_result and not lead_answer.get("_provider_failed")
-            else successful_results[0] if successful_results else None
-        )
-        responder, responder_answer = selected_result if selected_result else ({}, {})
-        can_keep_lead = bool(selected_result)
-        answered_ids = {
-            str(one.get("id") or "") for one, _draft in successful_results
-        }
-        participant_outcome, delivery_fields = _delivery_fields(
-            participants, answered_ids, provider_failures,
-            requested_mode="collaborate", lead_id=str(lead.get("id") or ""),
-        )
         ledger.record_state("provider_transport_failure", {
             "stage": "independent_first_round",
-            "status": "degraded" if can_keep_lead else "paused",
+            "status": "degraded" if successful_results else "paused",
             "failed_agents": [
                 {
                     "id": str(one.get("id") or ""),
                     "name": str(one.get("name") or "An agent"),
                     "route": str(one.get("route") or ""),
                     "outcome_unknown": bool(one.get("outcome_unknown")),
-                    "failure_code": "provider_turn_failed",
+                    "failure_code": str(one.get("failure_code") or "provider_turn_failed"),
                     **({"provider_reason": str(one.get("provider_reason") or "")}
                        if one.get("provider_reason") else {}),
                 }
                 for one in provider_failures
             ],
         })
-        remaining = [
-            f"Reconnect or reconcile {name}'s provider turn before resuming."
-            for name in failed_names
-        ]
-        if can_keep_lead:
-            # A provider failure must not erase truthful work that another agent
-            # already completed. This applies to explicit collaboration too:
-            # strict all-or-nothing transport turned one unavailable peer into a
-            # useless failed chat. Prefer the lead's answer, or the first healthy
-            # peer's concrete contribution when the lead itself is unavailable.
+        if not successful_results:
+            answered_ids: set[str] = set()
+            participant_outcome, delivery_fields = _delivery_fields(
+                participants, answered_ids, provider_failures,
+                requested_mode="collaborate", lead_id=str(lead.get("id") or ""),
+            )
+            remaining = [
+                f"Reconnect or reconcile {name}'s provider turn before resuming."
+                for name in failed_names
+            ]
+            report = collaboration_outcomes.notice_text(participant_outcome)
+            reasons = [
+                f"{one.get('name')}: {one.get('provider_reason')}"
+                for one in provider_failures if one.get("provider_reason")
+            ]
+            if reasons:
+                report += " Provider reason: " + " | ".join(reasons)
+            kept = chat_lab.keep_participant_outcome_exchange(
+                config,
+                str(lead.get("who") or ""),
+                text,
+                filed_as=filed_as or str(lead.get("name") or ""),
+                participant_outcome=participant_outcome,
+                attachments=public,
+            )
+            ledger.finish(
+                report, complete=False, stopped_because="provider_unavailable",
+                remaining=remaining,
+            )
+            return {
+                **kept,
+                "collaboration_ledger": ledger.describe(),
+                **delivery_fields,
+                "provider_failures": provider_failures,
+                "partial_provider_failure": report,
+                "goal_complete": False,
+                "discussion_rounds": 0,
+                "round_limit": round_limit,
+                "stopped_because": "provider_unavailable",
+                "remaining": remaining,
+                **({"participants_left_out": left_out_notice} if left_out_notice else {}),
+            }
+        if allow_partial_lead_answer or any(
+            one.get("outcome_unknown") for one in provider_failures
+        ):
+            # A peer whose delivery is unknown must never be asked again for
+            # this turn (that could duplicate it), so this collaboration ends
+            # here with every healthy answer saved; the user reconciles the
+            # uncertain delivery deliberately. An implicit pair chat that
+            # asked for the lead's answer on its own keeps it the same way.
+            lead_result = completed.get(str(lead.get("id") or ""))
+            lead_answer = lead_result[1] if lead_result else {}
+            responder, responder_answer = (
+                lead_result if lead_result and not lead_answer.get("_provider_failed")
+                else successful_results[0]
+            )
+            answered_ids = {str(one.get("id") or "") for one, _draft in successful_results}
+            participant_outcome, delivery_fields = _delivery_fields(
+                participants, answered_ids, provider_failures,
+                requested_mode="collaborate", lead_id=str(lead.get("id") or ""),
+            )
+            remaining = [
+                f"Reconnect or reconcile {name}'s provider turn before resuming."
+                for name in failed_names
+            ]
             successful_peer_contributions = [
                 _contribution(
                     one, draft, "agent_reply", str(draft.get("text") or ""),
                     recipient_id=str(lead.get("id") or ""),
                     recipient_name=str(lead.get("name") or "The lead agent"),
                 )
-                for one, draft in completed.values()
-                if one.get("id") != lead.get("id")
-                and one.get("id") != responder.get("id")
-                and not draft.get("_provider_failed")
+                for one, draft in successful_results
+                if one.get("id") != lead.get("id") and one.get("id") != responder.get("id")
             ]
             kept = chat_lab.keep_multiparty_exchange(
                 config,
@@ -2247,12 +3012,10 @@ def collaborate(
                 milliseconds=int(responder_answer.get("milliseconds") or 0),
                 participant_outcome=participant_outcome,
             )
-            final_turn = _contribution(
+            _share_turn(ledger, _contribution(
                 responder, responder_answer, "final_answer",
-                str(responder_answer.get("text") or ""),
-                recipient_name="User",
-            )
-            _share_turn(ledger, final_turn)
+                str(responder_answer.get("text") or ""), recipient_name="User",
+            ))
             partial_note = (
                 f"{responder.get('name') or 'A connected agent'} answered. "
                 + ", ".join(failed_names)
@@ -2281,41 +3044,21 @@ def collaborate(
                 "round_limit": round_limit,
                 "stopped_because": "partial_provider_failure",
                 "remaining": remaining,
+                **({"participants_left_out": left_out_notice} if left_out_notice else {}),
             }
-        report = collaboration_outcomes.notice_text(participant_outcome)
-        reasons = [
-            f"{one.get('name')}: {one.get('provider_reason')}"
-            for one in provider_failures if one.get("provider_reason")
-        ]
-        if reasons:
-            report += " Provider reason: " + " | ".join(reasons)
-        kept = chat_lab.keep_participant_outcome_exchange(
-            config,
-            str(lead.get("who") or ""),
-            text,
-            filed_as=filed_as or str(lead.get("name") or ""),
-            participant_outcome=participant_outcome,
-            attachments=public,
+        # Some agents answered: the team goes on without the failed ones for
+        # now. They are asked again in the discussion rounds and rejoin as
+        # soon as their provider answers.
+        for one in provider_failures:
+            unresolved_failures[str(one.get("id") or "")] = dict(one)
+        _report(
+            progress, "Continuing with the agents that answered",
+            ", ".join(failed_names) + " could not answer the first round. Nexus keeps "
+            "going with the others and asks again in the next round.",
         )
-        ledger.finish(
-            report, complete=False, stopped_because="provider_unavailable",
-            remaining=remaining,
-        )
-        return {
-            **kept,
-            "collaboration_ledger": ledger.describe(),
-            **delivery_fields,
-            "provider_failures": provider_failures,
-            "partial_provider_failure": report,
-            "goal_complete": False,
-            "discussion_rounds": 0,
-            "round_limit": round_limit,
-            "stopped_because": "provider_unavailable",
-            "remaining": remaining,
-        }
     # The screen shows actual completion order. The lead receives stable board
     # order so provider timing does not make otherwise identical runs drift.
-    drafts = [completed[str(one.get("id"))] for one in participants]
+    drafts = list(successful_results)
     contributions = [
         _contribution(
             one, draft,
@@ -2335,16 +3078,27 @@ def collaborate(
     )
     goal_complete = False
     remaining: list[str] = []
+    advisory_remaining: list[str] = []
     discussion_rounds = 0
     stopped_because = ""
-    progress_guard = _ProgressGuard()
+    repetition = _RepetitionNotice()
+    no_change_guard = _NoChangeGuard()
+    loop_notice = ""
     active_participants = list(participants)
-    degraded_provider_failures: list[dict[str, Any]] = []
+    degraded_provider_failures: list[dict[str, Any]] = [dict(one) for one in provider_failures]
+    previous_round_all_claimed_complete = False
+    rounds_without_any_answer = 0
+    consecutive_failures: dict[str, int] = {}
     for round_number in _round_numbers(round_limit):
         discussion_rounds = round_number
         cycle_complete = True
+        cycle_claimed_complete = True
+        cycle_answers = 0
         cycle_remaining: list[str] = []
-        cycle_state: list[tuple[Any, ...]] = []
+        cycle_advisory: list[str] = []
+        cycle_signature: list[Any] = []
+        cycle_transport_failed = False
+        cycle_failed_agents: list[str] = []
         ledger.record_state("prompt_context_checkpoint", {
             "stage": "discussion", "round": round_number,
             **_prompt_summary_state(contributions),
@@ -2374,10 +3128,11 @@ def collaborate(
                 + "\n\nContinue the real conversation. Address the other agents directly when useful. "
                   "Do not claim the goal is complete merely because you gave advice: completion means the user's requested outcome has actually been achieved. "
                   "Set goal_complete false and list concrete remaining work whenever anything is unfinished. "
-                  "The remaining list is Nexus's progress ledger: name the current unresolved facts, decisions, or outputs precisely, remove resolved items, "
-                  "and change an item when real progress changes its state. Do not disguise an unchanged blocker with new prose."
-                  " When a canonical checkpoint really changes, include progress entries with stable IDs, exact states, and concrete evidence; keep the same ID for the same checkpoint."
+                  "The remaining list is the team's shared list of unresolved facts, decisions, or outputs: remove resolved items. "
+                  "When everything is done but you have optional suggestions, set goal_complete true and start each such item with \"Optional:\"."
+                  " When a checkpoint really changes, you may include progress entries with stable IDs, states, and evidence."
                 + "\n" + turn_role
+                + ("\n\n" + loop_notice if loop_notice else "")
                 + ("\n\n" + attachment_text if attachment_text else "")
                 + _shared_context(ledger, one, {
                     "stage": "team_discussion",
@@ -2386,7 +3141,6 @@ def collaborate(
                 })
             )
             answer: dict[str, Any] = {}
-            failed = False
             degraded_protocol = False
             failure_cause: Exception | None = None
             try:
@@ -2417,7 +3171,9 @@ def collaborate(
                     )
                     message = str(value.get("message") or "").strip()
                     one_remaining = _remaining(value)
-                    one_complete = value.get("goal_complete") is True and not one_remaining
+                    one_blocking = _blocking_remaining(one_remaining)
+                    one_claimed = value.get("goal_complete") is True
+                    one_complete = one_claimed and not one_blocking
                 except cancellation.ChatCancelled:
                     raise
                 except Exception as exc:
@@ -2426,7 +3182,7 @@ def collaborate(
                 exc = failure_cause
                 failed_name = str(one.get("name") or "An agent")
                 safe_reason = _provider_reason(ledger, exc)
-                protocol_failure = isinstance(exc, StructuredCollaborationError)
+                protocol_failure = _is_protocol_failure(exc)
                 outcome_unknown = isinstance(exc, ProviderOutcomeUnknown)
                 delivered_text = (
                     _natural_language_web_contribution(one, answer)
@@ -2435,7 +3191,7 @@ def collaborate(
                 usable_contribution = bool(delivered_text)
                 correction_note = (
                     " even after one format correction"
-                    if str(one.get("who") or "").startswith("web:") else ""
+                    if protocol_failure else ""
                 )
                 report = (
                     f"{failed_name}'s delivered reply did not match the collaboration format"
@@ -2462,24 +3218,35 @@ def collaborate(
                     "usable_contribution": usable_contribution,
                     **({"provider_reason": safe_reason} if safe_reason else {}),
                 })
-                degraded_provider_failures.append({
+                failure_record = {
                     "id": one.get("id"), "name": failed_name,
                     "route": one.get("who"), "round": round_number,
                     "kind": "protocol" if protocol_failure else "transport",
                     "outcome_unknown": outcome_unknown,
                     "usable_contribution": usable_contribution,
                     **({"provider_reason": safe_reason} if safe_reason else {}),
-                })
+                }
+                degraded_provider_failures.append(failure_record)
+                if outcome_unknown:
+                    # An unreconciled delivery is never sent again
+                    # automatically: resending could duplicate it.
+                    active_participants = [
+                        candidate for candidate in active_participants
+                        if candidate.get("id") != one.get("id")
+                    ]
                 if usable_contribution:
                     # The provider genuinely answered, but Nexus cannot trust
                     # the failed schema as machine control state. Keep the
                     # exact prose as team speech, keep the agent reachable,
                     # and conservatively claim neither completion nor progress.
-                    failed = True
+                    unresolved_failures.pop(str(one.get("id") or ""), None)
+                    answered_agent_ids.add(str(one.get("id") or ""))
                     degraded_protocol = True
                     value = {}
                     message = delivered_text
                     one_remaining = []
+                    one_blocking = []
+                    one_claimed = False
                     one_complete = False
                     _report(
                         progress, f"Keeping {failed_name}'s delivered reply",
@@ -2487,15 +3254,32 @@ def collaborate(
                         "but did not infer completion, remaining work, or peer text from it.",
                     )
                 else:
-                    active_participants = [
-                        candidate for candidate in active_participants
-                        if candidate.get("id") != one.get("id")
-                    ]
+                    unresolved_failures[str(one.get("id") or "")] = failure_record
+                    failed_id = str(one.get("id") or "")
+                    consecutive_failures[failed_id] = consecutive_failures.get(failed_id, 0) + 1
+                    if not outcome_unknown:
+                        cycle_failed_agents.append(failed_id)
+                    if consecutive_failures[failed_id] >= _MOST_FAILED_TURNS_IN_A_ROW:
+                        # Asked again after each failure; after this many in a
+                        # row it no longer counts as able to answer, so the
+                        # user's accounts are not spent on it forever.
+                        active_participants = [
+                            candidate for candidate in active_participants
+                            if candidate.get("id") != one.get("id")
+                        ]
+                    cycle_transport_failed = cycle_transport_failed or not protocol_failure
+                    cycle_signature.append([str(one.get("id") or ""), "failed", failure_record["kind"]])
                     _report(
-                        progress, f"Continuing without {failed_name}",
-                        report + " Nexus preserved the completed team work and kept the healthy agents running.",
+                        progress, f"Continuing without {failed_name} for this round",
+                        report + " Nexus kept the team going and will ask "
+                        f"{failed_name} again next round.",
                     )
                     continue
+            else:
+                unresolved_failures.pop(str(one.get("id") or ""), None)
+                answered_agent_ids.add(str(one.get("id") or ""))
+                consecutive_failures.pop(str(one.get("id") or ""), None)
+            cycle_answers += 1
             contribution = _contribution(
                 one, answer, "agent_discussion", message,
                 recipient_name="Team deliberation",
@@ -2512,32 +3296,84 @@ def collaborate(
                 "speaker_remaining": one_remaining,
                 "structured_state_unavailable": degraded_protocol,
             })
-            cycle_remaining.extend(one_remaining)
+            cycle_remaining.extend(one_blocking)
+            cycle_advisory.extend(one for one in one_remaining if one not in one_blocking)
             cycle_complete = cycle_complete and one_complete
-            cycle_state.append(_canonical_progress_state(
-                str(one.get("id") or ""), one_complete, failed, value
-            ))
+            cycle_claimed_complete = cycle_claimed_complete and one_claimed
+            cycle_signature.append([
+                str(one.get("id") or ""), message, one_remaining,
+                bool(one_claimed), value.get("progress", []) if isinstance(value, dict) else [],
+            ])
         if not active_participants:
             remaining.append("No connected agent remains available to continue the team conversation.")
             stopped_because = "provider_unavailable"
             break
+        if cycle_answers == 0:
+            # Nobody could answer this round. Keep asking (agents rejoin as
+            # soon as their provider answers), but do not spend the user's
+            # accounts forever on a team that cannot answer at all.
+            rounds_without_any_answer += 1
+            if rounds_without_any_answer >= 3:
+                remaining = list(dict.fromkeys(
+                    f"{one.get('name') or 'An agent'} could not answer: "
+                    + str(one.get("provider_reason") or one.get("kind") or "provider turn failed")
+                    for one in unresolved_failures.values()
+                )) or ["No agent could answer three rounds in a row."]
+                stopped_because = (
+                    "provider_unavailable" if cycle_transport_failed
+                    else "provider_protocol_failure"
+                )
+                break
+            continue
+        rounds_without_any_answer = 0
+        # An agent that just failed a turn is asked again next round rather
+        # than being agreed past. Only one that failed three rounds running
+        # stops holding up the others' consensus.
+        waiting_for = [
+            one for one in cycle_failed_agents
+            if consecutive_failures.get(one, 0) < _MOST_FAILED_TURNS_IN_A_ROW
+        ]
+        if waiting_for:
+            cycle_complete = False
+            cycle_claimed_complete = False
         remaining = list(dict.fromkeys(cycle_remaining))
+        advisory_remaining = list(dict.fromkeys(cycle_advisory))
         ledger.record_state("discussion_round_state", {
             "stage": "team_discussion",
             "round": round_number,
             "all_agents_complete": cycle_complete,
+            "all_agents_claimed_complete": cycle_claimed_complete,
             "remaining": remaining,
+            "advisory_remaining": advisory_remaining,
         })
         if cycle_complete:
             goal_complete = True
             stopped_because = "complete"
             break
-        if progress_guard.stalled(tuple(cycle_state)):
-            remaining.append(
-                "Nexus stopped a repeated no-progress cycle: no agent changed completion state, unresolved work, requested files, or provider-failure state."
-            )
-            stopped_because = "stalled"
+        if cycle_claimed_complete and previous_round_all_claimed_complete:
+            # Every agent said goal_complete two rounds running; what is left
+            # in their remaining lists is kept as advisory, not as a blocker
+            # (one agent's empty-vs-nonempty formatting must not hold the
+            # team forever).
+            goal_complete = True
+            stopped_because = "complete"
+            advisory_remaining = list(dict.fromkeys([*advisory_remaining, *remaining]))
+            remaining = []
             break
+        previous_round_all_claimed_complete = cycle_claimed_complete
+        if no_change_guard.stuck([
+            [one[0], bool(one[3]), bool(_blocking_remaining(list(one[2] or [])))]
+            if len(one) > 3 else list(one) for one in cycle_signature
+        ]):
+            remaining.append(_no_change_guard_note(no_change_guard.reason))
+            stopped_because = "no_change_guard"
+            break
+        loop_notice = repetition.observe(cycle_signature)
+        if loop_notice:
+            ledger.record_state("repetition_noticed", {
+                "stage": "team_discussion", "round": round_number,
+                "identical_rounds": repetition.identical,
+            })
     if not goal_complete and not stopped_because:
         remaining.append(
             f"The user-set limit of {round_limit} team discussion round(s) was reached."
@@ -2591,6 +3427,9 @@ def collaborate(
                     + f"\n\nNEXUS COMPLETION STATE: {'complete' if goal_complete else 'incomplete'}"
                     + f"\nNEXUS STOP REASON: {stopped_because}"
                     + ("\nREMAINING WORK: " + "; ".join(remaining) if remaining else "")
+                    + ("\nOPTIONAL / ADVISORY ITEMS (not blocking): " + "; ".join(advisory_remaining)
+                       if advisory_remaining else "")
+                    + ("\n" + left_out_notice if left_out_notice else "")
                     + "\n\nGive the user a truthful final report. Name disagreements plainly. "
                       "If Nexus says incomplete, explicitly say the goal is incomplete and list what remains; do not present discussion or suggested work as completed work."
                     + ("\n\n" + attachment_text if attachment_text else "")
@@ -2610,12 +3449,14 @@ def collaborate(
         except Exception as exc:
             safe_reason = _provider_reason(ledger, exc)
             outcome_unknown = isinstance(exc, ProviderOutcomeUnknown)
-            degraded_provider_failures.append({
+            final_report_failure = {
                 "id": reporter.get("id"), "name": reporter.get("name"),
                 "route": reporter.get("who"), "kind": "final_report",
                 "outcome_unknown": outcome_unknown,
                 **({"provider_reason": safe_reason} if safe_reason else {}),
-            })
+            }
+            degraded_provider_failures.append(final_report_failure)
+            unresolved_failures[str(reporter.get("id") or "") + ":final"] = final_report_failure
             final = preserved_transcript_report(
                 f"{reporter.get('name') or 'the reporter'} could not generate the final synthesis"
             )
@@ -2634,8 +3475,10 @@ def collaborate(
             "no connected agent remained available to generate the final synthesis"
         )
         final_speaker = {"id": "nexus", "name": "Nexus", "who": ""}
+    # Only failures that were never recovered count against delivery: an
+    # agent that failed one turn and answered later is a full participant.
     participant_outcome, delivery_fields = _delivery_fields(
-        participants, answered_agent_ids, degraded_provider_failures,
+        participants, answered_agent_ids, list(unresolved_failures.values()),
         requested_mode="collaborate", lead_id=str(lead.get("id") or ""),
     )
     delivery_complete = participant_outcome["outcome"] == "complete"
@@ -2695,7 +3538,9 @@ def collaborate(
         "stopped_because": delivery_stop,
         "remaining": remaining,
         "provider_failures": degraded_provider_failures,
+        **({"advisory_remaining": advisory_remaining} if advisory_remaining else {}),
         **({"partial_provider_failure": delivery_note} if delivery_note else {}),
+        **({"participants_left_out": left_out_notice} if left_out_notice else {}),
     }
 
 
@@ -2731,17 +3576,29 @@ def _project_participants(
     board: dict[str, Any], lead: dict[str, Any], project_id: str,
     peer_id: str = "",
 ) -> list[dict[str, Any]]:
+    return _project_participants_and_left_out(board, lead, project_id, peer_id)[0]
+
+
+def _project_participants_and_left_out(
+    board: dict[str, Any], lead: dict[str, Any], project_id: str,
+    peer_id: str = "",
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     assigned = {
         str(line.get("agent")) for line in board.get("works_on", [])
         if isinstance(line, dict) and str(line.get("project")) == project_id
     }
     # A communication line permits a relay.  It does not itself grant the
     # connected agent access to a project tree; the works-on line is that
-    # separate authority.
-    return [
-        one for one in _participants(board, lead, peer_id)
+    # separate authority. The participant cap applies after that filter, so
+    # an agent on the project is never displaced by one that is not.
+    found, left_out = _participants_and_left_out(board, lead, peer_id)
+    everyone = [
+        one for one in [*found, *left_out]
         if str(one.get("id")) in assigned
     ]
+    if peer_id:
+        return everyone, []
+    return everyone[:MOST_PARTICIPANTS], everyone[MOST_PARTICIPANTS:]
 
 
 def _tree(root: Path) -> str:
@@ -2820,18 +3677,33 @@ def _safe_query_paths(root: Path, query: str) -> tuple[list[Path], str]:
         return [], f"DIR {relative}\n{listing or '[empty directory]'}{suffix}"
     if raw.startswith("glob:"):
         pattern = raw[5:].strip().replace("\\", "/")
-        if not pattern or Path(pattern).is_absolute() or ".." in Path(pattern).parts:
-            return [], f"unsafe glob request rejected: {pattern or '(empty)'}"
+        # "/src/*.py", "C:x" and "C:*" are absolute or drive-relative: pathlib
+        # raises NotImplementedError for them. They are refused as a normal
+        # tool result the agent can correct, never as a crash of the run.
+        if (
+            not pattern or Path(pattern).is_absolute() or ".." in Path(pattern).parts
+            or pattern.startswith("/") or re.match(r"^[A-Za-z]:", pattern)
+            or Path(pattern).drive or Path(pattern).anchor
+        ):
+            return [], (
+                f"unsafe glob request rejected: {pattern or '(empty)'} "
+                "(use a project-relative pattern such as glob:src/*.py)"
+            )
         matches: list[Path] = []
         try:
             candidates = root.glob(pattern)
             for candidate in candidates:
-                confined_path(root, candidate.relative_to(root), allow_missing=False)
+                # One refused match (for example a file under .git) is left
+                # out; it must not fail the whole request for every other file.
+                try:
+                    confined_path(root, candidate.relative_to(root), allow_missing=False)
+                except (HarnessError, ValueError):
+                    continue
                 if candidate.is_file() and not candidate.is_symlink():
                     matches.append(candidate)
                 if len(matches) >= 100:
                     break
-        except (HarnessError, OSError, ValueError) as exc:
+        except (HarnessError, OSError, ValueError, NotImplementedError) as exc:
             return [], f"glob request failed: {exc}"
         return sorted(matches), "" if matches else f"glob matched no readable files: {pattern}"
     try:
@@ -2959,6 +3831,57 @@ def _write_roots_from_goal(root: Path, text: str) -> list[str]:
     return _path_authority_from_goal(root, text)["writable"]
 
 
+# Ordinary prose words that end an unquoted path (a drive-rooted Windows
+# folder followed by "please ...").
+_PATH_PROSE_WORDS = frozenset({
+    "please", "and", "or", "but", "then", "to", "in", "into", "for", "with", "so",
+    "it", "its", "is", "are", "was", "be", "as", "at", "on", "of", "from", "by", "if",
+    "when", "where", "which", "that", "this", "these", "those", "the", "a", "an",
+    "you", "we", "i", "should", "must", "can", "will", "would", "could", "may",
+    "might", "do", "does", "don't", "not", "also", "instead", "there", "here",
+    "only", "just", "using", "use", "create", "update", "fix", "put", "save",
+    "write", "add", "make", "keep", "leave", "see", "like", "now", "first", "next",
+    "after", "before", "because", "while", "until", "without", "except",
+})
+
+
+def _unquoted_absolute_path(rest: str) -> str:
+    """Return the Windows path at the start of ``rest`` without trailing prose.
+
+    An unquoted path may contain spaces (a folder such as "My Projects" under
+    a drive root),
+    so the longest candidate that exists on disk wins. Without one, the path
+    continues across a space only while the next word still looks like part of
+    a path (it has a folder separator or a file extension); ordinary words
+    such as "please" or "and" end it.
+    """
+
+    tokens = re.findall(r"\S+", rest)
+    if not tokens:
+        return ""
+    trailing = " \t`\"').,;:!?"
+    candidates: list[str] = []
+    for count in range(1, min(len(tokens), 12) + 1):
+        candidates.append(" ".join(tokens[:count]).rstrip(trailing))
+    for candidate in reversed(candidates):
+        try:
+            if candidate and len(candidate) > 3 and Path(candidate).exists():
+                return candidate
+        except (OSError, ValueError):
+            continue
+    path = tokens[0]
+    for token in tokens[1:]:
+        if path.endswith((",", ";", ":", ".", "!", "?", ")")):
+            break
+        bare = token.rstrip(trailing)
+        if not bare or bare.casefold() in _PATH_PROSE_WORDS or not re.fullmatch(
+            r"[\w.()&'+-]+(?:[\\/][\w .()&'+-]*)*", bare,
+        ):
+            break
+        path += " " + token
+    return path.rstrip(trailing)
+
+
 def _absolute_prompt_paths(text: str) -> list[tuple[int, str]]:
     """Extract Windows paths with their line, preserving spaces and quoted names."""
 
@@ -2971,10 +3894,23 @@ def _absolute_prompt_paths(text: str) -> list[tuple[int, str]]:
         for match in re.finditer(r"(?<![A-Za-z0-9])[A-Za-z]:[\\/]", line):
             if any(start <= match.start() < end for start, end in quoted_spans):
                 continue
-            raw = line[match.start():].strip().rstrip(" \t`\"').,;:")
+            raw = _unquoted_absolute_path(line[match.start():])
             if raw:
                 found.append((line_number, raw))
     return found
+
+
+def _is_project_root_path(root: Path, raw: str) -> bool:
+    """Whether an absolute prompt path names the selected project itself."""
+
+    try:
+        candidate = Path(str(raw or "").strip().strip("`\"'").rstrip("\\/ ."))
+        return candidate.is_absolute() and (
+            candidate.resolve() == root.resolve()
+            or os.path.normcase(str(candidate)) == os.path.normcase(str(root.resolve()))
+        )
+    except (OSError, ValueError):
+        return False
 
 
 _WRITE_AUTHORITY = (
@@ -3013,7 +3949,15 @@ def _path_authority_from_goal(root: Path, text: str) -> dict[str, list[str]]:
     read_only: list[str] = []
     references: list[str] = []
     invalid_writable: list[str] = []
+    project_root_mentions: list[str] = []
+    read_only_standalone: list[str] = []
+    last_standalone_read_only_line = -2
     for index, (line_number, raw) in enumerate(occurrences):
+        if _is_project_root_path(root, raw):
+            # Naming the selected project itself grants the whole project; it
+            # is never "outside the project" and never narrows access.
+            project_root_mentions.append(raw)
+            continue
         previous_path_line = occurrences[index - 1][0] if index else -1
         next_path_line = occurrences[index + 1][0] if index + 1 < len(occurrences) else len(lines)
         before = max(previous_path_line + 1, line_number - 5, 0)
@@ -3037,12 +3981,22 @@ def _path_authority_from_goal(root: Path, text: str) -> dict[str, list[str]]:
         is_reference = any(pattern.search(local_context) for pattern in _REFERENCE_AUTHORITY)
         allows_write = any(pattern.search(context) for pattern in _WRITE_AUTHORITY)
         forbids_write = any(pattern.search(local_context) for pattern in _READ_ONLY_AUTHORITY)
+        # A path standing alone on its own line under a read-only heading
+        # ("The following folders are read-only:" + one path per line) is an
+        # explicit user protection; the next standalone lines of the same
+        # list inherit it.
+        line_text = lines[line_number] if line_number < len(lines) else ""
+        standalone = not re.sub(r"[\s\"'`*\-•:;,.()]+", "", line_text.replace(raw, ""))
+        continues_list = standalone and line_number == last_standalone_read_only_line + 1
         if is_reference and not allows_write:
             references.append(relative)
         elif allows_write:
             writable.append(relative)
-        elif forbids_write:
+        elif forbids_write or continues_list:
             read_only.append(relative)
+            if standalone:
+                read_only_standalone.append(relative)
+                last_standalone_read_only_line = line_number
     writable = list(dict.fromkeys(writable))
     read_only = list(dict.fromkeys(read_only))
     references = list(dict.fromkeys(references))
@@ -3062,15 +4016,46 @@ def _path_authority_from_goal(root: Path, text: str) -> dict[str, list[str]]:
         "read_only": read_only,
         "references": references,
         "invalid_writable": invalid_writable,
+        "project_root": list(dict.fromkeys(project_root_mentions)),
+        "read_only_standalone": list(dict.fromkeys(read_only_standalone)),
     }
+
+
+_GLOB_CHARACTERS = frozenset("*?[")
+
+
+def _glob_path_matches(normalized: str, pattern: str) -> bool:
+    """Whether a folded project path matches a folded glob restriction.
+
+    "*.md" protects every Markdown file in the project, "config/*.txt"
+    every text file in config/, and "**/x" also matches x at the top level.
+    A path inside a matching folder matches too.
+    """
+
+    candidates = [pattern]
+    while candidates[-1].startswith("**/"):
+        candidates.append(candidates[-1][3:])
+    parts = normalized.split("/")
+    prefixes = ["/".join(parts[:index]) for index in range(1, len(parts) + 1)]
+    return any(
+        fnmatch.fnmatchcase(prefix, candidate)
+        for candidate in candidates for prefix in prefixes
+    )
 
 
 def _path_is_under(relative: str, allowed_roots: list[str]) -> bool:
     normalized = relative.replace("\\", "/").strip("/").casefold()
-    return any(
-        normalized == root.casefold() or normalized.startswith(root.casefold() + "/")
-        for root in allowed_roots
-    )
+    for root in allowed_roots:
+        folded = str(root).replace("\\", "/").strip("/").casefold()
+        if not folded:
+            continue
+        if _GLOB_CHARACTERS & set(folded):
+            if _glob_path_matches(normalized, folded):
+                return True
+            continue
+        if normalized == folded or normalized.startswith(folded + "/"):
+            return True
+    return False
 
 
 def _paths_overlap(left: str, right: str) -> bool:
@@ -3087,6 +4072,136 @@ def _normalized_text_sha256(path: Path) -> str | None:
     return sha256_bytes(text.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8"))
 
 
+def _normalized_change_path(value: object) -> str:
+    """Spell an agent's relative path the way grants and write roots do.
+
+    "./src/a.py", "src//a.py" and "src/./a.py" all name src/a.py, and
+    "src/../a.py" names a.py, so protected-path and grant checks see the
+    same spelling the file system will. Absolute and drive-qualified paths
+    are returned unchanged, and a ".." that climbs above the project stays in
+    the path, so the confinement checks still refuse both.
+    """
+
+    text = str(value or "").replace("\\", "/").strip()
+    if not text or text.startswith("/") or re.match(r"^[A-Za-z]:", text):
+        return text
+    parts: list[str] = []
+    for one in text.split("/"):
+        if one in {"", "."}:
+            continue
+        if one == ".." and parts and parts[-1] != "..":
+            parts.pop()
+            continue
+        parts.append(one)
+    return "/".join(parts) if parts else text
+
+
+_NON_PORTABLE_NAME_CHARACTERS = frozenset('<>:"|?*')
+
+
+def _portable_change_name_problem(relative: str) -> str:
+    """Why a proposed file name cannot be written portably, or "".
+
+    Characters Windows forbids (<>:"|?*), control characters and a path
+    segment longer than 255 characters make the operating system raise.
+    Refusing that one entry keeps the rest of the agent's work.
+    """
+
+    for segment in str(relative or "").replace("\\", "/").split("/"):
+        if len(segment) > 255:
+            return "has a path segment longer than 255 characters"
+        if any(ord(char) < 32 or ord(char) == 127 for char in segment):
+            return "contains a control or tab character"
+        bad = sorted(set(segment) & _NON_PORTABLE_NAME_CHARACTERS)
+        if bad:
+            return "contains characters that are not valid in file names: " + " ".join(bad)
+    return ""
+
+
+def _validate_one_change(
+    root: Path,
+    raw: object,
+    allowed_write_roots: list[str] | None = None,
+    protected_paths: list[str] | None = None,
+    exact_write_grants: dict[str, set[str]] | None = None,
+) -> tuple[str, ChangePlan | None]:
+    """Check one proposed change: (normalized path, plan or None if no-op).
+
+    Raises HarnessError with the reason when this one entry cannot be applied.
+    """
+
+    if not isinstance(raw, dict):
+        raise HarnessError("A proposed file change is malformed")
+    relative = _normalized_change_path(raw.get("path"))
+    if not relative:
+        raise HarnessError("The proposed file change has no path")
+    if protected_paths and _path_is_under(relative, protected_paths):
+        raise HarnessError(
+            f"Proposed path {relative} is protected by the user's explicit read-only/do-not-touch instruction"
+        )
+    # Paths named by the goal only ever ADD to what agents may write. They
+    # never restrict writes, and the kind of change (create, modify or
+    # delete) is the agent's call: "fix parser.py" may create it when it
+    # is missing. Only an explicit user restriction (allowed_write_roots,
+    # from the UI or an explicit "only change X" in the goal) narrows it.
+    granted = bool(
+        exact_write_grants and exact_write_grants.get(relative.casefold())
+    )
+    if (
+        allowed_write_roots is not None
+        and not _path_is_under(relative, allowed_write_roots)
+        and not granted
+    ):
+        raise HarnessError(
+            f"Proposed path {relative} is outside the explicit write destinations: "
+            + (", ".join(allowed_write_roots) or "(no project paths are writable)")
+        )
+    problem = _portable_change_name_problem(relative)
+    if problem:
+        raise HarnessError(f"Proposed path {relative!r} {problem}")
+    path = confined_path(root, relative)
+    if path.is_symlink():
+        raise HarnessError(f"Refusing to replace a symbolic link: {relative}")
+    parent = path.parent
+    while parent != root and parent != parent.parent:
+        if parent.is_file():
+            raise HarnessError(
+                f"Proposed path {relative} is inside {parent.relative_to(root).as_posix()}, which is a file"
+            )
+        parent = parent.parent
+    deleting = raw.get("delete") is True
+    content = "" if deleting else str(raw.get("content") or "")
+    encoded = raw.get("content_base64")
+    if encoded:
+        if deleting or content or not isinstance(encoded, str):
+            raise HarnessError("A binary change cannot also contain text or delete the file")
+        try:
+            content = base64.b64decode(encoded, validate=True)
+        except (ValueError, TypeError) as exc:
+            raise HarnessError("A binary file change contains invalid base64") from exc
+    raw_bytes = content if isinstance(content, bytes) else content.encode("utf-8")
+    mode = raw.get("mode")
+    if mode is not None and (type(mode) is not int or not 0 <= mode <= 0o777):
+        raise HarnessError("A file mode must contain only portable permission bits")
+    # A provider can ignore the instruction not to return unchanged files.
+    # Treat that as no progress rather than creating a misleading backup,
+    # transaction id, and execution turn that claims the file changed.
+    if deleting and not path.exists():
+        return relative, None
+    if not deleting and file_sha256(path) == sha256_bytes(raw_bytes) and (
+        mode is None or stat.S_IMODE(path.stat().st_mode) == mode
+    ):
+        return relative, None
+    return relative, ChangePlan(
+        path=relative,
+        baseline_sha256=file_sha256(path),
+        content=None if deleting else content,
+        delete=deleting,
+        reason=str(raw.get("reason") or "Board work request")[:1000],
+        mode=mode,
+    )
+
+
 def _validated_changes(
     root: Path,
     raw_changes: object,
@@ -3094,125 +4209,107 @@ def _validated_changes(
     protected_paths: list[str] | None = None,
     exact_write_grants: dict[str, set[str]] | None = None,
 ) -> list[ChangePlan]:
+    """All-or-nothing validation, for callers that need exactly that.
+
+    Work together itself uses ``_partition_changes``: one bad entry is
+    refused alone and the rest of the agent's change set is applied.
+    """
+
     if not isinstance(raw_changes, list):
         raise HarnessError("The acting agent returned an invalid file change list")
     changes: list[ChangePlan] = []
     seen: set[str] = set()
     for raw in raw_changes:
-        if not isinstance(raw, dict):
-            raise HarnessError("A proposed file change is malformed")
-        relative = str(raw.get("path") or "").replace("\\", "/").strip()
-        if not relative or relative in seen:
-            raise HarnessError("The proposed file changes contain a missing or duplicate path")
-        if protected_paths and _path_is_under(relative, protected_paths):
-            raise HarnessError(
-                f"Proposed path {relative} is protected by the user's read-only/reference constraint"
-            )
-        if allowed_write_roots is not None and not _path_is_under(relative, allowed_write_roots):
-            raise HarnessError(
-                f"Proposed path {relative} is outside the explicit write destinations: "
-                + (", ".join(allowed_write_roots) or "(no project paths are writable)")
-            )
-        capability = "DELETE" if raw.get("delete") is True else (
-            "MODIFY" if confined_path(root, relative).exists() else "CREATE"
+        if isinstance(raw, dict):
+            relative = _normalized_change_path(raw.get("path"))
+            if not relative or relative in seen:
+                raise HarnessError("The proposed file changes contain a missing or duplicate path")
+        relative, plan = _validate_one_change(
+            root, raw, allowed_write_roots, protected_paths, exact_write_grants,
         )
-        # Exact operation grants and explicitly authorized destination roots
-        # are additive capabilities.  An exact artifact such as TEST-ci.yml
-        # must not turn the other user-authorized output roots into a
-        # global deny-list.  With no root grant, exact-only goals remain exact.
-        if exact_write_grants is not None:
-            allowed = {
-                str(one).upper() for one in exact_write_grants.get(relative.casefold(), set())
-            }
-            allowed_by_root = bool(
-                allowed_write_roots and _path_is_under(relative, allowed_write_roots)
-            )
-            if allowed and capability not in allowed and "CREATE_OR_MODIFY" not in allowed:
-                raise HarnessError(
-                    f"Proposed {capability.lower()} of {relative} is not authorized by the compiled goal operations"
-                )
-            if not allowed and not allowed_by_root:
-                raise HarnessError(
-                    f"Proposed {capability.lower()} of {relative} is not authorized by the compiled goal operations"
-                )
-        path = confined_path(root, relative)
-        if path.is_symlink():
-            raise HarnessError(f"Refusing to replace a symbolic link: {relative}")
         seen.add(relative)
-        deleting = raw.get("delete") is True
-        content = "" if deleting else str(raw.get("content") or "")
-        encoded = raw.get("content_base64")
-        if encoded:
-            if deleting or content or not isinstance(encoded, str):
-                raise HarnessError("A binary change cannot also contain text or delete the file")
-            try:
-                content = base64.b64decode(encoded, validate=True)
-            except (ValueError, TypeError) as exc:
-                raise HarnessError("A binary file change contains invalid base64") from exc
-        raw_bytes = content if isinstance(content, bytes) else content.encode("utf-8")
-        mode = raw.get("mode")
-        if mode is not None and (type(mode) is not int or not 0 <= mode <= 0o777):
-            raise HarnessError("A file mode must contain only portable permission bits")
-        # A provider can ignore the instruction not to return unchanged files.
-        # Treat that as no progress rather than creating a misleading backup,
-        # transaction id, and execution turn that claims the file changed.
-        if deleting and not path.exists():
-            continue
-        if not deleting and file_sha256(path) == sha256_bytes(raw_bytes) and (
-            mode is None or stat.S_IMODE(path.stat().st_mode) == mode
-        ):
-            continue
-        changes.append(ChangePlan(
-            path=relative,
-            baseline_sha256=file_sha256(path),
-            content=None if deleting else content,
-            delete=deleting,
-            reason=str(raw.get("reason") or "Board work request")[:1000],
-            mode=mode,
-        ))
+        if plan is not None:
+            changes.append(plan)
     return changes
 
 
-def _with_test_companion_grants(
+def _partition_changes(
     root: Path,
     raw_changes: object,
-    grants: dict[str, set[str]],
-    goal_spec: dict[str, Any],
-    contract: dict[str, Any],
-) -> dict[str, set[str]]:
-    """Instantiate only causally related runnable-test companion grants."""
+    allowed_write_roots: list[str] | None = None,
+    protected_paths: list[str] | None = None,
+    exact_write_grants: dict[str, set[str]] | None = None,
+    *,
+    limit: int = MOST_CHANGES_PER_REPLY,
+) -> tuple[list[ChangePlan], list[dict[str, Any]]]:
+    """Validate each proposed change on its own.
 
-    expanded = {key: set(value) for key, value in grants.items()}
-    behavior = any(
-        isinstance(one, dict) and one.get("kind") in {"behavior", "behavior_preservation"}
-        for one in contract.get("requirements", [])
-    )
-    if not behavior or not isinstance(raw_changes, list):
-        return expanded
-    target_stems = {
-        Path(str(path)).stem.casefold()
-        for path in goal_spec.get("write_policy", {}).get("grants", []) if str(path)
-    }
-    for raw in raw_changes:
-        if not isinstance(raw, dict) or raw.get("delete") is True:
+    Returns the applicable plans and one refusal per bad entry (index, path,
+    reason), so the agent is told exactly which entry was refused and why
+    while every other entry is still applied. Genuine protections (explicit
+    user restrictions, confinement, .git/.harness, symlinks) refuse only the
+    entry that hits them.
+    """
+
+    if raw_changes is None:
+        return [], []
+    if not isinstance(raw_changes, list):
+        raw_changes = [raw_changes]
+    changes: list[ChangePlan] = []
+    refusals: list[dict[str, Any]] = []
+    seen: dict[str, int] = {}
+    for index, raw in enumerate(raw_changes):
+        shown = str(raw.get("path") or "") if isinstance(raw, dict) else ""
+        if index >= limit:
+            refusals.append({
+                "index": index, "path": shown,
+                "reason": (
+                    f"Nexus applies at most {limit} file changes per reply; send this "
+                    "change again in your next reply"
+                ),
+            })
             continue
-        relative = str(raw.get("path") or "").replace("\\", "/").strip()
-        content = str(raw.get("content") or "")
-        filename = Path(relative).name.casefold()
-        runnable_shape = bool(
-            re.search(r"(?:^|/)(?:tests?|specs?)(?:/|$)", relative, re.I)
-            or re.search(r"(?:^test_.*|_test\.|\.test\.|\.spec\.)", filename, re.I)
-        ) and Path(relative).suffix.casefold() in {
-            ".py", ".js", ".cjs", ".mjs", ".ts", ".tsx", ".go", ".cs", ".java", ".rs",
-        }
-        references_target = any(
-            re.search(rf"(?<![\w]){re.escape(stem)}(?![\w])", content, re.I)
-            for stem in target_stems if stem
+        relative = _normalized_change_path(raw.get("path")) if isinstance(raw, dict) else ""
+        if relative and relative in seen:
+            refusals.append({
+                "index": index, "path": relative,
+                "reason": (
+                    f"duplicate of change #{seen[relative] + 1} to the same path in this reply; "
+                    "the first one was used"
+                ),
+            })
+            continue
+        try:
+            relative, plan = _validate_one_change(
+                root, raw, allowed_write_roots, protected_paths, exact_write_grants,
+            )
+        except HarnessError as exc:
+            refusals.append({"index": index, "path": relative or shown, "reason": str(exc)})
+            continue
+        except (OSError, ValueError) as exc:
+            # The operating system refused this one name; the other entries
+            # still apply and the run continues.
+            refusals.append({
+                "index": index, "path": relative or shown,
+                "reason": f"the file system cannot use this path ({type(exc).__name__}: {exc})"[:500],
+            })
+            continue
+        seen[relative] = index
+        if plan is not None:
+            changes.append(plan)
+    return changes, refusals
+
+
+def _refusal_notice(agent_name: str, refusals: list[dict[str, Any]]) -> str:
+    if not refusals:
+        return ""
+    return (
+        f"Nexus refused {len(refusals)} of {agent_name}'s proposed change(s) and applied the rest: "
+        + "; ".join(
+            f"#{int(one.get('index', 0)) + 1} {one.get('path') or '(no path)'}: {one.get('reason')}"
+            for one in refusals
         )
-        if runnable_shape and references_target:
-            confined_path(root, relative)
-            expanded.setdefault(relative.casefold(), set()).add("CREATE_OR_MODIFY")
-    return expanded
+    )
 
 
 def _transaction_paths(root: Path | None, transaction_ids: list[str]) -> list[str]:
@@ -3277,10 +4374,9 @@ def _file_snapshot(root: Path, paths: list[str]) -> str:
     return "\n\n".join(blocks) or "[No readable changed or requested files.]"
 
 
-_TEST_GOAL = re.compile(
-    r"\b(?:test|tests|testing|e2e|end[- ]to[- ]end|unit|integration|playwright|pytest|vitest)\b",
-    re.IGNORECASE,
-)
+# Test evidence is required only when the user explicitly asks for tests to be
+# written or run. One shared classifier decides that for every engine:
+# goal_verification.tests_explicitly_requested / explicit_test_requests.
 _EMPTY_TEST_OUTPUT = re.compile(
     r"\b(?:no(?: [A-Za-z0-9_-]+)? tests? (?:to run|found|collected)|0 tests? (?:run|passed|collected))\b",
     re.IGNORECASE,
@@ -3288,7 +4384,23 @@ _EMPTY_TEST_OUTPUT = re.compile(
 
 
 def _is_test_goal(goal: str) -> bool:
-    return bool(_TEST_GOAL.search(_mask_goal_files(str(goal or ""))))
+    """Whether the user explicitly asked for tests to be written or run.
+
+    Delegates to the one shared classifier, which honours negation ("Do not
+    add tests", "without adding tests", "No need to add tests").
+    """
+
+    from .goal_verification import tests_explicitly_requested
+
+    return tests_explicitly_requested(str(goal or ""))
+
+
+def _test_write_requested(goal: str) -> bool:
+    """Whether the user explicitly asked for new or extended tests."""
+
+    from .goal_verification import tests_write_requested
+
+    return tests_write_requested(str(goal or ""))
 
 
 def _runnable_tests_in_changed_files(root: Path, changed: list[str]) -> dict[str, Any]:
@@ -3449,12 +4561,23 @@ def _missing_requested_test_levels(
 
 
 def _requested_test_levels(goal: str) -> list[str]:
-    folded = str(goal or "").casefold()
+    """Test levels the user explicitly asked to be written ("add unit tests").
+
+    A level word elsewhere in the goal ("the API client", "unit conversion")
+    is not a request for that level of test.
+    """
+
+    from .goal_verification import explicit_test_requests
+
+    phrases = " ".join(
+        one["phrase"] for one in explicit_test_requests(str(goal or ""))
+        if one["kind"] == "write"
+    ).casefold()
     return [
         name for name, wanted in (
-            ("E2E", bool(re.search(r"\b(?:e2e|end[- ]to[- ]end)\b", folded))),
-            ("API", bool(re.search(r"\bapi\b", folded))),
-            ("unit", bool(re.search(r"\bunit\b", folded))),
+            ("E2E", bool(re.search(r"\b(?:e2e|end[- ]to[- ]end)\b", phrases))),
+            ("API", bool(re.search(r"\bapi\b", phrases))),
+            ("unit", bool(re.search(r"\bunit\b", phrases))),
         ) if wanted
     ]
 
@@ -6055,16 +7178,6 @@ _EXCEPTION_CONNECTOR_PAIRS = {
 _POSITIVE_CONTRAST_CONNECTORS = frozenset({
     "but", "yet", "still", "however", "nevertheless", "nonetheless",
 })
-_GLOBAL_READ_ONLY = re.compile(
-    r"\bread[- ]only\b"
-    r"|\b(?:do not|don't|never)\s+(?:make|apply)\s+(?:any\s+)?(?:changes?|edits?)\b"
-    r"|\b(?:do not|don't|never)\s+(?:change|modify|edit|write|touch|alter)\s+"
-    r"(?:anything|any\s+files?|the\s+(?:project|repository|code|source))\b"
-    r"|\bwithout\s+(?:making|applying)\s+(?:any\s+)?(?:changes?|edits?)\b"
-    r"|\bwithout\s+(?:changing|modifying|editing|writing|touching|altering)\s+"
-    r"(?:anything|any\s+files?|the\s+(?:project|repository|code|source))\b",
-    re.IGNORECASE,
-)
 _GOAL_FILE = re.compile(
     # Compatibility token for compact paths. Contextual spaced, Unicode, and
     # extensionless names are handled by _goal_named_paths below.
@@ -6095,7 +7208,14 @@ _PATH_WITH_EXTENSION = re.compile(
 )
 
 
-def _normalize_goal_path(raw: str) -> str:
+def _normalize_goal_path(raw: str, *, allow_spaces: bool = False) -> str:
+    """Return one well-formed project-relative path token, or "".
+
+    Unquoted prose never becomes a path: "Submit in index.html" or
+    "users list (see api/users.py" are sentences around a path, not paths.
+    A name with spaces is accepted only when the user quoted it.
+    """
+
     candidate = str(raw or "").strip().strip("\"'").strip()
     candidate = candidate.rstrip(".,;:!?)]}").lstrip("([{").strip()
     candidate = re.sub(r"^(?:the|a|an)\s+", "", candidate, flags=re.I)
@@ -6103,11 +7223,24 @@ def _normalize_goal_path(raw: str) -> str:
     if possessive and " " not in possessive.group(1):
         candidate = possessive.group(1)
     candidate = candidate.replace("\\", "/")
+    # "./config/secret.txt" and "src/./a.py" name the same project file as
+    # "config/secret.txt" and "src/a.py". ".." and "//" stay invalid.
+    candidate = re.sub(r"^(?:\./)+", "", candidate)
+    candidate = re.sub(r"/(?:\./)+", "/", candidate)
+    if not allow_spaces and (
+        re.search(r"\s", candidate)
+        or candidate.count("(") != candidate.count(")")
+    ):
+        return ""
     if (
         not candidate
         or "://" in candidate
         or candidate.startswith("/")
         or re.match(r"^[A-Za-z]:", candidate)
+        # A colon is never part of a granted project path (it would name a
+        # Windows alternate data stream), even where the prose around it was
+        # only a port or line reference that validation let through.
+        or ":" in candidate
         or any(part in {"", ".", ".."} for part in candidate.split("/"))
         or any(ord(char) < 32 for char in candidate)
     ):
@@ -6140,19 +7273,121 @@ def _unsafe_goal_path(raw: str) -> bool:
     )
 
 
-def _validate_goal_path_syntax(goal: str) -> None:
-    """Reject unsafe path-shaped tokens before semantic authority is compiled.
+def _unsafe_goal_path_token(token: str) -> bool:
+    """Whether one goal token is a path, and an unsafe one.
 
-    Wrapping a path in quotes, backticks, or parentheses must not make it
-    disappear and later fall back to a safe-looking basename.  External URLs,
-    drive paths, and UNC references remain non-authoritative references rather
-    than being reinterpreted as project-relative paths.
+    Ordinary prose is not a path: "localhost:3000", "std::vector", "10:30"
+    and a bare "//" name no project file, so they never stop a goal. A token
+    counts as a path only when it has a folder separator next to a name, a
+    ".." segment, a drive prefix, or a dotted file name. A leading host:port
+    (or file:line) is a reference and a leading code scope such as "std::" is
+    code; only what follows either one is checked as a path.
     """
 
+    value = str(token or "").strip()
+    # A file:line(:column) reference ("src/app.py:42", "a/b.ts:10:5") names
+    # the file; the line number is not part of the path.
+    line_reference = re.fullmatch(
+        r"((?:[\w.-]+[\\/])*[\w.-]+\.[^\W_][\w-]*):\d+(?::\d+)?", value,
+    )
+    if line_reference:
+        value = line_reference.group(1)
+    reference = re.match(r"[\w.-]+:\d{1,5}(?=$|[/?#])", value)
+    if reference:
+        value = value[reference.end():]
+    scope = re.match(r"(?:[A-Za-z_]\w*::)+", value)
+    if scope:
+        value = value[scope.end():]
+    if not value:
+        return False
+    path_shaped = bool(
+        re.search(r"(?:^|[\\/])\.\.(?:[\\/]|$)", value)
+        or re.search(r"\w[\\/]|[\\/]\w", value)
+        or re.match(r"[A-Za-z]:", value)
+        or re.search(r"[\w-]\.[^\W_][\w-]*", value)
+    )
+    return path_shaped and _unsafe_goal_path(value)
+
+
+def _unsafe_goal_path_tokens(goal: str) -> list[str]:
+    """Path-shaped goal tokens that use "..", "//" or a stream colon.
+
+    Such a token never refuses the goal. It simply never becomes a write
+    grant (``_normalize_goal_path`` rejects it), the agents are told it was
+    ignored, and a write through such a path is still refused at apply time
+    by project confinement. An explicit protection or "only" scope spelled
+    that way is honoured in its collapsed, in-project form.
+    """
+
+    found: list[str] = []
     for token in re.findall(r"[^\s\"'`()\[\]{}]+", str(goal or "")):
         candidate = token.rstrip(".,;!?)]}")
-        if candidate and _unsafe_goal_path(candidate):
-            raise HarnessError(f"Unsafe explicit project path in goal: {candidate[:160]}")
+        if candidate and _unsafe_goal_path_token(candidate) and candidate not in found:
+            found.append(candidate[:160])
+    return found
+
+
+def _validate_goal_path_syntax(goal: str) -> list[str]:
+    """Compatibility name: report unsafe path tokens; never raise."""
+
+    return _unsafe_goal_path_tokens(goal)
+
+
+def _collapsed_goal_path(value: str) -> str:
+    """The in-project path an unsafe spelling names, or "" when it escapes.
+
+    "cfg//secret.txt" -> "cfg/secret.txt", "src/../a.py" -> "a.py",
+    "notes.txt:stream" -> "notes.txt". Used only for explicit restrictions.
+    """
+
+    text = str(value or "").replace("\\", "/").strip()
+    text = re.sub(r"^((?:[^/:]+/)*[^/:]+\.[^\W_][\w-]*):[^/]*$", r"\1", text)
+    if ":" in text or text.startswith("/"):
+        return ""
+    collapsed = _normalized_change_path(text)
+    if not collapsed or collapsed.startswith("..") or collapsed == text and _unsafe_goal_path(text):
+        return ""
+    return collapsed
+
+
+def _mask_non_project_references(text: str) -> str:
+    """Blank out tokens that are references, not project-relative paths.
+
+    host:port locations ("localhost:3000/index.html", "api:8080/routes.py"),
+    code scopes ("std::chrono/clock.h", or a code scope followed by a
+    drive-rooted path) and absolute, drive or UNC paths ("/etc/app.py", a
+    drive-rooted Windows file, a UNC share file) are masked whole, so no tail of them can be
+    rewritten into a project path. A file:line reference ("src/app.py:42")
+    keeps its file and drops the line number. Offsets are preserved.
+    """
+
+    value = str(text or "")
+
+    def blank(match: re.Match[str]) -> str:
+        return " " * len(match.group(0))
+
+    for _line, raw in _absolute_prompt_paths(value):
+        if raw:
+            value = value.replace(raw, " " * len(raw))
+    value = re.sub(
+        r"(?<![\w./\\:-])((?:[\w.-]+[\\/])*[\w.-]+\.[^\W_][\w-]*)(:\d+(?::\d+)?)(?![\w/\\:])",
+        lambda match: match.group(1) + " " * len(match.group(2)), value,
+    )
+    value = re.sub(r"(?<![\w.:-])[\w.-]+:\d{1,5}(?:[\\/?#][^\s\"'`<>]*)?", blank, value)
+    value = re.sub(r"(?<![\w:])(?:[A-Za-z_]\w*::)+[^\s\"'`<>()\[\]{},;]*", blank, value)
+    value = re.sub(r"(?<![\w])[A-Za-z]:[\\/][^\s\"'`<>]*", blank, value)
+    value = re.sub(r"(?<![\w\\])\\\\[^\s\"'`<>]+", blank, value)
+    value = re.sub(r"(?<![\w./\\:-])/(?=[\w.])[^\s\"'`<>]*", blank, value)
+    # IPv6 hosts ("[::1]:8080/x.py"), drive-relative paths ("C:foo.py"),
+    # alternate data streams ("a.txt:stream"), 8.3 short names
+    # ("SECRET~1.TXT"), e-mail addresses and "mailto:"-style URIs.
+    value = re.sub(r"\[[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*\](?::\d+)?[^\s\"'`<>]*", blank, value)
+    value = re.sub(r"(?<![\w.\\/:-])[A-Za-z]:(?![\\/\s])[^\s\"'`<>]+", blank, value)
+    value = re.sub(r"(?<![\w./\\:-])[\w./\\-]+\.[\w-]+:(?!\d)[^\s\"'`<>]+", blank, value)
+    value = re.sub(r"(?<![\w.-])[\w.-]*~\d+(?:\.[\w-]+)?", blank, value)
+    value = re.sub(r"(?<![\w:])(?:mailto|tel|urn|data|javascript|file|news|sms):[^\s\"'`<>]*", blank, value, flags=re.I)
+    value = re.sub(r"[^\s\"'`<>()]*@[^\s\"'`<>()]+", blank, value)
+    return value
 
 
 def _goal_named_paths(goal: str) -> list[str]:
@@ -6164,20 +7399,27 @@ def _goal_named_paths(goal: str) -> list[str]:
     """
 
     text = str(goal or "")
-    _validate_goal_path_syntax(text)
     # URLs are references, not project filenames. Mask the entire URL before
     # parsing prose spans: checking a phrase such as "Three.js loaded from
     # https://cdn.example/lib.js in index.html" as one path mistakes the URL's
     # colon for an NTFS stream and can also grant authority to a URL basename.
-    # Token validation above still rejects unsafe local paths beside the URL.
+    # Unsafe local path tokens never become paths (_normalize_goal_path).
     text = re.sub(
         r"\b[a-z][a-z0-9+.-]*://[^\s<>\"'`()\[\]{}]+",
         lambda match: " " * len(match.group(0)), text, flags=re.I,
     )
+    text = _mask_non_project_references(text)
+    # An unsafe spelling ("tests//a.py", "../a.py", "a.txt:stream") is
+    # reported and never grants anything: mask it whole, or the part after
+    # "//" would be read as a separate top-level file.
+    for token in re.findall(r"[^\s\"'`()\[\]{}]+", text):
+        candidate = token.rstrip(".,;!?)]}")
+        if candidate and _unsafe_goal_path_token(candidate):
+            text = text.replace(candidate, " " * len(candidate))
     found: list[str] = []
 
-    def remember(raw: str) -> None:
-        normalized = _normalize_goal_path(raw)
+    def remember(raw: str, *, quoted: bool = False) -> None:
+        normalized = _normalize_goal_path(raw, allow_spaces=quoted)
         if not normalized:
             return
         key = normalized.casefold()
@@ -6186,17 +7428,14 @@ def _goal_named_paths(goal: str) -> list[str]:
                 return
         found.append(normalized)
 
-    for quoted in re.finditer(r"[\"']([^\"'\r\n]+)[\"']", text):
-        if _unsafe_goal_path(quoted.group(1)):
-            raise HarnessError(f"Unsafe explicit project path in goal: {quoted.group(1)[:160]}")
+    # An apostrophe inside a word ("don't", "user's") is not a quote.
+    for quoted in re.finditer(r"(?<!\w)[\"'`]([^\"'`\r\n]+)[\"'`](?!\w)", text):
         if _external_goal_path(quoted.group(1)):
             continue
-        remember(quoted.group(1))
+        remember(quoted.group(1), quoted=True)
 
     for action in _PATH_ACTION.finditer(text):
         body = action.group(1).strip()
-        if _unsafe_goal_path(body):
-            raise HarnessError(f"Unsafe explicit project path in goal: {body[:160]}")
         if _external_goal_path(body) or body.startswith(("/", "\\")):
             continue
         raw_action_word = re.match(r"\w+", action.group(0)).group(0).casefold()
@@ -6298,18 +7537,805 @@ def _goal_named_paths(goal: str) -> list[str]:
     return found
 
 
+# Explicit user wording is the only source of restrictions (AGENTS.md, "Agents
+# lead; Nexus only supports"). Everything else Nexus reads from a goal is a
+# hint for the agents and never limits what they may change.
+_NEGATION = (
+    r"(?:do\s+not|don['’]t|dont|never|must\s+not|mustn['’]t|should\s+not|shouldn['’]t|"
+    r"may\s+not|please\s+do\s+not|please\s+don['’]t|avoid|under\s+no\s+circumstances(?:\s+(?:should|may|must)\s+you)?)"
+)
+# A prohibition addressed to the agents starts its clause ("Don't touch X",
+# "..., and never edit X", "You must not modify X"). "Users cannot delete files
+# in uploads/" or "The app must not delete X" describe behaviour (often a
+# bug) and never restrict the agents.
+_IMPERATIVE_NEGATION = (
+    r"(?:^|(?<=[.;!?\n:,(\-\u2014\u2013])|\b(?:and|but|please|also|then|so|just|only|or)\b)\s*"
+    r"(?:(?:you|we|the\s+agents?|agents?|all\s+of\s+you|y['’]all)\s+)?(?:please\s+)?(?:just\s+)?"
+    + _NEGATION
+)
+_WRITE_VERB = (
+    r"(?:touch\w*|chang\w*|modif\w*|edit\w*|alter\w*|writ\w*|overwrit\w*|delet\w*|remov\w*|"
+    r"renam\w*|mov\w*|updat\w*|rewrit\w*|replac\w*|refactor\w*|reformat\w*)"
+)
+_GERUND_WRITE_VERB = (
+    r"(?:touching|changing|modifying|editing|altering|writing(?:\s+to)?|overwriting|deleting|"
+    r"removing|renaming|moving|updating|rewriting|replacing|refactoring|reformatting)"
+)
+_CLAUSE_END = r"(?:\.\s|\.$|[;\n]|[!?](?=\s|$)|$)"
+_OBJECT_SEPARATOR = re.compile(r"\s*,\s*(?:and\s+|or\s+|nor\s+)?|\s+(?:and|or|nor|&)\s+", re.I)
+_SCOPE_EXCEPTION = re.compile(
+    r"\b(?:except|excepting|excluding|other\s+than|besides|apart\s+from|aside\s+from|"
+    r"save\s+for|unless|outside(?:\s+of)?|beyond|else)\b",
+    re.I,
+)
+
+
+_CONTROL_TOP_LEVEL = frozenset({".git", ".harness"})
+_TEST_SCOPE_WORDS = re.compile(
+    r"^(?:the\s+|all\s+(?:the\s+)?|our\s+|my\s+|its\s+|existing\s+)?(?:unit\s+|automated\s+)?"
+    r"(?:tests?|test\s+(?:files?|suites?|code|folders?|directory|directories)|specs?|test\s+cases?)"
+    r"(?:\s+(?:folder|folders|directory|directories|dir|files?))?$",
+    re.I,
+)
+_DOCS_SCOPE_WORDS = re.compile(
+    r"^(?:the\s+|all\s+(?:the\s+)?|our\s+|my\s+|its\s+)?(?:docs|documentation|doc\s+files|documents)"
+    r"(?:\s+(?:folder|directory|dir|files?))?$",
+    re.I,
+)
+
+
+def _project_entries_named(root: Path, name: str, *, limit: int = 4000) -> list[str]:
+    """Project-relative entries whose final name is exactly ``name``."""
+
+    folded = name.casefold()
+    found: list[str] = []
+    seen = 0
+    try:
+        for folder, directories, files in os.walk(root, followlinks=False):
+            directories[:] = [
+                one for one in directories
+                if one.casefold() not in _CONTROL_TOP_LEVEL and one not in {"node_modules", ".venv", "venv"}
+            ]
+            base = Path(folder)
+            depth = len(base.relative_to(root).parts)
+            if depth >= 4:
+                directories[:] = []
+            for entry in [*directories, *files]:
+                seen += 1
+                if entry.casefold() == folded:
+                    found.append((base / entry).relative_to(root).as_posix())
+            if seen > limit:
+                break
+    except (OSError, ValueError):
+        return found
+    return found
+
+
+def _resolve_bare_project_name(root: Path | None, name: str) -> str:
+    """Resolve "config" in "do not touch config" to an existing project entry.
+
+    A top-level entry with exactly that name wins; otherwise a single exact
+    match deeper in the project. Anything else (no match, or several) is not
+    a usable path.
+    """
+
+    if root is None or not re.fullmatch(r"[\w.-]+", name or "", re.UNICODE):
+        return ""
+    if name.casefold() in _CONTROL_TOP_LEVEL:
+        return ""
+    try:
+        for entry in root.iterdir():
+            if entry.name.casefold() == name.casefold():
+                return entry.name
+    except OSError:
+        return ""
+    matches = _project_entries_named(root, name)
+    return matches[0] if len(matches) == 1 else ""
+
+
+def _semantic_scope_paths(phrase: str, root: Path | None) -> list[str]:
+    """Paths meant by "the tests" or "the documentation"."""
+
+    text = re.sub(r"\s+", " ", str(phrase or "").strip().strip("\"'`.,;:!?"))
+    if _TEST_SCOPE_WORDS.match(text):
+        folders = ["tests", "test"]
+        if root is not None:
+            for name in ("tests", "test", "spec", "specs", "__tests__", "e2e"):
+                folders.extend(_project_entries_named(root, name))
+        return list(dict.fromkeys([
+            *folders, "**/test_*", "**/*_test.*", "**/*.test.*", "**/*.spec.*", "**/conftest.py",
+        ]))
+    if _DOCS_SCOPE_WORDS.match(text):
+        folders = ["docs", "doc"]
+        if root is not None:
+            folders.extend(_project_entries_named(root, "docs"))
+            folders.extend(_project_entries_named(root, "doc"))
+        return list(dict.fromkeys([*folders, "**/*.md", "**/*.rst"]))
+    return []
+
+
+def _usable_restriction_path(relative: str) -> str:
+    """Drop paths that name Git/Nexus control state or escape the project."""
+
+    value = str(relative or "").replace("\\", "/").strip("/")
+    if not value:
+        return ""
+    if value == ".":
+        return value
+    parts = value.split("/")
+    if parts[0].casefold() in _CONTROL_TOP_LEVEL or any(part == ".." for part in parts):
+        return ""
+    return value
+
+
+def _explicit_path_token(token: str, root: Path | None = None, *, folder_word: bool = False) -> str:
+    """Return a well-formed project path (or glob) spelled by the user, or ""."""
+
+    value = str(token or "").strip().strip("\"'`()[]{}").rstrip(".,;:!")
+    value = value.rstrip("?") if not re.search(r"[\w*\]]\?[\w.*]", value) else value
+    if not value:
+        return ""
+    line_reference = re.fullmatch(r"(.+\.[^\W_][\w-]*):\d+(?::\d+)?", value)
+    if line_reference and not re.match(r"^[A-Za-z]:[\\/]", value):
+        value = line_reference.group(1)
+    if "::" in value or re.match(r"^[\w.-]+:\d", value) or "@" in value:
+        # Code scopes, host:port locations and e-mail addresses are never
+        # project paths.
+        return ""
+    if re.match(r"^\.[\\/]", value):
+        value = re.sub(r"^(?:\.[\\/])+", "", value)
+    if re.match(r"^[A-Za-z]:[\\/]", value):
+        if root is None:
+            return ""
+        if _is_project_root_path(root, value):
+            return "."
+        normal = _normal_write_roots(root, [value])
+        return _usable_restriction_path(normal[0]) if normal else ""
+    if _external_goal_path(value) or re.match(r"^[A-Za-z]:", value):
+        return ""
+    if _GLOB_CHARACTERS & set(value):
+        pattern = value.replace("\\", "/").strip("/")
+        if (
+            re.fullmatch(r"[\w.*?\[\]!-]+(?:/[\w.*?\[\]!-]+)*", pattern, re.UNICODE)
+            and not any(part in {".", ".."} for part in pattern.split("/"))
+        ):
+            return _usable_restriction_path(pattern)
+        return ""
+    if _unsafe_goal_path(value):
+        # An explicit restriction spelled with "//", an inner ".." or a
+        # stream suffix still protects/scopes the file it names.
+        value = _collapsed_goal_path(value)
+        if not value or _unsafe_goal_path(value):
+            return ""
+    file_path = _normalize_goal_path(value)
+    if file_path:
+        return _usable_restriction_path(file_path)
+    folder = value.replace("\\", "/").rstrip("/")
+    if (
+        folder
+        and re.fullmatch(r"[\w.-]+(?:/[\w.-]+)*", folder, re.UNICODE)
+        and not folder.startswith("/")
+        and not any(part in {"", ".", ".."} for part in folder.split("/"))
+    ):
+        if "/" in value.replace("\\", "/"):
+            return _usable_restriction_path(folder)
+        resolved = _resolve_bare_project_name(root, folder)
+        if resolved:
+            return _usable_restriction_path(resolved)
+        if folder_word and root is None:
+            return _usable_restriction_path(folder)
+    return ""
+
+
+def _path_shaped_object(text: str) -> bool:
+    """Whether an instruction's object is spelled like a path.
+
+    Used to tell "only change ../outside" (a path the user named, even if it
+    is unusable) apart from "only change what is needed" (not a path).
+    """
+
+    words = str(text or "").strip().split()[:6]
+    return any(
+        re.search(r"[\\/~*?]|::|^\.\w|^\.\.|^\[", one.strip("\"'`(),;"))
+        or re.search(r"[\w-]\.[A-Za-z][A-Za-z0-9]{0,7}$", one.strip("\"'`(),;.!?"))
+        or re.match(r"^[A-Za-z]:", one.strip("\"'`("))
+        for one in words
+    )
+
+
+def _explicit_object_paths(
+    span: str, root: Path | None = None, *, reverse: bool = False,
+    allow_inner: bool = False,
+) -> list[str]:
+    """Parse the coordinated path objects of one explicit instruction.
+
+    ``span`` is the text after (or, with ``reverse``, before) the instruction
+    verb. Objects are taken while they are path tokens joined by commas or
+    and/or; the first ordinary word ends the list, so "don't touch
+    config.py and fix app.py" protects only config.py.
+    """
+
+    semantic = _semantic_scope_paths(str(span or ""), root)
+    if semantic:
+        return semantic
+    pieces = [one.strip() for one in _OBJECT_SEPARATOR.split(str(span or "")) if one.strip()]
+    if reverse:
+        pieces = list(reversed(pieces))
+    found: list[str] = []
+    object_pattern = re.compile(
+        r"^(?:the\s+|a\s+|our\s+|my\s+|your\s+)?(?:(?:file|folder|directory|dir|module|script)\s+)?"
+        r"(?:(?:anything|everything|any\s+files?|any\s+code|all\s+files|files?|code|contents?)\s+"
+        r"(?:in|inside|under|within|of)\s+(?:the\s+)?)?"
+        r"[\"'`(]*(?P<path>[^\s\"'`(),;]+)[\"'`)]*"
+        r"(?P<folder>\s+(?:folder|directory|dir)\b)?",
+        re.I,
+    )
+    for index, piece in enumerate(pieces):
+        semantic = _semantic_scope_paths(piece, root)
+        if semantic:
+            found.extend(semantic)
+            continue
+        if reverse:
+            match = re.search(
+                r"(?:^|\s)(?:the\s+)?(?:(?:file|folder|directory)\s+)?[\"'`(]*(?P<path>[^\s\"'`(),;]+)[\"'`)]*"
+                r"(?P<folder>\s+(?:folder|directory|dir))?\s*$",
+                piece, re.I,
+            )
+        else:
+            match = object_pattern.match(piece)
+        relative = _explicit_path_token(
+            match.group("path"), root, folder_word=bool(match.group("folder")),
+        ) if match else ""
+        if not relative and index == 0 and not reverse and allow_inner:
+            # "only change the header in index.html" scopes to index.html.
+            # Never used for protection: "don't touch the header in
+            # index.html" must not freeze the whole file.
+            inner = re.search(
+                r"\b(?:in|to|of|inside|within|under)\s+(?:the\s+)?[\"'`(]*(?P<path>[^\s\"'`(),;]+)[\"'`)]*"
+                r"(?P<folder>\s+(?:folder|directory|dir)\b)?",
+                piece, re.I,
+            )
+            if inner:
+                relative = _explicit_path_token(
+                    inner.group("path"), root, folder_word=bool(inner.group("folder")),
+                )
+        if not relative:
+            break
+        found.append(relative)
+        consumed = (match.end() if match else 0)
+        if reverse:
+            if match and piece[:match.start()].strip():
+                break
+        elif match and piece[consumed:].strip():
+            # "config.py at all" ends the coordinated object list.
+            break
+    return list(dict.fromkeys(found))
+
+
+def _relativize_goal_paths(goal: str, root: Path | None) -> str:
+    """Spell absolute paths inside the selected project as project paths.
+
+    "do not touch <project root>\\config\\secret.txt" becomes "do not
+    touch config/secret.txt", so an explicit protection or "only" scope given as
+    an absolute path is honoured like its relative spelling. The project root
+    itself becomes "."; paths outside the project are left as they are.
+    """
+
+    text = str(goal or "")
+    if root is None:
+        return text
+    for _line, raw in sorted(_absolute_prompt_paths(text), key=lambda one: -len(one[1])):
+        if not raw:
+            continue
+        if _is_project_root_path(root, raw):
+            relative = "."
+        else:
+            normal = _normal_write_roots(root, [raw])
+            if not normal:
+                continue
+            relative = normal[0]
+        if " " in relative:
+            relative = f'"{relative}"'
+        text = text.replace(raw, relative)
+    return text
+
+
+_PROTECTION_HEADER = re.compile(
+    r"(?:^|(?<=[.;!?(\n])\s*|(?<=\u2014)|(?<=\u2013))\s*(?:[-*\u2022]\s*|\d+[.)]\s*)?"
+    r"(?P<head>"
+    rf"{_NEGATION}\s+{_WRITE_VERB}(?:\s*(?:,|or|and|nor)\s*{_WRITE_VERB})*"
+    r"(?:\s+(?:these|the\s+following|any\s+of\s+these|any\s+of\s+the\s+following|the))?"
+    r"(?:\s+(?:files?|paths?|folders?|directories|items))?"
+    r"|(?:(?:these|the\s+following)\s+(?:files?|paths?|folders?|directories)\s+(?:are|is)\s+)?"
+    r"(?:protected|read[- ]only|frozen|locked|immutable|off[- ]limits|untouchable|do[- ]not[- ](?:touch|change|modify|edit))"
+    r"(?:\s+(?:files?|paths?|folders?|directories|items))?"
+    r"|(?:files?|paths?|folders?|directories)\s+(?:not\s+to\s+(?:touch|change|modify|edit)|"
+    r"(?:that\s+)?(?:must|should|may)\s+not\s+(?:change|be\s+(?:changed|modified|touched|edited)))"
+    r"|hands\s+off"
+    r")\s*:[ \t]*(?P<rest>[^\n]*)",
+    re.I,
+)
+_LIST_ITEM = re.compile(r"^\s*(?:[-*\u2022+]|\d+[.)])\s+(?P<item>.+?)\s*$")
+_PROTECTION_LABEL = (
+    rf"(?:(?:do\s+not|don['\u2019]t|dont|never|no)\s+(?:{_WRITE_VERB}|changes?|edits?|writes?)"
+    r"(?:\s+(?:it|this|them|that))?"
+    r"|read[- ]only|protected|frozen|locked|immutable|untouched|unchanged|off[- ]limits|hands\s+off"
+    r"|(?:keep|leave)\s+(?:(?:it|this)\s+)?(?:as[- ]is|unchanged|untouched|alone)"
+    r"|leave\s+alone)\b"
+)
+_LABELLED_PATH = re.compile(
+    r"(?:^|(?<=[\n;(])|(?<=[.!?]\s)|(?<=,\s)|(?<=\b(?:but|and|for)\s)|(?<=[\u2014\u2013]\s))"
+    r"\s*(?:[-*\u2022]\s*|\d+[.)]\s*)?(?:(?:for|but|and)\s+)?(?:the\s+)?"
+    r"(?P<name>[^\s,:;()]+)(?P<noun>\s+(?:file|folder|directory|dir))?"
+    r"\s*(?P<sep>[:,\-\u2014\u2013])\s*"
+    rf"(?P<label>{_PROTECTION_LABEL})",
+    re.I,
+)
+
+
+def _labelled_path_name(name: str, noun: str, root: Path | None) -> str:
+    return _explicit_path_token(name, root, folder_word=bool(noun))
+
+
+def _protection_list_paths(text: str, root: Path | None) -> list[str]:
+    """Protections given as a header list or a per-file label.
+
+    "Do not modify:\n- config/secret.txt\n- LICENSE", "Protected files: a,
+    b", "Don't touch: a, b", "Read-only: config/secret.txt",
+    "config/secret.txt: do not modify", "- LICENSE: read-only" and
+    "(config/secret.txt: read-only)".
+    """
+
+    found: list[str] = []
+    lines = text.splitlines()
+    offsets = []
+    position = 0
+    for line in lines:
+        offsets.append(position)
+        position += len(line) + 1
+    for match in _PROTECTION_HEADER.finditer(text):
+        rest = match.group("rest").strip()
+        if rest:
+            found.extend(_explicit_object_paths(rest, root))
+        line_index = text.count("\n", 0, match.end())
+        for line in lines[line_index + 1:]:
+            if not line.strip():
+                if found:
+                    continue
+                continue
+            item = _LIST_ITEM.match(line)
+            if not item:
+                break
+            body = item.group("item")
+            labelled = re.match(r"(?P<name>[^\s:]+)\s*:\s*(?P<what>.*)$", body)
+            if labelled and not re.search(_PROTECTION_LABEL, labelled.group("what"), re.I):
+                # "- src/app.py: fix" under a protection header is odd; the
+                # file named before the colon is still the item.
+                body = labelled.group("name")
+            found.extend(_explicit_object_paths(body, root)[:1])
+    for match in _LABELLED_PATH.finditer(text):
+        if match.group("sep") == "," and not re.match(
+            r"(?:do\s+not|don['\u2019]t|dont|never|no)\b", match.group("label"), re.I,
+        ):
+            continue
+        relative = _labelled_path_name(match.group("name"), match.group("noun") or "", root)
+        if relative:
+            found.append(relative)
+    return found
+
+
+def _is_path_label_before(text: str, start: int) -> bool:
+    """Whether a read-only phrase at ``start`` is a label for a named path.
+
+    "config/secret.txt: do not modify", "tests/test_app.py: read-only",
+    "For config/secret.txt, don't change." or "The config file - don't
+    touch." restrict that path only, never the whole project.
+    """
+
+    clause = re.split(r"[\n;(]|[.!?]\s", text[:start])[-1]
+    label = re.search(
+        r"(?:^|\b(?:for|but|and)\s+|[\s(])(?:the\s+)?(?P<name>[^\s,:;()]+)"
+        r"(?P<noun>\s+(?:file|folder|directory|dir))?\s*[:,\-\u2014\u2013]\s*$",
+        clause, re.I,
+    )
+    if not label:
+        return False
+    if label.group("noun"):
+        return True
+    name = label.group("name")
+    return bool(_explicit_path_token(name, None)) or bool(re.search(r"[\\/]|\.\w{1,8}$", name))
+
+
+def _is_path_header_after(text: str, end: int) -> bool:
+    """Whether "Read-only:" / "Do not modify:" is followed by named paths."""
+
+    rest = text[end:]
+    header = re.match(r"\s*(?:(?:files?|paths?|folders?|directories)\s*)?:[ \t]*(?P<rest>[^\n]*)", rest, re.I)
+    if not header:
+        return False
+    if header.group("rest").strip():
+        first = header.group("rest").strip().split()[0]
+        return _path_shaped_object(first) or bool(_explicit_path_token(first, None))
+    following = rest[header.end():].lstrip("\n").splitlines()
+    return bool(following and _LIST_ITEM.match(following[0]))
+
+
+def _explicit_protected_paths(goal: str, root: Path | None = None) -> list[str]:
+    """Paths the user explicitly told the agents not to change.
+
+    Only negation or preservation wording protects a path: "don't
+    touch/change/modify/edit X", "never delete X", "without changing X",
+    "leave X alone", "keep X unchanged", "X is read-only", "X must not be
+    changed", "treat X as read-only". Mentioning, reading, reviewing, using
+    or copying a file never protects it.
+    """
+
+    text = _relativize_goal_paths(goal, root)
+    found: list[str] = []
+    forward = (
+        rf"{_IMPERATIVE_NEGATION}\s+(?:(?:ever|even|actually|directly|manually|accidentally|please)\s+)?"
+        rf"{_WRITE_VERB}(?:\s*(?:,|or|and|nor)\s*{_WRITE_VERB})*"
+        r"(?:\s+(?:to|with|in|into|inside|within|under)\b)?(?:\s*:[ \t]*|\s+)"
+        rf"(?P<span>.*?)(?={_CLAUSE_END})",
+        # "Keep your hands off X", "Hands off X", "Freeze X".
+        rf"\b(?:keep\s+(?:your\s+)?)?hands\s+off\s+(?:of\s+)?(?P<span>.*?)(?={_CLAUSE_END})",
+        rf"(?:^|(?<=[.;!?\n(])|\b(?:and|also|please|then)\b)\s*freeze\s+(?P<span>.*?)(?={_CLAUSE_END})",
+        rf"\bno\s+(?:changes?|edits?|modifications?|writes?)\s+(?:to|in|inside|under|within|of)\s+(?P<span>.*?)(?={_CLAUSE_END})",
+        rf"\bwithout\s+(?:ever\s+)?{_GERUND_WRITE_VERB}(?:\s*(?:,|or|and|nor)\s*{_GERUND_WRITE_VERB})*"
+        r"(?:\s+(?:to|with|in|into|inside|within|under)\b)?\s+"
+        rf"(?P<span>.*?)(?={_CLAUSE_END}|\s*,)",
+        rf"\btreat\s+(?P<span>.*?)\s+as\s+(?:a\s+)?read[- ]only\b",
+        # "Preserve settings.json and update game.py": preserving a named
+        # file is explicit. ("Keep X" alone is not: "keep app.py working".)
+        rf"\bpreserve\s+(?P<span>.*?)(?={_CLAUSE_END}|\s*,|\s+(?:while|but|then|so|when)\b)",
+        rf"\bread[- ]only\s*(?::|\()?\s*(?:(?:reference|file|files|copy|input|inputs|folder|directory|source)\s*:?\s+)?"
+        rf"(?P<span>.*?)(?={_CLAUSE_END}|\s*\)|\s*\b(?:and|but|then|while)\s+(?!\S+\.\w))",
+    )
+    for pattern in forward:
+        for match in re.finditer(pattern, text, re.I):
+            span = match.group("span")
+            if _SCOPE_EXCEPTION.match(span.strip()) or re.match(
+                r"\s*(?:anything|everything|any\s+files?|any\s+code|a\s+thing)\s*(?:else\b|$|[,.;!?])",
+                span, re.I,
+            ):
+                continue
+            found.extend(_explicit_object_paths(span, root))
+    # "Nothing in config/ may change".
+    for match in re.finditer(
+        r"\bnothing\s+(?:in|inside|under|within)\s+(?P<span>.+?)\s+(?:may|can|should|must|is\s+to|is\s+allowed\s+to)\s+"
+        r"(?:be\s+)?(?:change|changed|modified|touched|edited|altered|written)\b",
+        text, re.I,
+    ):
+        found.extend(_explicit_object_paths(match.group("span"), root))
+    # "Refactor everything except legacy.py": the exception keeps its content.
+    for match in re.finditer(
+        rf"\b(?:refactor|reformat|rewrite|chang|modif|updat|edit|touch|format|lint|clean|fix)\w*\s+"
+        r"(?:everything|all\s+(?:files|the\s+files|the\s+code|code)|the\s+(?:whole|entire)\s+(?:project|repo|codebase))\s+"
+        rf"(?:except|but|other\s+than|besides|apart\s+from|aside\s+from|save\s+for|excluding)\s+(?:for\s+)?(?P<span>.*?)(?={_CLAUSE_END})",
+        text, re.I,
+    ):
+        found.extend(_explicit_object_paths(match.group("span"), root))
+    found.extend(_protection_list_paths(text, root))
+    around = (
+        r"\b(?:leave|keep|preserve)\s+(?P<span>.{1,200}?)\s+(?:completely\s+|entirely\s+|exactly\s+)?"
+        r"(?:alone|untouched|unchanged|intact|as[- ]is|read[- ]only|the\s+same|as\s+it\s+is)\b",
+    )
+    for pattern in around:
+        for match in re.finditer(pattern, text, re.I):
+            span = match.group("span")
+            if re.search(rf"{_CLAUSE_END}", span):
+                span = re.split(r"\.\s|[;!?\n]", span)[-1]
+            found.extend(_explicit_object_paths(span, root))
+    status = (
+        r"\s+(?:is|are|stays?|remains?|(?:must|should|shall|has\s+to|have\s+to|needs?\s+to|will)\s+"
+        r"(?:stay|remain|be))\s+(?:strictly\s+|completely\s+|entirely\s+|always\s+)?"
+        r"(?:read[- ]only|unchanged|untouched|off[- ]limits|frozen|immutable|protected|intact)\b",
+        r"\s+(?:file\s+|folder\s+|directory\s+)?(?:must|should|may|shall|is|are|can)\s*not\s+(?:to\s+)?(?:be\s+)?"
+        r"(?:touched|changed|modified|edited|altered|written|overwritten|deleted|removed|renamed|moved|"
+        r"updated|replaced|rewritten|refactored)\b",
+        # "X must not change", "X should never change".
+        r"\s+(?:file\s+|folder\s+|directory\s+)?(?:must|should|may|shall|can)(?:\s*not|\s+never)\s+(?:change|be\s+altered|move)\b",
+        r"\s+(?:must|should)\s+(?:stay|remain)\s+(?:as[- ]is|the\s+same|unchanged|untouched)\b",
+        r"\s*\(\s*read[- ]only[^)]*\)",
+        r"\s+as\s+(?:an?\s+)?read[- ]only\b",
+    )
+    for pattern in status:
+        for match in re.finditer(pattern, text, re.I):
+            before = text[:match.start()]
+            clause = re.split(r"\.\s|[;!?\n:]|\b(?:but|however|then|while|and\s+then)\b", before)[-1]
+            sentence = re.split(r"\.\s|[;!?\n:]", before)[-1]
+            if re.search(
+                r"\b(?:everything|anything|all\s+(?:files|code|other\s+files))\s+(?:except|but|other\s+than|"
+                r"besides|apart\s+from|aside\s+from|save\s+for|excluding)\b",
+                sentence, re.I,
+            ):
+                # "Everything except src/app.py is read-only" limits writes to
+                # src/app.py (see _explicit_write_only_request).
+                continue
+            found.extend(_explicit_object_paths(clause, root, reverse=True))
+    if root is not None:
+        # A protected absolute path under a read-only heading on its own line.
+        found.extend(_path_authority_from_goal(root, str(goal or "")).get("read_only_standalone", []))
+    return [one for one in dict.fromkeys(_usable_restriction_path(one) for one in found) if one]
+
+
+_GLOBAL_READ_ONLY_EXPLICIT = (
+    re.compile(
+        r"\bread[- ]only\s+(?:task|run|mode|request|review|question|analysis|audit|investigation|"
+        r"pass|session|access|inspection|exploration|job|work|assessment|walkthrough)\b",
+        re.I,
+    ),
+    re.compile(
+        r"\b(?:be|stay|work|operate|remain|act|run|proceed|keep\s+(?:it|this|everything|things|the\s+"
+        r"(?:project|repo|repository|code(?:base)?|workspace|files)))\s+"
+        r"(?:strictly\s+|purely\s+|completely\s+|entirely\s+)?read[- ]only\b",
+        re.I,
+    ),
+    # "Read-only: ..." at the start, or "...; read-only" as its own clause.
+    re.compile(
+        r"^\s*[(\[]?\s*read[- ]only\b(?!\s*-?\s*(?:reference|copy|copies|file|files|folder|folders|"
+        r"directory|directories|source|input|inputs|mirror|snapshot|version|baseline|path|paths)\b)",
+        re.I,
+    ),
+    re.compile(r"[;:\n,.]\s*(?:strictly\s+|this\s+is\s+)?read[- ]only\s*(?:please\s*)?(?:[.;!?]|$)", re.I),
+    re.compile(
+        rf"{_IMPERATIVE_NEGATION}\s+(?:make|apply|do|write|commit|save|propose)\s+(?:any\s+)?(?:file\s+|code\s+)?"
+        r"(?:changes?|edits?|modifications?|writes?)\b(?!\s+(?:to|in|inside|under|within|of|for)\b)",
+        re.I,
+    ),
+    re.compile(
+        rf"{_IMPERATIVE_NEGATION}\s+(?:(?:ever|even|actually)\s+)?{_WRITE_VERB}\s+"
+        r"(?:anything|any\s+(?:files?|code|thing)|a\s+(?:thing|single\s+(?:file|line))|"
+        r"the\s+(?:project|repo|repository|code|codebase|source|files|workspace))\b"
+        r"(?!\s+(?:in|of|under|inside|within|for|at|that|which|related|outside|beyond|besides|else|"
+        r"here|there|below|above)\b)",
+        re.I,
+    ),
+    re.compile(
+        # "Just explain, don't change." -- but not "don't touch ./secret.txt".
+        rf"{_IMPERATIVE_NEGATION}\s+(?:change|modify|edit|touch|write|alter)(?:\s+(?:it|them|this|that|files|code))?\s*(?:[.!;](?=\s|$)|$)",
+        re.I,
+    ),
+    re.compile(r"\bmake\s+no\s+(?:file\s+|code\s+)?(?:changes?|edits?|modifications?)\b(?!\s+(?:to|in|inside|under|within|of)\b)", re.I),
+    re.compile(
+        r"(?:^|[.;!?\n]\s*|,\s*|\bbut\s+|\band\s+)no\s+(?:file\s+|code\s+)?(?:changes?|edits?|modifications?|writes?)"
+        r"(?:\s+(?:please|at\s+all|whatsoever|allowed|permitted|needed|wanted))?\s*(?:[.,;!?]|$)",
+        re.I,
+    ),
+    re.compile(
+        r"\bwithout\s+(?:making|applying|doing|writing)\s+(?:any\s+)?(?:file\s+|code\s+)?(?:changes?|edits?|modifications?)\b"
+        r"(?!\s+(?:to|in|inside|under|within|of)\b)",
+        re.I,
+    ),
+    re.compile(
+        rf"\bwithout\s+{_GERUND_WRITE_VERB}\s+(?:anything|any\s+(?:files?|code)|files|code|the\s+"
+        r"(?:project|repo|repository|code|codebase|source|files))\b"
+        r"(?!\s+(?:in|of|under|inside|within|for|else)\b)",
+        re.I,
+    ),
+    re.compile(
+        r"\bleave\s+(?:the\s+)?(?:project|repo|repository|code(?:base)?|files|everything|all\s+files)\s+"
+        r"(?:alone|untouched|unchanged|as[- ]is)\b",
+        re.I,
+    ),
+)
+_RESTRICTIVE_EXCEPTION = (
+    r"(?:except|excepting|excluding|other\s+than|besides|apart\s+from|aside\s+from|save\s+for|"
+    r"unless|outside(?:\s+of)?|bar|barring|beyond|else|with\s+the\s+(?:sole\s+|single\s+)?exception\s+(?:of|to|for))"
+)
+_CONTRAST_EXCEPTION = r"(?:but|however|nevertheless|nonetheless|instead|yet|still)"
+_EXCEPTION_ACTION = re.compile(
+    r"\b(fix|repair|updat|chang|modif|edit|add|creat|writ|implement|remov|delet|renam|mov|"
+    r"refactor|correct|replac|resolv|migrat)(\w*)",
+    re.I,
+)
+_EXCEPTION_OBLIGATION = re.compile(
+    r"\b(?:required|needed|necessary|essential|mandatory|must|requested|should\s+be|has\s+to\s+be)\b",
+    re.I,
+)
+
+
+def _prohibition_has_positive_exception(tail: str) -> bool:
+    """Whether text after a prohibition reopens it for a real action.
+
+    Restrictive exceptions ("except fixes to parser.py", "other than fixing
+    X") reopen it for the named action. A contrast ("However, ...") does so
+    only with an imperative ("However, fix X") or an obligation ("repairs to
+    X are required"); "However, repairs are described in the report" does not.
+    """
+
+    for match in re.finditer(
+        rf"\b(?:{_RESTRICTIVE_EXCEPTION}|{_CONTRAST_EXCEPTION})\b", tail, re.I,
+    ):
+        clause = re.split(r"\.\s|[;!?\n]", tail[match.end():], maxsplit=1)[0]
+        if re.fullmatch(_RESTRICTIVE_EXCEPTION, match.group(0), re.I) and re.search(r"\w", clause):
+            # "don't change anything except src/parser.py": a scoped
+            # restriction (see _explicit_write_only_scope), not read-only.
+            return True
+        action = _EXCEPTION_ACTION.search(clause[:160])
+        if not action:
+            continue
+        suffix = action.group(2).casefold()
+        nominal = suffix in {"s", "es", "ion", "ions", "ment", "ments", "ications", "ication", "ations", "ation"}
+        if not nominal or _EXCEPTION_OBLIGATION.search(clause):
+            return True
+    return False
+
+
+def _explicit_read_only_goal(goal: str) -> bool:
+    """Whether the user explicitly asked for a run that changes nothing.
+
+    Read-only is never inferred from a question mark, from verbs such as
+    show/list/check/explain, from "without breaking X" or "avoid X", or from a
+    bug report phrased as a prohibition ("Files must not be deleted when ...").
+    It needs explicit wording such as "read-only", "don't change anything",
+    "make no changes", "no changes" or "just explain, don't change". A
+    prohibition followed by an exception ("don't change anything except
+    app.py", "... However, fix the typo") is a scoped restriction, not
+    read-only.
+    """
+
+    text = str(goal or "")
+    for pattern in _GLOBAL_READ_ONLY_EXPLICIT:
+        for match in pattern.finditer(text):
+            if _prohibition_has_positive_exception(text[match.end():]):
+                continue
+            label_start = match.start() + (1 if match.group(0)[:1] in ";:\n,." else 0)
+            label_start += len(match.group(0)[label_start - match.start():]) - len(
+                match.group(0)[label_start - match.start():].lstrip()
+            )
+            if _is_path_label_before(text, label_start) or _is_path_header_after(text, match.end()):
+                # "config/secret.txt: do not modify" or "Read-only:\n- a.txt"
+                # protects those paths only (see _explicit_protected_paths).
+                continue
+            return True
+    return False
+
+
+def _explicit_write_only_request(
+    goal: str, root: Path | None = None,
+) -> dict[str, Any]:
+    """The user's explicit "only ..." write restriction, if any.
+
+    Returns ``requested`` (the user explicitly limited writes), ``scope``
+    (the usable project paths/globs it names) and ``unresolved`` (the
+    wording that named something Nexus cannot use as a writable project path,
+    such as "../outside", "/etc", ".git" or a scope the user also protects).
+    A requested scope that resolves to nothing stays restricted with an empty
+    scope, so the user is asked instead of the restriction silently widening
+    to the whole project.
+
+    Recognised wording: "only change X", "change only X", "edit X only",
+    "you may only edit X", "by editing only X", "touching only X", "limit
+    changes to X", "change nothing except X", "touch nothing but X", "don't
+    change anything except X", "only X may change", "changes only in docs/",
+    "X and nothing else", "don't touch anything else", "everything else is
+    read-only", "only change the tests" (the project's test files). The
+    selected project root itself ("only work in <project root>") is full access.
+    """
+
+    text = _relativize_goal_paths(goal, root)
+    found: list[str] = []
+    requested = False
+    unresolved: list[str] = []
+    verbs = (
+        r"(?:change|modify|edit|update|touch|write(?:\s+to)?|fix|alter|work\s+(?:on|in|inside|within)|"
+        r"make\s+(?:changes|edits)\s+(?:to|in|inside|within)|create\s+files\s+in|put\s+files\s+in)"
+    )
+    gerunds = (
+        r"(?:changing|modifying|editing|updating|touching|writing(?:\s+to)?|fixing|altering|"
+        r"working\s+(?:on|in|inside|within))"
+    )
+    span = rf"(?P<span>.*?)(?={_CLAUSE_END})"
+    exceptions = (
+        r"(?:except|excepting|other\s+than|besides|apart\s+from|aside\s+from|save\s+for|"
+        r"but|outside(?:\s+of)?|beyond)"
+    )
+    patterns = (
+        rf"(?<!not\s)(?<!n't\s)(?<!n\u2019t\s)\bonly\s+{verbs}\s+{span}",
+        rf"\b{verbs}\s+only\s+(?:(?:in|inside|within|under|to)\s+)?{span}",
+        rf"\b(?:by\s+)?{gerunds}\s+only\s+(?:(?:in|inside|within|under|to)\s+)?{span}",
+        rf"(?<!\bnot\s)\bonly\s+{gerunds}\s+{span}",
+        rf"\b(?:limit|restrict|confine|scope)\s+(?:your\s+|all\s+|the\s+|any\s+)?(?:changes|edits|writes|modifications|yourself|work|yourselves)\s+to\s+{span}",
+        rf"\b(?:no\s+(?:other\s+)?(?:changes|edits|modifications)|{_NEGATION}\s+(?:change|modify|edit|touch|alter|write)\s+anything|"
+        rf"make\s+no\s+(?:changes|edits)|{verbs}\s+nothing)\s+(?:else\s+)?,?\s*{exceptions}\s+(?:(?:to|in|for|inside|within)\s+)?{span}",
+        rf"\b(?:changes|edits|writes)\s+(?:only|exclusively)\s+(?:in|inside|within|under|to)\s+{span}",
+        rf"(?<!\bnot\s)\b(?:only|just)\s+(?:in|inside|within|under)\s+{span}",
+        rf"\b(?:everything|anything|all\s+files)\s+{exceptions}\s+(?P<span2>[^;!?\n]+?)"
+        r"(?=\s+(?:is|are|stays?|remains?|must\s+(?:stay|remain|be)|should\s+(?:stay|remain|be))\s+"
+        r"(?:read[- ]only|unchanged|untouched|off[- ]limits|frozen|protected)\b)",
+        rf"\b(?:leave|keep)\s+(?:everything|all\s+files|all\s+other\s+files)\s+{exceptions}\s+(?P<span2>.*?)\s+"
+        r"(?:alone|untouched|unchanged|as[- ]is|read[- ]only)\b",
+    )
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, re.I):
+            chosen = match.groupdict().get("span") or match.groupdict().get("span2") or ""
+            chosen = re.sub(r"\s+(?:only|if\s+(?:needed|necessary|required))\s*$", "", chosen.strip(), flags=re.I)
+            paths = _explicit_object_paths(chosen, root, allow_inner=True)
+            if paths:
+                requested = True
+                found.extend(paths)
+            elif _path_shaped_object(chosen):
+                requested = True
+                unresolved.append(chosen.strip()[:200])
+    # "Edit src/app.py only": the object comes before "only".
+    for match in re.finditer(
+        rf"\b{verbs}\s+(?:the\s+(?:file|folder|directory)\s+)?(?P<span>[^\s,;]+(?:\s*(?:,|and)\s*[^\s,;]+)*)\s+only\s*(?=[.;,!?\n]|$)",
+        text, re.I,
+    ):
+        paths = _explicit_object_paths(match.group("span"), root)
+        if paths:
+            requested = True
+            found.extend(paths)
+        elif _path_shaped_object(match.group("span")):
+            requested = True
+            unresolved.append(match.group("span")[:200])
+    for match in re.finditer(
+        r"(?<!\bnot\s)\bonly\s+(?P<path>[^\s,;]+)\s+(?:may|can|should|is\s+allowed\s+to|needs?\s+to|shall)\s+"
+        r"(?:be\s+)?(?:change[ds]?|modified|edited|touched|updated|written)\b",
+        text, re.I,
+    ):
+        relative = _explicit_path_token(match.group("path"), root)
+        if relative:
+            requested = True
+            found.append(relative)
+        elif _path_shaped_object(match.group("path")):
+            requested = True
+            unresolved.append(match.group("path")[:200])
+    if re.search(
+        r"\b(?:just|only)\s+(?:this|that|these|those|the\s+(?:named|listed|mentioned))\s+files?\b"
+        r"|\bnothing\s+else\b|\bno\s+other\s+files?\b"
+        rf"|{_IMPERATIVE_NEGATION}\s+(?:change|modify|edit|touch|alter|write)\s+(?:anything|any\s+other\s+files?)\s+else\b"
+        rf"|{_IMPERATIVE_NEGATION}\s+(?:change|modify|edit|touch|alter|write\s+to)\s+any\s+other\s+files?\b"
+        r"|\bleave\s+(?:everything|all\s+other\s+files|the\s+rest)\s+(?:else\s+)?(?:alone|untouched|unchanged|as[- ]is)\b"
+        r"|\b(?:everything|anything|all)\s+else\s+(?:is|stays|remains|must\s+(?:stay|remain|be)|should\s+(?:stay|remain|be))\s+"
+        r"(?:read[- ]only|unchanged|untouched|off[- ]limits|frozen|protected)\b"
+        r"|\bread[- ]only\s+(?:for\s+)?everything\s+else\b"
+        r"|\b(?:and|with)\s+no\s+other\s+(?:file|files|changes)\b",
+        text, re.I,
+    ):
+        requested = True
+        named = [*_goal_named_paths(text)]
+        for token in re.findall(r"(?<![\w.-])((?:[\w.-]+[\\/])+[\w.-]*)", text):
+            relative = _explicit_path_token(token, root)
+            if relative and relative not in named:
+                named.append(relative)
+        found.extend(_usable_restriction_path(one) for one in named)
+    found = list(dict.fromkeys(one for one in found if one))
+    if "." in found:
+        # The project itself was named: that is full access, not a limit.
+        return {"requested": False, "scope": [], "unresolved": []}
+    protected = _explicit_protected_paths(goal, root)
+    scope = [one for one in found if not _path_is_under(one, protected)]
+    if found and not scope:
+        unresolved.append("every path in the only-scope is also protected: " + ", ".join(found))
+    return {"requested": requested, "scope": scope, "unresolved": list(dict.fromkeys(unresolved))}
+
+
+def _explicit_write_only_scope(goal: str, root: Path | None = None) -> list[str]:
+    """Project paths the user explicitly limited all writes to (may be [])."""
+
+    return list(_explicit_write_only_request(goal, root)["scope"])
+
+
 def _goal_path_roles(goal: str) -> dict[str, Any]:
-    """Classify named files as requested effects or protected references."""
+    """Classify named files as requested effects, neutral mentions or protected.
+
+    Only explicit negation/preserve wording protects a path. A file that is
+    merely mentioned, read, reviewed, used as a reference or reported as the
+    location of a bug is never protected; agents may change it.
+    """
 
     text = str(goal or "")
     paths = _goal_named_paths(text)
-    if _informational_goal(text):
+    if _explicit_read_only_goal(text):
         protected = list(dict.fromkeys(paths))
         return {
             "mentions": [{"path": relative, "role": "protected"} for relative in protected],
             "effects": [],
             "protected": protected,
         }
+    explicit_protected = _explicit_protected_paths(text)
     roles: list[dict[str, str]] = []
     for relative in paths:
         variants = {relative, relative.replace("/", "\\")}
@@ -6506,14 +8532,25 @@ def _goal_path_roles(goal: str) -> dict[str, Any]:
                         mentions.append("effect")
                     else:
                         mentions.append("neutral")
-        role = "protected" if "protected" in mentions else (
-            "effect" if "effect" in mentions else "protected"
-        )
+        # The clause analysis above only tells effects apart from other
+        # mentions. It never protects: a reference/review/"using" mention is
+        # neutral, and a neutral mention never restricts the agents.
+        if _path_is_under(relative, explicit_protected):
+            role = "protected"
+        elif "effect" in mentions:
+            role = "effect"
+        else:
+            role = "neutral"
         roles.append({"path": relative, "role": role})
+    named = {one["path"].casefold() for one in roles}
+    for relative in explicit_protected:
+        if relative.casefold() not in named:
+            roles.append({"path": relative, "role": "protected"})
     return {
         "mentions": roles,
         "effects": [one["path"] for one in roles if one["role"] == "effect"],
         "protected": [one["path"] for one in roles if one["role"] == "protected"],
+        "neutral": [one["path"] for one in roles if one["role"] == "neutral"],
     }
 
 
@@ -6564,6 +8601,20 @@ def _goal_operations(goal: str) -> list[dict[str, Any]]:
         }
         signature = (kind, *[f"{key}={normalized[key].casefold()}" for key in sorted(normalized)])
         if not normalized or signature in occupied:
+            return
+        # Only well-formed path operands make an operation. "Rename the Save
+        # button to Submit in index.html" renames a button, not a file.
+        if kind in {"move", "rename", "copy"} and not (
+            normalized.get("source") and normalized.get("destination")
+        ):
+            return
+        if kind == "replace" and not (normalized.get("target") and normalized.get("source")):
+            return
+        if any(
+            not _normalize_goal_path(value, allow_spaces=True)
+            and not (_fragment_directory(value) and not re.search(r"\s", value))
+            for value in normalized.values()
+        ):
             return
         occupied.add(signature)
         identifier = "operation_" + hashlib.sha256(
@@ -6835,57 +8886,34 @@ def _requested_action_goal(goal: str) -> bool:
 
 
 def _pure_prohibition_goal(goal: str) -> bool:
-    """Recognize project-wide negative authority without inventing an action.
+    """Recognize an explicit project-wide prohibition ("don't change anything").
 
-    Positive contrast exceptions (``however parser.py must be repaired``)
-    remain actionable and are handled by the clause parser.
+    A bug report phrased as a prohibition ("Files must not be deleted when the
+    user cancels", "The cache should not be updated on failed requests")
+    describes wanted behaviour and is never a prohibition on the agents.
     """
 
-    text = str(goal or "").strip()
-    action = (
-        r"(?:update|fix|repair|modify|edit|change|implement|create|add|delete|"
-        r"rename|move|copy|replace|build|generate|write|refactor)\w*"
-    )
-    positive_exception = re.search(
-        rf"\b(?:however|nevertheless|nonetheless|yet|still)\b[^.;!?]*"
-        rf"(?:{action}|\b(?:repairs?|fix(?:es)?|updates?|changes?)\b[^.;!?]*"
-        r"\b(?:required|essential|necessary|needed|mandatory)\b)",
-        text, re.I,
-    )
-    if positive_exception:
-        return False
-    if re.search(
-        r"\bPROJECT_FILE\s+does\s+not\s+need\s+to\s+be\s+"
-        r"(?:updated|fixed|repaired|modified|edited|changed)\b",
-        _mask_goal_files(text), re.I,
-    ):
-        return True
-    found = False
-    for clause in [one.strip() for one in re.split(r"[;.!?]+", text) if one.strip()]:
-        has_action = bool(re.search(rf"\b{action}\b", clause, re.I))
-        if not has_action:
-            continue
-        prohibited = bool(
-            re.search(
-                rf"\b(?:must|should|may|shall|is|are)\s+not\s+"
-                rf"(?:be\s+|to\s+(?:be\s+)?)?{action}\b",
-                clause, re.I,
-            )
-            or re.search(
-                rf"\bunder\s+no\s+circumstances\b[^.;!?]*\b{action}\b",
-                clause, re.I,
-            )
-        )
-        if not prohibited:
-            return False
-        found = True
-    return found
+    return _explicit_read_only_goal(goal)
 
 
 def _informational_goal(goal: str) -> bool:
+    """Whether the run must change nothing: only on explicit user wording.
+
+    A question ("Can you make the app faster?", "Why is login broken?") is
+    never read-only by itself; see _question_goal for the non-binding hint.
+    """
+
+    return _explicit_read_only_goal(goal)
+
+
+def _question_goal(goal: str) -> bool:
+    """Hint only: the goal reads like a question or a request for advice.
+
+    It never restricts the agents. If they decide a change helps, they may
+    make it unless the user explicitly asked for a read-only run.
+    """
+
     text = str(goal or "").strip()
-    if _pure_prohibition_goal(text):
-        return True
     if _requested_action_goal(text):
         return False
     if re.match(r"^should\b.*\?\s*$", text, re.I):
@@ -7066,19 +9094,15 @@ def _parse_goal_intent(goal: str) -> dict[str, Any]:
                 prior_prohibition = False
             clause_lead = False
         previous = token
+    # Read-only needs explicit user wording. Questions, show/list/check/explain
+    # verbs, "without breaking X", "avoid X" and behaviour prohibitions are
+    # ordinary project work: the agents decide whether a change is needed.
     if _requested_action_goal(text):
         if not mutation_actions:
             mutation_actions.append("requested_outcome")
         intent = "mutation"
-    elif _informational_goal(text):
-        mutation_actions = []
-        intent = "read_only"
-        if not read_only_actions:
-            read_only_actions.append("explain")
     elif mutation_actions:
         intent = "mutation"
-    elif read_only_actions or constraints or _GLOBAL_READ_ONLY.search(text):
-        intent = "read_only"
     else:
         intent = "project_work"
     return {
@@ -7097,10 +9121,16 @@ def _goal_effect_evidence(
     changed: list[str],
     required_effect_paths: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Mechanically reject provider consensus that produced no requested effect."""
+    """Report which named/planned files changed; never veto the agents.
+
+    The agents decide what the goal needs. "No change was needed" with an
+    explanation is a valid completion, and a planned or named file that was
+    left alone is reported, not failed. The only hard rule left is the user's
+    own: an explicitly read-only run must not change the project.
+    """
 
     intent = _goal_intent(goal)
-    effect_required = intent != "read_only"
+    effect_required = False
     normalized_changed = {path.replace("\\", "/").casefold() for path in changed}
     path_roles = _goal_path_roles(goal)
     if intent == "read_only" and changed:
@@ -7121,10 +9151,10 @@ def _goal_effect_evidence(
         relative = str(raw or "").replace("\\", "/").strip().strip("/")
         if not relative:
             continue
+        # A plan is a hint. Overlap with a protected path is reported by the
+        # write gate if an agent actually tries it; it never raises here.
         if any(_paths_overlap(relative, protected) for protected in path_roles["protected"]):
-            raise HarnessError(
-                f"Planned effect path {relative} conflicts with protected/read-only goal path"
-            )
+            continue
         try:
             confined_path(root, relative)
         except HarnessError:
@@ -7132,41 +9162,41 @@ def _goal_effect_evidence(
         if relative not in named:
             named.append(relative)
     evidence: list[dict[str, Any]] = []
-    unmet: list[str] = []
+    not_changed: list[str] = []
     for relative in named:
         try:
             path = confined_path(root, relative, allow_missing=True)
         except HarnessError:
-            unmet.append(relative)
             continue
         digest = file_sha256(path)
         changed_here = relative.casefold() in normalized_changed
         evidence.append({
-            "requirement": f"project-work effect {relative}",
+            "requirement": f"project-work effect hint {relative}",
             "path": relative,
             "sha256": digest,
             "changed_in_session": changed_here,
         })
-        if effect_required and not changed_here:
-            unmet.append(relative)
-        elif not effect_required and digest is None:
-            unmet.append(relative)
-    if effect_required and not changed:
-        return {
-            "passed": False, "effect_required": True, "intent": intent, "evidence": evidence,
-            "reason": (
-                "Project-work completion requires relevant changed state unless the user explicitly marks the goal read-only; "
-                "this session produced no project-file effect."
-            ),
-        }
-    if unmet:
-        return {
-            "passed": False, "effect_required": effect_required, "intent": intent, "evidence": evidence,
-            "reason": "Required project effects were not produced in this session: " + ", ".join(unmet),
-        }
+        if not changed_here:
+            not_changed.append(relative)
+    if intent == "read_only":
+        reason = "The explicitly read-only goal required no project mutation."
+    elif not changed:
+        reason = (
+            "No project file changed. The agents may conclude that no change was needed; "
+            "that is a valid outcome."
+        )
+    elif not_changed:
+        reason = (
+            "Project files changed. Named or planned files left unchanged (hints only): "
+            + ", ".join(not_changed)
+        )
+    else:
+        reason = "Project files changed."
     return {
         "passed": True, "effect_required": effect_required, "intent": intent, "evidence": evidence,
-        "reason": "Required project effect evidence is present." if effect_required else "The explicitly read-only goal required no project mutation.",
+        "unchanged_hints": not_changed,
+        "no_change": not changed,
+        "reason": reason,
     }
 
 
@@ -7202,32 +9232,81 @@ def _project_tree_merkle(root: Path) -> tuple[str, dict[str, str]]:
     return digest, manifest
 
 
-def _compile_goal_spec(root: Path, goal: str) -> dict[str, Any]:
-    """Compile immutable semantic authority before provider planning begins."""
+def _GLOBAL_CHARACTERS_IN(relative: str) -> bool:
+    return bool(_GLOB_CHARACTERS & set(str(relative or "")))
 
-    _validate_goal_path_syntax(goal)
+
+def _compile_goal_spec(root: Path, goal: str) -> dict[str, Any]:
+    """Compile the goal's explicit user restrictions and non-binding hints.
+
+    Restrictions come only from explicit user wording: an explicitly
+    read-only run, explicitly protected paths ("don't touch X") and an
+    explicit "only change X" scope. Named files and derived file operations
+    are hints for the agents: they add to what may be written and never
+    restrict it, and they are never mandatory requirements. Nothing here
+    raises for a contradiction: an explicit protection simply wins.
+    """
+
+    ignored_path_tokens = _unsafe_goal_path_tokens(goal)
     intent = _goal_intent(goal)
     roles = _goal_path_roles(goal)
+    # Explicit user protections, including absolute paths inside the project,
+    # bare folder names ("do not touch config"), header lists and per-file
+    # labels, resolved against the selected project.
+    explicit_protected = list(dict.fromkeys([
+        *roles["protected"], *_explicit_protected_paths(goal, root),
+    ]))
+    if "." in explicit_protected:
+        # "Do not touch <the project folder>" protects the whole project.
+        intent = "read_only"
+    explicit_protected = [one for one in explicit_protected if one != "."]
+    if explicit_protected != list(roles["protected"]):
+        roles = {
+            "mentions": [
+                *[one for one in roles["mentions"] if not _path_is_under(one["path"], explicit_protected)],
+                *[{"path": one, "role": "protected"} for one in explicit_protected],
+            ],
+            "effects": [one for one in roles["effects"] if not _path_is_under(one, explicit_protected)],
+            "protected": explicit_protected,
+        }
     make_sure = re.search(
         r"\bmake\s+sure\s+(.+?)\s+(?:is|gets?)\s+(?:updated|fixed|repaired|"
         r"modified|edited|changed|created|deleted|renamed|moved|copied|replaced)\b",
         goal, re.I,
     )
     if make_sure and _requested_action_goal(goal):
-        requested_paths = _goal_named_paths(make_sure.group(1))
+        requested_paths = [
+            one for one in _goal_named_paths(make_sure.group(1))
+            if not _path_is_under(one, explicit_protected)
+        ]
         if requested_paths:
             roles = {
-                "mentions": [{"path": one, "role": "effect"} for one in requested_paths],
-                "effects": requested_paths, "protected": [],
+                "mentions": [
+                    *[{"path": one, "role": "effect"} for one in requested_paths],
+                    *[{"path": one, "role": "protected"} for one in explicit_protected],
+                ],
+                "effects": requested_paths, "protected": explicit_protected,
             }
-    operations = _goal_operations(goal)
+    operations = [
+        operation for operation in _goal_operations(goal)
+        # Only an explicitly protected path is preserved; a "keep"/"use"
+        # clause without explicit protection wording is a hint at most.
+        if operation.get("kind") != "preserve"
+        or _path_is_under(str(operation.get("target") or ""), explicit_protected)
+    ]
     if _requested_action_goal(goal) and not roles["effects"] and not operations:
-        requested_paths = _goal_named_paths(goal)
+        requested_paths = [
+            one for one in _goal_named_paths(goal)
+            if not _path_is_under(one, explicit_protected)
+        ]
         if requested_paths:
             roles = {
-                "mentions": [{"path": one, "role": "effect"} for one in requested_paths],
+                "mentions": [
+                    *[{"path": one, "role": "effect"} for one in requested_paths],
+                    *[{"path": one, "role": "protected"} for one in explicit_protected],
+                ],
                 "effects": requested_paths,
-                "protected": [],
+                "protected": explicit_protected,
             }
     claimed = {
         str(operation.get(field) or "").casefold()
@@ -7264,19 +9343,27 @@ def _compile_goal_spec(root: Path, goal: str) -> dict[str, Any]:
             ).hexdigest()[:12]
             operations.append({"id": identifier, "kind": "preserve", "target": relative})
             claimed.add(relative.casefold())
+    confined_operations: list[dict[str, Any]] = []
     for operation in operations:
         baseline: dict[str, str | None] = {}
         baseline_text: dict[str, str | None] = {}
-        for field in ("target", "source", "destination"):
-            relative = str(operation.get(field) or "")
-            if relative:
-                baseline_path = confined_path(root, relative)
-                baseline[field] = file_sha256(baseline_path)
-                baseline_text[field] = _normalized_text_sha256(baseline_path)
+        try:
+            for field in ("target", "source", "destination"):
+                relative = str(operation.get(field) or "")
+                if relative:
+                    baseline_path = confined_path(root, relative)
+                    baseline[field] = file_sha256(baseline_path)
+                    baseline_text[field] = _normalized_text_sha256(baseline_path)
+        except (HarnessError, OSError, ValueError):
+            # A derived operand that is not a usable project path (a glob, a
+            # name Windows cannot open) is dropped: derived operations are
+            # hints and never stop a run.
+            continue
         operation["baseline_sha256"] = baseline
         operation["baseline_text_sha256"] = baseline_text
+        confined_operations.append(operation)
+    operations = confined_operations
     operation_effects: list[str] = []
-    operation_protected: list[str] = []
     for operation in operations:
         kind = str(operation.get("kind") or "")
         if kind in {"modify", "create", "delete", "replace"}:
@@ -7287,116 +9374,89 @@ def _compile_goal_spec(root: Path, goal: str) -> dict[str, Any]:
             ])
         if kind == "copy":
             operation_effects.append(str(operation.get("destination") or ""))
-            operation_protected.append(str(operation.get("source") or ""))
-        if kind == "replace":
-            operation_protected.append(str(operation.get("source") or ""))
-        if kind == "preserve":
-            operation_protected.append(str(operation.get("target") or ""))
-    operation_effects = [one for one in dict.fromkeys(operation_effects) if one]
-    operation_protected = [one for one in dict.fromkeys(operation_protected) if one]
-    def explicitly_protected(relative: str) -> bool:
-        variants = [re.escape(relative), re.escape(relative.replace("/", "\\"))]
-        path_pattern = "(?:" + "|".join(variants) + ")"
-        if re.search(
-            rf"(?:do\s+not|don't|never|must\s+not|should\s+not|may\s+not)"
-            rf"[^,.;!?]{{0,48}}{path_pattern}", goal, re.I,
-        ) or re.search(
-            rf"(?:preserve|keep|leave)\s+(?:the\s+)?(?:file\s+)?"
-            rf"[\"'`(]*{path_pattern}", goal, re.I,
-        ):
-            return True
-        # A suffix such as "parser.py must not be changed" protects that
-        # operand.  Stop at coordination/punctuation and, crucially, at a
-        # second path mention so "update app.py, preserve README.md unchanged"
-        # cannot project README's polarity backwards onto app.py.
-        for match in re.finditer(path_pattern, goal, re.I):
-            tail = goal[match.end():match.end() + 96]
-            tail = re.split(r"[,;.!?]", tail, maxsplit=1)[0]
-            status = re.search(
-                r"(?:unchanged|untouched|read[- ]only|must\s+not|should\s+not|"
-                r"may\s+not|is\s+not\s+to)", tail, re.I,
-            )
-            if status is None:
-                continue
-            before_status = tail[:status.start()]
-            if not _goal_named_paths(before_status):
-                return True
-        return False
-
-    explicit_conflict = [
-        effect for effect in operation_effects
-        if explicitly_protected(effect)
-        and not any(
-            str(operation.get("kind") or "") in {"copy", "replace"}
-            and str(operation.get("source") or "").casefold() == effect.casefold()
-            for operation in operations
-        )
+    # Copy/replace sources and references are not protected: only explicit
+    # user wording protects a path, and an explicit protection always wins
+    # over a derived effect instead of stopping the run.
+    effects = [
+        one for one in dict.fromkeys([*operation_effects, *roles["effects"]])
+        if one and not _path_is_under(one, explicit_protected)
     ]
-    if explicit_conflict:
-        raise HarnessError(
-            "The goal requires a transfer/change while also prohibiting that same path: "
-            + ", ".join(dict.fromkeys(explicit_conflict))
-            + ". Clarify which instruction should control."
-        )
-    if operations:
-        operands = [*operation_effects, *operation_protected]
-        def independent_mention(candidate: str) -> bool:
-            folded = candidate.casefold()
-            related = [one for one in operands if one.casefold() in folded or folded in one.casefold()]
-            return not related
-        effects = list(dict.fromkeys([*operation_effects, *[
-            one for one in roles["effects"]
-            if one not in operation_protected and independent_mention(one)
-        ]]))
-        protected = list(dict.fromkeys([*operation_protected, *[
-            one for one in roles["protected"]
-            if one not in operation_effects and independent_mention(one)
-        ]]))
-        roles = {
-            "mentions": [
-                *[{"path": one, "role": "effect"} for one in effects],
-                *[{"path": one, "role": "protected"} for one in protected],
-            ],
-            "effects": effects,
-            "protected": protected,
-        }
-        if effects and not _informational_goal(goal):
-            intent = "mutation"
-    conflict = [
-        effect for effect in roles["effects"]
-        if any(_paths_overlap(effect, protected) for protected in roles["protected"])
+    usable_effects: list[str] = []
+    for relative in effects:
+        if _GLOBAL_CHARACTERS_IN(relative):
+            continue
+        try:
+            confined_path(root, relative)
+        except (HarnessError, OSError, ValueError):
+            continue
+        usable_effects.append(relative)
+    effects = usable_effects
+    protected = list(explicit_protected)
+    if effects and intent != "read_only":
+        intent = "mutation"
+    neutral = [
+        one["path"] for one in roles["mentions"]
+        if one.get("role") == "neutral"
+        and one["path"] not in effects and one["path"] not in protected
     ]
-    if conflict:
-        raise HarnessError(
-            "The goal gives the same project path incompatible write and preserve/reference roles: "
-            + ", ".join(conflict)
-        )
-    for relative in [*roles["effects"], *roles["protected"]]:
-        confined_path(root, relative)
+    roles = {
+        "mentions": [
+            *[{"path": one, "role": "effect"} for one in effects],
+            *[{"path": one, "role": "neutral"} for one in neutral],
+            *[{"path": one, "role": "protected"} for one in protected],
+        ],
+        "effects": effects,
+        "protected": protected,
+    }
+    only_request = (
+        {"requested": False, "scope": [], "unresolved": []}
+        if intent == "read_only" else _explicit_write_only_request(goal, root)
+    )
+    only_scope = list(only_request["scope"])
     core = {
         "schema_version": 1,
         "speech_act": "information_query" if intent == "read_only" else (
             "request_action" if _requested_action_goal(goal) else
+            # A question is a hint only: agents may still change files.
+            "question" if _question_goal(goal) else
             "desired_outcome" if intent == "mutation" else "project_work"
         ),
         "intent": intent,
         "operands": [
             {
                 "path": one["path"],
-                "role": "PRESERVE_EXACT" if one["role"] == "protected" else "WRITE_MODIFY",
+                "role": (
+                    "PRESERVE_EXACT" if one["role"] == "protected" else
+                    "WRITE_MODIFY" if one["role"] == "effect" else "MENTION"
+                ),
             }
             for one in roles["mentions"]
         ],
+        # Derived operations are hints for the agents, never requirements.
         "operations": operations,
         "write_policy": {
-            "mode": "DENY_ALL" if intent == "read_only" else "SCOPED",
+            # OPEN: agents may change any project file (outside .git/.harness
+            # and explicitly protected paths). SCOPED only when the user
+            # explicitly said "only ..."; DENY_ALL only on explicit read-only.
+            "mode": (
+                "DENY_ALL" if intent == "read_only" else
+                "SCOPED" if only_scope or only_request["requested"] else "OPEN"
+            ),
             "grants": [] if intent == "read_only" else list(roles["effects"]),
             "protected": list(roles["protected"]),
+            "only_scope": list(only_scope),
+            # The user explicitly said "only ..." but it named nothing
+            # writable: stay restricted and ask instead of widening to OPEN.
+            "only_requested": bool(only_request["requested"]),
+            "only_unresolved": list(only_request["unresolved"]),
             "exact_capabilities": {
                 path: sorted(capabilities)
                 for path, capabilities in _operation_write_grants(operations).items()
             } if intent != "read_only" else {},
         },
+        # Path-shaped tokens with "..", "//" or a stream colon never refuse the
+        # goal and never grant a write; the agents are told they were ignored.
+        "ignored_path_tokens": ignored_path_tokens,
     }
     digest_core = copy.deepcopy(core)
     for operation in digest_core.get("operations", []):
@@ -7867,15 +9927,15 @@ def _acceptance_target_decision(
             decision, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
         ).encode("utf-8")).hexdigest()
         return decision
-    labels = ", ".join(
-        f"{one['qualname']} ({one['candidate_id']})" for one in candidates
-    ) or "no safely identifiable callable"
+    # Several candidates: behaviour evidence is optional (a bonus the engine
+    # may gather), so Nexus never pauses the agents to ask the user which
+    # callable to probe. The agents simply work without a frozen target.
     return {
-        "status": "needs_clarification",
+        "status": "ambiguous",
         "candidates": candidates,
-        "question": (
-            "Which exact production callable or route should Nexus use for the acceptance probe? "
-            f"Baseline candidates: {labels}. Reply with the callable name or candidate ID."
+        "note": (
+            "Several baseline callables could be the acceptance target; Nexus does not pause "
+            "for this. Optional behaviour evidence is gathered only when a target is clear."
         ),
         "baseline_merkle": _project_tree_merkle(root)[0],
     }
@@ -7888,19 +9948,30 @@ def _derive_requirement_contract(
     *,
     ratified_by: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Build an engine-owned, durable whole-goal acceptance contract.
+    """Build the durable whole-goal contract: explicit rules plus hints.
 
-    Requirements are semantic artifact/behavior classes plus exact plan/path
-    effects.  Provider consensus may expand this contract through effect_paths;
-    it cannot remove requirements explicitly present in the user's goal.
+    Only what the user explicitly asked for is mandatory: tests when the user
+    explicitly asked for tests to be written or run, and explicitly protected
+    paths. Everything Nexus infers from goal wording (artifact kinds, named
+    files, file operations, behaviour clauses, destinations) is recorded with
+    ``mandatory: False``: it is reported to the agents and the user but never
+    blocks completion. Agents' planned effect paths are hints only
+    (``planned_effect_paths``); they never become requirements and never raise.
     """
 
     requirements: dict[str, dict[str, Any]] = {}
+    planned_effect_paths: list[str] = []
     goal_spec = _compile_goal_spec(root, goal)
     intent = str(goal_spec.get("intent") or _goal_intent(goal))
     path_roles = {
         "mentions": [
-            {"path": one["path"], "role": "protected" if one["role"] == "PRESERVE_EXACT" else "effect"}
+            {
+                "path": one["path"],
+                "role": (
+                    "protected" if one["role"] == "PRESERVE_EXACT" else
+                    "effect" if one["role"] == "WRITE_MODIFY" else "neutral"
+                ),
+            }
             for one in goal_spec.get("operands", []) if isinstance(one, dict)
         ],
         "effects": list(goal_spec.get("write_policy", {}).get("grants", [])),
@@ -7914,13 +9985,18 @@ def _derive_requirement_contract(
             "kind": kind,
             "effect_roots": [],
             "effect_paths": [],
+            # Inferred from wording: a hint, never a completion veto.
+            "mandatory": False,
         })
 
     if intent != "read_only":
         folded = goal.casefold()
         if _is_test_goal(goal):
+            # The user explicitly asked for tests to be written or run.
             item = require("tests", "Runnable requested tests execute successfully", "tests")
             item["requested_levels"] = _requested_test_levels(goal)
+            item["mandatory"] = True
+            item["test_request"] = "write" if _test_write_requested(goal) else "run"
         if re.search(r"trace?ability|tracibility", folded) and re.search(r"workbook|dashboard|html", folded):
             require("traceability", "A traceability workbook/dashboard is created", "traceability")
         if "langgraph" in folded:
@@ -7986,20 +10062,18 @@ def _derive_requirement_contract(
 
         for raw in required_effect_paths or []:
             relative = str(raw or "").replace("\\", "/").strip().strip("/")
-            if not relative:
+            if not relative or relative in planned_effect_paths:
                 continue
+            # An agent's plan is a hint. A planned file the agent later
+            # leaves alone is fine, and a plan touching a protected path is
+            # only refused if an agent actually tries to write it.
             if any(_paths_overlap(relative, protected) for protected in path_roles["protected"]):
-                raise HarnessError(
-                    f"Planned effect path {relative} conflicts with protected/read-only goal path"
-                )
+                continue
             try:
                 confined_path(root, relative)
             except HarnessError:
                 continue
-            identifier = "path_" + hashlib.sha256(relative.encode("utf-8")).hexdigest()[:12]
-            item = require(identifier, f"Planned project effect {relative} is produced", "exact_path")
-            if relative not in item["effect_paths"]:
-                item["effect_paths"].append(relative)
+            planned_effect_paths.append(relative)
 
         for relative in dict.fromkeys(
             match.replace("\\", "/").strip("/") for match in path_roles["effects"]
@@ -8017,11 +10091,11 @@ def _derive_requirement_contract(
                     relative = matching_roots[0].rstrip("/") + "/" + relative
             item = require(
                 "path_" + hashlib.sha256(relative.encode("utf-8")).hexdigest()[:12],
-                f"Explicitly requested file {relative} is changed", "exact_path",
+                f"The goal names {relative} (hint: it may need a change)", "exact_path",
             )
             item["effect_paths"].append(relative)
         if not requirements:
-            require("project_effect", "The requested project state materially changes", "project_effect")
+            require("project_effect", "The requested project state may change (hint)", "project_effect")
 
     canonical = list(requirements.values())
     return {
@@ -8029,6 +10103,7 @@ def _derive_requirement_contract(
         "goal_sha256": hashlib.sha256(goal.encode("utf-8")).hexdigest(),
         "intent": intent,
         "requirements": canonical,
+        "planned_effect_paths": planned_effect_paths,
         "path_mentions": path_roles["mentions"],
         "protected_paths": path_roles["protected"],
         "goal_spec_digest": goal_spec.get("spec_digest"),
@@ -8036,6 +10111,17 @@ def _derive_requirement_contract(
         "ratified_by": list(dict.fromkeys(ratified_by or [])),
         "status": "ratified" if ratified_by else "derived",
     }
+
+
+def _requirement_mandatory(requirement: dict[str, Any]) -> bool:
+    """Whether a contract requirement may block completion.
+
+    Only requirements the user explicitly asked for are mandatory (today: an
+    explicit request for tests). Anything inferred from wording is a hint.
+    Contracts saved before this rule have no flag and are treated as hints.
+    """
+
+    return requirement.get("mandatory") is True
 
 
 def _requirement_artifact_evidence(
@@ -8087,6 +10173,10 @@ def _requirement_artifact_evidence(
                 for level in levels
             )
             candidates = scoped_files
+            if requirement.get("test_request") == "run":
+                # "Make sure the tests pass" asks for the existing tests to
+                # run, not for new test files: execution evidence decides.
+                artifact_ok = True
             if artifact_ok:
                 pending_execution.append(identifier)
         elif kind == "traceability":
@@ -8276,9 +10366,20 @@ def _requirement_artifact_evidence(
                 unmet.append(str(item["id"]))
         else:
             item["assigned_changed_path"] = assigned_by_id[str(item["id"])]
+    mandatory_ids = {
+        str(one.get("id") or "unknown") for one in contract.get("requirements", [])
+        if isinstance(one, dict) and _requirement_mandatory(one)
+    }
+    for item in evidence:
+        item["mandatory"] = str(item["id"]) in mandatory_ids
+    # Inferred requirements are hints: an unmet hint is reported to the agents
+    # and the user but never blocks completion.
+    advisory_unmet = [one for one in unmet if one not in mandatory_ids]
+    unmet = [one for one in unmet if one in mandatory_ids]
     return {
         "passed": not unmet and not protected_violations,
         "unmet": unmet,
+        "advisory_unmet": advisory_unmet,
         "protected_violations": protected_violations,
         "pending_execution": pending_execution,
         "evidence": evidence,
@@ -8718,7 +10819,7 @@ def _executed_requirement_evidence(
     }
     requested_levels = next((
         list(one.get("requested_levels", [])) for one in contract.get("requirements", [])
-        if isinstance(one, dict) and one.get("id") == "tests"
+        if isinstance(one, dict) and one.get("id") == "tests" and _requirement_mandatory(one)
     ), [])
     proven_levels = {level for index, level in command_levels.items() if index in positive_indexes}
     contracts = evidence_contracts if isinstance(evidence_contracts, list) else project.get("test_evidence_contracts", [])
@@ -8945,16 +11046,22 @@ def _executed_requirement_evidence(
                     continue
                 proven_behaviors.add(str(requirement_id))
     unmet: list[str] = []
+    advisory_unmet: list[str] = []
     if requested_levels and any(level not in proven_levels for level in requested_levels):
         unmet.append("tests:" + ",".join(level for level in requested_levels if level not in proven_levels))
     for requirement in contract.get("requirements", []):
         if isinstance(requirement, dict) and requirement.get("kind") in {"behavior", "behavior_preservation"}:
             requirement_id = str(requirement.get("id") or "behavior")
             if requirement_id not in proven_behaviors:
-                unmet.append(requirement_id)
+                # Causal behaviour receipts are a bonus the engine reports
+                # when it can gather them; they are never required.
+                (unmet if _requirement_mandatory(requirement) else advisory_unmet).append(
+                    requirement_id
+                )
     return {
         "passed": not unmet,
         "unmet": unmet,
+        "advisory_unmet": advisory_unmet,
         "proven_test_levels": sorted(proven_levels),
         "positive_command_indexes": sorted(positive_indexes),
         "behavior_proof": bool(proven_behaviors),
@@ -9060,12 +11167,15 @@ def _run_selected_project_verification(
                 + ", ".join(hard_artifact_unmet)
             ),
         }
+    # Test evidence is required only when the user explicitly asked for tests
+    # to be written or run; new test files only when they asked to write them.
     test_goal = _is_test_goal(goal)
+    tests_written_on_request = test_goal and _test_write_requested(goal)
     static = _runnable_tests_in_changed_files(root, changed)
     preflight = _test_preflight(root, changed)
-    missing_levels = _missing_requested_test_levels(goal, changed, root)
+    missing_levels = _missing_requested_test_levels(goal, changed, root) if tests_written_on_request else []
     preflight["missing_requested_test_levels"] = missing_levels
-    if test_goal and missing_levels:
+    if tests_written_on_request and missing_levels:
         return {
             "status": "failed", "basis": "test_requirement_coverage", "commands": [],
             "runnable_tests": static, "preflight": preflight,
@@ -9089,11 +11199,14 @@ def _run_selected_project_verification(
             "runnable_tests": static, "preflight": preflight,
             "reason": preflight["false_green"],
         }
-    if test_goal and effect["effect_required"] and static["runnable"] == 0:
+    if tests_written_on_request and changed and static["runnable"] == 0:
         return {
             "status": "failed", "basis": "static_runnable_test_gate",
             "commands": [], "runnable_tests": static, "preflight": preflight,
-            "reason": "The run changed test files but created zero runnable, non-skipped test cases.",
+            "reason": (
+                "The user explicitly asked for tests, but the files changed in this run contain "
+                "zero runnable, non-skipped test cases."
+            ),
         }
     if not commands:
         return {
@@ -9285,7 +11398,9 @@ def _run_selected_project_verification(
                 "reason": "The selected test runner executable is missing or could not be started: "
                 + str(payload.get("stderr")),
             }
-        if re.search(
+        # A successful command may still print "No module named x, using
+        # fallback"; only a failing command is a missing test dependency.
+        if payload.get("exit_code") != 0 and re.search(
             r"(?:no module named|module not found|cannot find module|command not found|is not recognized)",
             combined, re.IGNORECASE,
         ):
@@ -9330,12 +11445,20 @@ def _run_selected_project_verification(
         int(one["index"]) for one in positive.get("verification_evidence", [])
         if isinstance(one, dict) and isinstance(one.get("index"), int)
     }
-    causal_receipts = _build_causal_behavior_receipts(
-        command_config, root, goal, requirement_contract, changed,
-        list(transaction_ids or []), base_commands[0] if base_commands else None,
-        behavior_command_indexes, commands, results, positive_indexes,
-        behavior_witnesses, verification_session_id or uuid.uuid4().hex,
-    )
+    # Causal behaviour receipts are a bonus: a failure while gathering them
+    # (for example a locked temporary runtime on Windows) means no receipt,
+    # never a failed or crashed verification.
+    causal_receipt_error = ""
+    try:
+        causal_receipts = _build_causal_behavior_receipts(
+            command_config, root, goal, requirement_contract, changed,
+            list(transaction_ids or []), base_commands[0] if base_commands else None,
+            behavior_command_indexes, commands, results, positive_indexes,
+            behavior_witnesses, verification_session_id or uuid.uuid4().hex,
+        )
+    except (HarnessError, OSError) as exc:
+        causal_receipts = []
+        causal_receipt_error = f"Optional behaviour evidence was not gathered: {exc}"[:1000]
     executed_requirements = _executed_requirement_evidence(
         requirement_contract, commands, results, positive, project, command_levels,
         changed,
@@ -9371,6 +11494,7 @@ def _run_selected_project_verification(
             "execution": executed_requirements,
         },
         "reason": "All deterministic selected-project test commands passed with goal-effect evidence.",
+        **({"causal_receipt_error": causal_receipt_error} if causal_receipt_error else {}),
     }
 
 
@@ -9425,72 +11549,18 @@ def _project_state_digest(root: Path, changed: list[str]) -> str:
 def _delta_path_matches_requirement(
     root: Path, contract: dict[str, Any], relative: str,
 ) -> bool:
-    """Whether one real file delta advances an explicit goal requirement."""
+    """Whether one real file delta counts as progress: any project edit does.
 
-    folded = relative.replace("\\", "/").casefold()
-    all_requirements = [
-        one for one in contract.get("requirements", []) if isinstance(one, dict)
-    ]
-    has_specific = any(
-        str(one.get("kind") or "project_effect") != "project_effect"
-        for one in all_requirements
-    )
-    for requirement in all_requirements:
-        kind = str(requirement.get("kind") or "project_effect")
-        if kind in {"behavior", "behavior_preservation"}:
-            # Behavior is proved by deterministic execution, never inferred
-            # from file churn alone.
-            continue
-        roots = [str(one) for one in requirement.get("effect_roots", []) if isinstance(one, str)]
-        paths = [str(one) for one in requirement.get("effect_paths", []) if isinstance(one, str)]
-        scoped = (
-            (not roots or _path_is_under(relative, roots))
-            and (not paths or any(
-                folded == path.replace("\\", "/").casefold()
-                or folded.startswith(path.replace("\\", "/").casefold().rstrip("/") + "/")
-                for path in paths
-            ))
-        )
-        if (roots or paths) and scoped:
-            return True
-        if roots or paths:
-            continue
-        if kind == "project_effect":
-            if not has_specific:
-                return True
-            continue
-        if kind == "tests":
-            static = _runnable_tests_in_changed_files(root, [relative])
-            if int(static.get("runnable", 0)) > 0:
-                return True
-        elif kind == "traceability" and re.search(
-            r"trace?ability|tracibility|(?:^|[/_. -])trace(?:[/_. -]|$)|workbook|dashboard",
-            folded, re.I,
-        ):
-            return True
-        elif kind == "langgraph" and "langgraph" in folded:
-            return True
-        elif kind == "upload_bundle" and re.search(
-            r"(?:^|[/_. -])(?:upload|bundle)(?:[/_. -]|$)", folded, re.I,
-        ):
-            return True
-        elif kind == "commit_message" and folded.endswith(".md") and re.search(
-            r"(?:^|[/_. -])(?:commit|message)(?:[/_. -]|$)", folded, re.I,
-        ):
-            return True
-        elif kind == "durable_memory" and folded.endswith(".md") and re.search(
-            r"(?:^|[/_. -])(?:obsidian|vault|memory)(?:[/_. -]|$)", folded, re.I,
-        ):
-            return True
-        elif kind == "generic_artifact":
-            if requirement.get("generic_file"):
-                return True
-            if all(
-                re.search(rf"(?:^|[/_. -]){re.escape(str(term).casefold())}(?:[/_. -]|$)", folded, re.I)
-                for term in requirement.get("artifact_terms", [])
-            ):
-                return True
-    return False
+    Behaviour goals and goals whose wording Nexus cannot map to a path must
+    never be starved of tool-budget renewal, so every applied edit of a
+    selected-project file counts. Only Nexus/Git control paths do not.
+    """
+
+    folded = relative.replace("\\", "/").strip("/").casefold()
+    first = folded.split("/", 1)[0]
+    if not folded or first in {".git", ".harness"} or ".." in folded.split("/"):
+        return False
+    return True
 
 
 def _verified_net_semantic_deltas(
@@ -9873,6 +11943,23 @@ class _ProjectContextTools:
             WorkspaceIndexer(self.config, self.memory).scan(deadline)
             self.indexed = True
 
+    def count_unrunnable_call(self, node: str, reason: str) -> None:
+        """Spend one session call on a call Nexus cannot run (malformed/over cap).
+
+        Named unknown tools already spend a call inside the session; these
+        must too, or a stream of them never reaches the call limit.
+        """
+
+        if self.session.calls >= self.session.max_calls:
+            raise AgentToolCallLimitReached(
+                f"Agent tool call limit reached: {self.session.max_calls}"
+            )
+        self.session.calls += 1
+        self.ledger.record_state("context_tool_unrunnable_call", {
+            "node": node, "reason": reason, "call_number": self.session.calls,
+        })
+        self._record_budget()
+
     def execute(
         self, node: str, call: dict[str, Any], *, execution_scope: str = "",
     ) -> dict[str, Any]:
@@ -10226,18 +12313,34 @@ def work_together(
     lead = _agent(board, agent_id)
     project = _one_project(board, lead, project_id)
     root = Path(str(project.get("path"))).resolve()
+    # Earlier runs' journals never lock the project: conflicts are recorded
+    # and reported (with the journal path and files), a dead run's applied
+    # work is kept, and only a half-applied transaction is restored.
     orphan_recovery = _MutationSaga.recover_orphans(root)
-    unresolved_orphans = [
-        one for one in orphan_recovery if one.get("status") != "rolled_back"
-    ]
-    if unresolved_orphans:
-        raise SwarmError(
-            "Nexus found an interrupted mutation saga that could not be safely compensated: "
-            + json.dumps(unresolved_orphans, sort_keys=True)
-        )
-    participants = _project_participants(
+    prior_run_notices: list[str] = []
+    for one in orphan_recovery:
+        if one.get("status") in {"rollback_conflict_acknowledged", "journal_damaged"}:
+            prior_run_notices.append(str(one.get("message") or ""))
+        elif one.get("status") == "recovered":
+            kept_files = [str(path) for path in one.get("kept_files", [])]
+            conflicts = one.get("conflicts") or []
+            if kept_files:
+                prior_run_notices.append(
+                    "An earlier run stopped unexpectedly; Nexus kept the changes it had "
+                    "already applied: " + ", ".join(kept_files) + "."
+                )
+            for conflict in conflicts:
+                prior_run_notices.append(
+                    "An earlier run stopped half-way through a change that Nexus could not "
+                    "undo because the files changed afterwards ("
+                    + (", ".join(conflict.get("files") or []) or "unknown files")
+                    + f"); the files were left as they are. Journal: {one.get('journal_path')}."
+                )
+    prior_run_notices = [one for one in prior_run_notices if one]
+    participants, left_out = _project_participants_and_left_out(
         board, lead, str(project.get("id")), peer_id
     )
+    left_out_notice = _left_out_notice(left_out)
     if len(participants) < 2:
         raise SwarmError(
             "No ready connected agent also works on this project. Connect another ready "
@@ -10334,6 +12437,19 @@ def work_together(
                 resumed_changed_paths = [
                     str(path) for path in prior_changed if isinstance(path, str)
                 ]
+        # A pause keeps the applied work and records it in its checkpoint, so
+        # the resumed run knows what is already done instead of redoing it.
+        paused_state = prior_state if isinstance(prior_state, dict) else {}
+        for source in (
+            paused_state.get("changed"),
+            (paused_state.get("checkpoint") or {}).get("changed")
+            if isinstance(paused_state.get("checkpoint"), dict) else None,
+        ):
+            if isinstance(source, list):
+                resumed_changed_paths.extend(
+                    str(path) for path in source
+                    if isinstance(path, str) and path not in resumed_changed_paths
+                )
         if resumed_answers:
             ledger.append(
                 kind="user_answer", phase="user_answer", text=resumed_answers,
@@ -10371,6 +12487,26 @@ def work_together(
             )
     else:
         ledger.begin(text, participants, mode="project_work")
+    if orphan_recovery:
+        ledger.record_state("prior_mutation_journals", {
+            "stage": "pre_provider_authority",
+            "results": orphan_recovery,
+        })
+        # Only now that the notice is durably in this run's ledger is an
+        # earlier conflict marked acknowledged; an earlier stop reports it
+        # again next time.
+        _MutationSaga.acknowledge_conflicts(orphan_recovery)
+        for notice in prior_run_notices:
+            _report(progress, "Earlier run recovered", notice)
+    if left_out_notice:
+        ledger.record_state("participants_capped", {
+            "limit": MOST_PARTICIPANTS,
+            "left_out": [
+                {"id": str(one.get("id") or ""), "name": str(one.get("name") or "")}
+                for one in left_out
+            ],
+        })
+        _report(progress, "Some agents were not included", left_out_notice)
     # The semantic authority contract is compiled before attachments are
     # prepared or any provider is contacted.  Provider plans may narrow or
     # instantiate this policy, but can never turn an information request into
@@ -10384,11 +12520,26 @@ def work_together(
         if resumed_answers and acceptance_target.get("status") == "ratified"
         else text
     )
-    compiled_exact_grants = {
-        str(path).casefold(): {str(one).upper() for one in capabilities}
-        for path, capabilities in goal_spec.get("write_policy", {}).get("exact_capabilities", {}).items()
-        if isinstance(capabilities, list)
-    }
+    # Files the goal names are hints: they add to what agents may write and
+    # never restrict writes. Only explicit user wording restricts (read-only,
+    # "don't touch X", "only change X") or a restriction set in the UI.
+    named_path_hints = [
+        str(path) for path in goal_spec.get("write_policy", {}).get("grants", [])
+        if isinstance(path, str) and path
+    ]
+    goal_only_requested = goal_spec.get("write_policy", {}).get("only_requested") is True
+    goal_only_unresolved = [
+        str(one) for one in goal_spec.get("write_policy", {}).get("only_unresolved", [])
+        if isinstance(one, str)
+    ]
+    goal_only_scope = [
+        str(path) for path in goal_spec.get("write_policy", {}).get("only_scope", [])
+        if isinstance(path, str) and path
+    ]
+    goal_protected_paths = [
+        str(path) for path in goal_spec.get("write_policy", {}).get("protected", [])
+        if isinstance(path, str) and path
+    ]
     read_only_run = goal_spec["write_policy"]["mode"] == "DENY_ALL"
     read_only_baseline_merkle = ""
     read_only_baseline_manifest: dict[str, str] = {}
@@ -10440,54 +12591,93 @@ def work_together(
     else:
         explicit_write_roots = requested_write_roots
         write_scope_restricted = scope_was_supplied
+    outside_project_mentions: list[str] = []
     if not write_scope_restricted and not resume_session_id:
         derived_authority = _path_authority_from_goal(root, text)
-        invalid_derived = derived_authority.get("invalid_writable", [])
-        if invalid_derived:
-            raise SwarmError(
-                "The goal names a write destination outside the selected project; Nexus did not broaden access: "
-                + ", ".join(repr(one) for one in invalid_derived)
-            )
-        explicit_write_roots = list(derived_authority["writable"])
-        write_scope_restricted = bool(explicit_write_roots)
-    if compiled_exact_grants:
-        write_scope_restricted = True
+        # A destination outside the selected project can never be written
+        # (confinement), but naming one does not stop the run: the agents are
+        # told and decide what to do. Mentioned sub-folders never restrict.
+        outside_project_mentions = list(derived_authority.get("invalid_writable", []))
+        if outside_project_mentions:
+            ledger.record_state("goal_outside_project_destination", {
+                "stage": "pre_provider_authority",
+                "paths": outside_project_mentions,
+                "status": "not_writable_outside_selected_project",
+            })
+        if goal_only_scope or goal_only_requested:
+            # The user explicitly said "only ...". A scope that named nothing
+            # writable stays restricted (and empty) so the user is asked.
+            explicit_write_roots = list(goal_only_scope)
+            write_scope_restricted = True
     if read_only_run:
-        # Read-only is a project-wide capability, not merely protection for
-        # the filenames mentioned in the question.  Even an explicitly
-        # supplied UI destination cannot broaden it.
+        # Explicit read-only is a project-wide capability, not merely
+        # protection for the filenames mentioned in the question. Even an
+        # explicitly supplied UI destination cannot broaden it.
         explicit_write_roots = []
         write_scope_restricted = True
     if (
         write_scope_restricted and not explicit_write_roots
-        and _goal_intent(text) != "read_only"
-        and (scope_was_supplied or not compiled_exact_grants)
+        and not read_only_run
     ):
+        if goal_only_requested and not scope_was_supplied and goal_only_unresolved:
+            raise SwarmError(
+                "The goal explicitly limits changes to something Nexus cannot use as a writable "
+                "project path (" + "; ".join(goal_only_unresolved[:3]) + "). Nexus did not widen "
+                "the restriction. Name the project files or folders the agents may change, or set "
+                "write destinations for this run."
+            )
         raise SwarmError(
             "This project-work request has an explicit empty write scope, so no project path is writable. "
             "Select at least one valid destination or start an explicitly read-only run."
         )
     destination_contract = (
-        "\nMECHANICALLY ENFORCED WRITE DESTINATIONS\n"
-        + "\n".join(f"- {one}/" for one in explicit_write_roots)
-        + "\nNexus will reject proposed paths outside these destinations."
-        if write_scope_restricted else ""
+        "\nUSER-SET WRITE SCOPE (enforced because the user explicitly restricted it)\n"
+        + "\n".join(f"- {one}" for one in explicit_write_roots)
+        + "\nNexus will not apply changes outside these paths."
+        if write_scope_restricted and not read_only_run else
+        "\nEXPLICITLY READ-ONLY RUN\nThe user explicitly asked for no project changes; "
+        "Nexus will not apply file changes in this run. Say what you would change instead."
+        if read_only_run else
+        "\nWRITE ACCESS\nYou may create, modify or delete any file in this project that the goal "
+        "needs (except .git and .harness control files)."
     )
-    if compiled_exact_grants:
+    if goal_protected_paths:
         destination_contract += (
-            "\nMECHANICALLY ENFORCED EXACT GOAL OPERANDS\n"
-            + "\n".join(
-                f"- {path}: {', '.join(sorted(capabilities))}"
-                for path, capabilities in compiled_exact_grants.items()
-            )
-            + "\nProvider plans and executors cannot add sibling or unrelated paths."
+            "\nPATHS THE USER EXPLICITLY SAID NOT TO CHANGE\n"
+            + "\n".join(f"- {one}" for one in goal_protected_paths)
+        )
+    if named_path_hints and not read_only_run:
+        destination_contract += (
+            "\nFILES THE GOAL NAMES (hints only; change any other file the goal needs too)\n"
+            + "\n".join(f"- {one}" for one in named_path_hints)
+        )
+    if outside_project_mentions:
+        destination_contract += (
+            "\nPATHS OUTSIDE THE SELECTED PROJECT (Nexus cannot write there)\n"
+            + "\n".join(f"- {one}" for one in outside_project_mentions)
+        )
+    ignored_path_tokens = [
+        str(one) for one in goal_spec.get("ignored_path_tokens", []) if isinstance(one, str)
+    ]
+    if ignored_path_tokens:
+        destination_contract += (
+            "\nPATH SPELLINGS NEXUS IGNORED AS FILE NAMES (they use \"..\", \"//\" or a "
+            "stream colon, so they grant nothing; use the plain project-relative path)\n"
+            + "\n".join(f"- {one}" for one in ignored_path_tokens)
+        )
+    if prior_run_notices:
+        destination_contract += (
+            "\nEARLIER RUNS ON THIS PROJECT (the files as they are now are the truth)\n"
+            + "\n".join(f"- {one}" for one in prior_run_notices)
         )
     write_authority_state = {
         "allowed_write_roots": explicit_write_roots,
         "write_scope_restricted": write_scope_restricted,
-        "exact_write_grants": {
-            path: sorted(capabilities) for path, capabilities in compiled_exact_grants.items()
-        },
+        # Named-file grants no longer exist as a restriction; kept empty so
+        # saved-state readers see a stable shape.
+        "exact_write_grants": {},
+        "named_path_hints": named_path_hints,
+        "protected_paths": goal_protected_paths,
         "goal_spec_digest": goal_spec.get("spec_digest"),
     }
     if acceptance_target.get("status") == "needs_clarification":
@@ -10558,6 +12748,7 @@ def work_together(
         )
 
     def plan(one: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+        answer: dict[str, Any] = {}
         try:
             answer = chat_lab.ask_once(
                 config,
@@ -10582,6 +12773,9 @@ def work_together(
         except HarnessError as exc:
             return one, {
                 "_provider_failed": True,
+                "_protocol_failure": _is_protocol_failure(exc),
+                "_cause": exc,
+                "_delivered_text": _natural_language_web_contribution(one, answer),
                 "_milliseconds": 0,
                 "_model": "",
                 "_provider_reason": _provider_reason(ledger, exc),
@@ -10592,15 +12786,17 @@ def work_together(
 
     completed: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
     provider_failures: list[dict[str, Any]] = []
+    protocol_failures: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=len(participants)) as pool:
         futures = [cancellation.submit(pool, plan, one) for one in participants]
         for future in as_completed(futures):
             one, value = future.result()
             completed[str(one.get("id"))] = (one, value)
             if value.get("_provider_failed"):
-                provider_failures.append({
+                (protocol_failures if value.get("_protocol_failure") else provider_failures).append({
                     **one,
                     "_provider_reason": str(value.get("_provider_reason") or ""),
+                    "_cause": value.get("_cause"),
                 })
                 continue
             live_text = (
@@ -10623,15 +12819,55 @@ def work_together(
             }
             _show_turn(live_turn, live)
             _share_turn(ledger, live, {"stage": "plan_review"})
-    if provider_failures:
+    if provider_failures or (protocol_failures and len(protocol_failures) == len(participants)):
+        # A provider outage (nothing has been applied yet) pauses for a
+        # reconnect. A reply that merely did not fit the format pauses only
+        # when no agent at all produced a readable plan.
+        failed_now = provider_failures or protocol_failures
         joined_reasons = " | ".join(
             f"{one.get('name')}: {one.get('_provider_reason')}"
-            for one in provider_failures if one.get("_provider_reason")
+            for one in failed_now if one.get("_provider_reason")
+        )
+        first_cause = next((one.get("_cause") for one in failed_now if one.get("_cause")), None)
+        cause: Exception | None = (
+            first_cause if len(failed_now) == 1 and isinstance(first_cause, Exception)
+            else (StructuredCollaborationError(joined_reasons) if not provider_failures
+                  else SwarmError(joined_reasons)) if joined_reasons else first_cause
         )
         _pause_provider_failure(
-            ledger, provider_failures, "independent_planning",
+            ledger, failed_now, "independent_planning",
             checkpoint=dict(write_authority_state),
-            cause=SwarmError(joined_reasons) if joined_reasons else None,
+            cause=cause,
+        )
+    for failed_one in protocol_failures:
+        # This agent answered, just not in the plan format. It keeps its
+        # place in the team with an empty plan and reviews the others' plans
+        # in the next round.
+        failed_value = completed[str(failed_one.get("id"))][1]
+        delivered = str(failed_value.get("_delivered_text") or "")
+        completed[str(failed_one.get("id"))] = (
+            completed[str(failed_one.get("id"))][0],
+            {
+                "contribution": delivered or "(No readable plan this round.)",
+                "message_to_lead": "", "needs_files": [], "effect_paths": [],
+                "_degraded": True, "_milliseconds": 0, "_model": "",
+            },
+        )
+        ledger.record_state("provider_protocol_failure", {
+            "stage": "independent_planning", "status": "degraded",
+            "failed_agent": {
+                "id": str(failed_one.get("id") or ""),
+                "name": str(failed_one.get("name") or ""),
+                "route": str(failed_one.get("who") or ""),
+            },
+            "failure_code": "invalid_structured_result",
+            **({"provider_reason": failed_one["_provider_reason"]}
+               if failed_one.get("_provider_reason") else {}),
+        })
+        _report(
+            progress, f"Continuing with {failed_one.get('name')}'s plan pending",
+            f"{failed_one.get('name')}'s plan did not match the plan format; it stays in the team "
+            "and reviews the plan in the next round.",
         )
     plans = [completed[str(one.get("id"))] for one in participants]
     reviewer_correlation = _review_correlation(plans, config)
@@ -10650,17 +12886,23 @@ def work_together(
     ]
 
     latest = {str(one.get("id")): (one, value) for one, value in plans}
-    plan_progress_guard = _ProgressGuard()
+    plan_repetition = _RepetitionNotice()
+    plan_no_change = _NoChangeGuard()
+    plan_loop_notice = ""
     plan_rounds = 0
     plan_remaining: list[str] = []
     plan_stopped_because = ""
     paused_questions: list[dict[str, Any]] = []
+    plan_rounds_without_answer = 0
+    everyone_ready = False
     for round_number in _round_numbers(round_limit):
         plan_rounds = round_number
         everyone_ready = True
+        round_answers = 0
+        round_protocol_failures: list[tuple[dict[str, Any], HarnessError]] = []
         cycle_remaining: list[str] = []
-        cycle_state: list[tuple[Any, ...]] = []
-        cycle_observations: dict[str, set[str]] = {}
+        cycle_signature: list[Any] = []
+        cycle_state: list[Any] = []
         ledger.record_state("prompt_context_checkpoint", {
             "stage": "plan_review", "round": round_number,
             **_prompt_summary_state(contributions),
@@ -10670,11 +12912,10 @@ def work_together(
             "Agents are reviewing one another's real messages in order before any files change."
         )
         for one in participants:
+            answer = {}
             try:
-                failed = False
                 observed: set[str] = set()
                 requested_context = _requested_files(root, list(latest.values()), observations=observed)
-                cycle_observations[str(one.get("id") or "")] = observed
                 answer = chat_lab.ask_once(
                     config, str(one.get("who") or ""),
                     _continuation_turn(
@@ -10692,9 +12933,11 @@ def work_together(
                           "Carry forward the exact project-relative files that must change in effect_paths; add any missing required effect paths found during review. "
                           "ready_to_execute means no more planning or input is needed before Nexus starts the file transaction; it does not mean the files already exist. "
                           "Execution and post-transaction verification steps belong in the plan and are not remaining planning work. "
-                          "When the plan already specifies the requested changes and how to verify them, set ready_to_execute true and remaining to an empty list. "
+                          "When the plan already specifies the requested changes and how to verify them, set ready_to_execute true and remaining to an empty list "
+                          "(optional suggestions may stay in remaining if each starts with \"Optional:\"). "
                           "If and only if an essential user decision cannot be inferred safely, put structured questions in questions, keep ready_to_execute false, and Nexus will pause for an answer. Give two or three clear options when useful, mark at most one recommended option, and allow_other unless a custom value would be invalid. Never hide a user question in remaining. "
-                          "When a canonical planning checkpoint really changes, include progress entries with stable IDs, exact states, and concrete evidence; keep the same ID for the same checkpoint."
+                          "When a planning checkpoint really changes, you may include progress entries with stable IDs, states, and evidence."
+                        + ("\n\n" + plan_loop_notice if plan_loop_notice else "")
                         + _shared_context(ledger, one, {
                             "stage": "plan_review",
                             "round": round_number,
@@ -10714,26 +12957,68 @@ def work_together(
             except cancellation.ChatCancelled:
                 raise
             except HarnessError as exc:
-                _pause_provider_failure(
-                    ledger,
-                    one,
-                    "plan_review",
-                    checkpoint={"round": round_number, **write_authority_state},
-                    cause=exc,
+                if not _is_protocol_failure(exc):
+                    _pause_provider_failure(
+                        ledger,
+                        one,
+                        "plan_review",
+                        checkpoint={"round": round_number, **write_authority_state},
+                        cause=exc,
+                    )
+                # The agent answered but not in the review format. Its turn
+                # is skipped this round (its last plan stays) and it is asked
+                # again next round; the others carry on.
+                round_protocol_failures.append((one, exc))
+                safe_reason = _provider_reason(ledger, exc)
+                delivered = _natural_language_web_contribution(one, answer)
+                ledger.record_state("provider_protocol_failure", {
+                    "stage": "plan_review", "round": round_number, "status": "degraded",
+                    "failed_agent": {
+                        "id": str(one.get("id") or ""), "name": str(one.get("name") or ""),
+                        "route": str(one.get("who") or ""),
+                    },
+                    "failure_code": "invalid_structured_result",
+                    "usable_contribution": bool(delivered),
+                    **({"provider_reason": safe_reason} if safe_reason else {}),
+                })
+                if delivered:
+                    contribution = _contribution(one, answer, "agent_plan_review", delivered)
+                    contribution["structured_state_unavailable"] = True
+                    contributions.append(contribution)
+                    _show_turn(live_turn, {"who": "them", **contribution})
+                    _share_turn(ledger, contribution, {
+                        "stage": "plan_review", "round": round_number,
+                        "structured_state_unavailable": True,
+                    })
+                cycle_signature.append([str(one.get("id") or ""), "format", delivered])
+                cycle_state.append([str(one.get("id") or ""), "format"])
+                _report(
+                    progress, f"Skipping {one.get('name')}'s unreadable review this round",
+                    f"{one.get('name')}'s reply did not match the review format; the others carry on "
+                    "and it is asked again next round.",
                 )
+                continue
+            round_answers += 1
             value["_milliseconds"] = int(answer.get("milliseconds") or 0)
             value["_model"] = str(answer.get("model") or "")
             latest[str(one.get("id"))] = (one, value)
             one_remaining = _remaining(value)
+            one_blocking = _blocking_remaining(one_remaining)
             one_questions = user_questions.normalize(value.get("questions"))
             paused_questions.extend(one_questions)
-            one_ready = value.get("ready_to_execute") is True and not one_remaining and not one_questions
+            one_ready = value.get("ready_to_execute") is True and not one_blocking and not one_questions
             everyone_ready = everyone_ready and one_ready
-            cycle_remaining.extend(one_remaining)
-            cycle_state.append(_canonical_progress_state(
-                str(one.get("id") or ""), one_ready, failed, value,
-                value.get("needs_files", []),
-            ))
+            cycle_remaining.extend(one_blocking)
+            cycle_state.append([
+                str(one.get("id") or ""), one_ready, bool(one_blocking),
+                sorted(str(path) for path in value.get("needs_files", []) if isinstance(path, str)),
+                sorted(str(path) for path in value.get("effect_paths", []) if isinstance(path, str)),
+            ])
+            cycle_signature.append([
+                str(one.get("id") or ""),
+                {key: item for key, item in value.items() if not str(key).startswith("_")},
+                sorted(observed),
+            ])
             words = _plan_words(value)
             contribution = _contribution(one, value, "agent_plan_review", words)
             contributions.append(contribution)
@@ -10745,6 +13030,18 @@ def work_together(
                 "speaker_remaining": one_remaining,
                 "requested_files": value.get("needs_files", []),
             })
+        if round_answers == 0:
+            everyone_ready = False
+            plan_rounds_without_answer += 1
+            if plan_rounds_without_answer >= 3 and round_protocol_failures:
+                failed_agents = [one for one, _exc in round_protocol_failures]
+                _pause_provider_failure(
+                    ledger, failed_agents, "plan_review",
+                    checkpoint={"round": round_number, **write_authority_state},
+                    cause=round_protocol_failures[0][1],
+                )
+        else:
+            plan_rounds_without_answer = 0
         plan_remaining = list(dict.fromkeys(cycle_remaining))
         ledger.record_state("plan_round_state", {
             "stage": "plan_review",
@@ -10752,6 +13049,7 @@ def work_together(
             "all_agents_ready": everyone_ready,
             "remaining": plan_remaining,
             "questions": user_questions.frozen(paused_questions),
+            "format_failures": [str(one.get("id") or "") for one, _exc in round_protocol_failures],
         })
         if paused_questions:
             plan_stopped_because = "user_input"
@@ -10759,12 +13057,16 @@ def work_together(
         if everyone_ready:
             plan_stopped_because = "complete"
             break
-        if plan_progress_guard.stalled(tuple(cycle_state), observations=cycle_observations):
-            plan_remaining.append(
-                "Nexus stopped a repeated planning cycle because readiness, remaining work, requested files, and provider-failure state did not advance."
-            )
-            plan_stopped_because = "stalled"
+        if plan_no_change.stuck(cycle_state):
+            plan_remaining.append(_no_change_guard_note(plan_no_change.reason))
+            plan_stopped_because = "no_change_guard"
             break
+        plan_loop_notice = plan_repetition.observe(cycle_signature)
+        if plan_loop_notice:
+            ledger.record_state("repetition_noticed", {
+                "stage": "plan_review", "round": round_number,
+                "identical_rounds": plan_repetition.identical,
+            })
     if not everyone_ready and not plan_stopped_because:
         plan_remaining.append(
             f"The user-set limit of {round_limit} team plan-review round(s) was reached."
@@ -10852,27 +13154,22 @@ def work_together(
         for path in value.get("effect_paths", [])
         if isinstance(path, str) and path.strip()
     ))
-    unauthorized_plan_effects = [
+    # Planned effect paths are the agents' own hints. They are never turned
+    # into requirements and never stop the run. When the user explicitly
+    # restricted writes, planned paths outside that scope are only noted; the
+    # write gate refuses such a change if an agent actually proposes it.
+    plan_effects_outside_scope = [
         path for path in required_effect_paths
-        if compiled_exact_grants and path.casefold() not in compiled_exact_grants
-        and not (
-            explicit_write_roots and _path_is_under(path, explicit_write_roots)
-        )
-        and not (
-            _is_test_goal(text)
-            and re.search(r"(?:^|/)(?:tests?|specs?)(?:/|$)", path, re.I)
-        )
+        if write_scope_restricted and not read_only_run
+        and not _path_is_under(path, explicit_write_roots)
     ]
-    if unauthorized_plan_effects:
-        ledger.record_state("scope_expansion_rejected", {
+    if plan_effects_outside_scope:
+        ledger.record_state("plan_effects_outside_user_scope", {
             "stage": "pre_mutation_acceptance",
-            "requested_paths": unauthorized_plan_effects,
-            "goal_spec_digest": goal_spec.get("spec_digest"),
-            "status": "requires_user_approval",
+            "requested_paths": plan_effects_outside_scope,
+            "allowed_write_roots": explicit_write_roots,
+            "status": "noted",
         })
-        required_effect_paths = [
-            path for path in required_effect_paths if path not in unauthorized_plan_effects
-        ]
     requirement_contract = _derive_requirement_contract(
         root, contract_goal, [] if read_only_run else required_effect_paths,
         ratified_by=[str(one.get("id") or "") for one, _value in plans],
@@ -10907,6 +13204,14 @@ def work_together(
                 ]
                 if combined:
                     by_id[identifier][field] = list(dict.fromkeys(combined))
+        # Whether a requirement may block completion follows the current
+        # policy, not a stale saved flag: only explicitly requested items.
+        fresh_mandatory = {
+            str(one.get("id")): _requirement_mandatory(one)
+            for one in requirement_contract["requirements"] if isinstance(one, dict)
+        }
+        for identifier, one in by_id.items():
+            one["mandatory"] = fresh_mandatory.get(identifier, False)
         requirement_contract["requirements"] = list(by_id.values())
         requirement_contract["resumed_from_persisted_contract"] = True
     ledger.record_state("requirement_contract", {
@@ -10922,10 +13227,19 @@ def work_together(
         "goal_named_paths": list(dict.fromkeys(_goal_named_paths(text))),
         "goal_path_roles": _goal_path_roles(text)["mentions"],
     })
-    team_plans = "\n\n".join(
-        f"CURRENT PLAN FROM {one.get('name')} ({one.get('who')}):\n{_plan_words(value)}"
+    # Every execution prompt carries the team's plans. They go through the
+    # same bounded prompt projection as the conversation, so 24 long plans
+    # cannot make each of 24 executor prompts unbounded; the full plans stay
+    # in the ledger and each executor still gets its own plan in full.
+    team_plans = _prompt_conversation([
+        {
+            "speaker_name": f"CURRENT PLAN FROM {one.get('name')}",
+            "speaker_route": one.get("who"),
+            "phase": "team_plan",
+            "text": _plan_words(value),
+        }
         for one, value in plans
-    )
+    ])
     _report(
         progress, "Reading the requested project files",
         "Nexus is confining requested paths to the connected project before sharing their current contents."
@@ -10935,18 +13249,197 @@ def work_together(
     mutation_saga = _MutationSaga(root, ledger.session_id)
     work_passes = 0
     goal_complete = False
+    machine_verified = False
+    read_only_unapplied: list[str] = []
     provider_consensus = False
     remaining = plan_remaining
     feedback = ""
     final_answer: dict[str, Any] = {"model": ""}
-    no_change_passes = 0
-    work_progress_guard = _ProgressGuard()
+    work_repetition = _RepetitionNotice()
+    work_no_change = _NoChangeGuard(detect_cycles=True)
     work_stopped_because = ""
+    format_failures: list[dict[str, Any]] = []
+    transaction_failures: list[dict[str, Any]] = []
+    refused_changes: list[dict[str, Any]] = []
+    passes_without_verification_answer = 0
+    # Consecutive unreadable verification replies per verifier. Until a
+    # verifier has failed the format this many passes in a row, its turn
+    # blocks completion: an unreadable dissent must never be ignored.
+    verifier_format_streak: dict[str, int] = {}
+    abstained_verifiers: list[str] = []
     deterministic_verification: dict[str, Any] = {
         "status": "not_run", "basis": "none", "commands": [],
         "reason": "Provider review has not yet reached consensus.",
     }
     context_tools: _ProjectContextTools | None = None
+    change_scope = (
+        explicit_write_roots if write_scope_restricted and explicit_write_roots else None
+    )
+    change_protection = [
+        str(one) for one in requirement_contract.get("protected_paths", [])
+        if isinstance(one, str)
+    ]
+
+    def paused_checkpoint(pass_number: int) -> dict[str, Any]:
+        return {
+            "pass": pass_number, "changed": list(all_changed),
+            **write_authority_state,
+        }
+
+    def note_format_failure(
+        one: dict[str, Any], exc: Exception, answer: dict[str, Any],
+        stage: str, pass_number: int,
+    ) -> str:
+        """Record one agent's unreadable reply; return its delivered prose."""
+
+        safe_reason = _provider_reason(ledger, exc)
+        delivered = _natural_language_web_contribution(one, answer)
+        record = {
+            "id": str(one.get("id") or ""), "name": str(one.get("name") or ""),
+            "route": str(one.get("who") or ""), "stage": stage, "pass": pass_number,
+            **({"provider_reason": safe_reason} if safe_reason else {}),
+        }
+        format_failures.append(record)
+        ledger.record_state("provider_protocol_failure", {
+            "stage": stage, "pass": pass_number, "status": "degraded",
+            "failed_agent": {
+                "id": record["id"], "name": record["name"], "route": record["route"],
+            },
+            "failure_code": "invalid_structured_result",
+            "usable_contribution": bool(delivered),
+            **({"provider_reason": safe_reason} if safe_reason else {}),
+        })
+        _report(
+            progress, f"Continuing after {one.get('name')}'s unreadable reply",
+            f"{one.get('name')}'s reply did not match the {stage} format"
+            + (f" ({safe_reason})" if safe_reason else "")
+            + ". Its turn is skipped this pass, nothing is rolled back, and it is asked again next pass.",
+        )
+        return delivered
+
+    def apply_changes(
+        executor: dict[str, Any], raw_changes: object, pass_number: int,
+        pass_changed: list[str], pass_transaction_ids: list[str],
+        pass_policy_denials: list[str],
+    ) -> tuple[list[str], str]:
+        """Apply one reply's changes; return (changed paths, notice for the team).
+
+        Each entry is checked on its own: a bad entry is refused with its
+        reason and the rest are applied in one atomic transaction. If that
+        transaction cannot be applied consistently, FileTransaction restores
+        exactly that transaction; every earlier transaction stays applied and
+        the run continues.
+        """
+
+        executor_name = str(executor.get("name") or "The acting agent")
+        if read_only_run and raw_changes:
+            # Only an explicitly read-only run gets here. The proposal is
+            # not silently dropped: it is recorded and the agents are told
+            # plainly why it was not applied, so they can report it.
+            proposed_paths = [
+                str(one.get("path") or "") for one in (raw_changes if isinstance(raw_changes, list) else [])
+                if isinstance(one, dict)
+            ]
+            ledger.record_state("read_only_proposal_rejected", {
+                "stage": "execution", "pass": pass_number,
+                "agent_id": str(executor.get("id") or ""),
+                "proposed_paths": proposed_paths,
+                "write_policy": "DENY_ALL",
+            })
+            notice = (
+                f"{executor_name} proposed changes to {', '.join(proposed_paths) or 'files'}, "
+                "but the user explicitly asked for a read-only run, so Nexus did not apply them. "
+                "Describe the proposed change to the user instead."
+            )
+            pass_policy_denials.append(notice)
+            read_only_unapplied.extend(
+                one for one in proposed_paths if one and one not in read_only_unapplied
+            )
+            return [], notice
+        changes, refusals = _partition_changes(
+            root, raw_changes, change_scope, change_protection, None,
+        )
+        notices: list[str] = []
+        if refusals:
+            refused_changes.extend(
+                {**one, "agent_id": str(executor.get("id") or ""), "pass": pass_number}
+                for one in refusals
+            )
+            ledger.record_state("execution_changes_refused", {
+                "stage": "execution", "pass": pass_number,
+                "agent_id": str(executor.get("id") or ""),
+                "refused": refusals,
+                "accepted_paths": [one.path for one in changes],
+                "goal_spec_digest": goal_spec.get("spec_digest"),
+            })
+            notice = _refusal_notice(executor_name, refusals)
+            pass_policy_denials.append(notice)
+            notices.append(notice)
+        if not changes:
+            return [], "\n".join(notices)
+        _report(
+            progress, f"Applying {executor_name}'s proposed changes",
+            "Nexus is checking paths and fresh baselines before opening the atomic transaction."
+        )
+        transaction_id = FileTransaction.new_transaction_id()
+        try:
+            with swarm_runs.post_provider_mutation():
+                mutation_saga.prepare(transaction_id)
+                manifest = FileTransaction(
+                    root,
+                    max_files=MOST_CHANGES_PER_REPLY,
+                    max_bytes=int(config.get("execution.max_changed_bytes")),
+                ).apply(
+                    changes, transaction_id=transaction_id,
+                    allowed_exact_capabilities=None,
+                    allowed_write_roots=change_scope,
+                    protected_paths=change_protection,
+                )
+                _record_applied_transaction(
+                    ledger, mutation_saga, transaction_id, manifest,
+                )
+        except HarnessError as exc:
+            restored = "automatic rollback was refused" not in str(exc)
+            mutation_saga.abandon(transaction_id, str(exc), restored=restored)
+            failed_paths = [one.path for one in changes]
+            transaction_failures.append({
+                "transaction_id": transaction_id, "agent_id": str(executor.get("id") or ""),
+                "pass": pass_number, "paths": failed_paths, "failure": str(exc),
+                "restored": restored,
+            })
+            ledger.record_state("mutation_failed", {
+                "stage": "execution", "pass": pass_number,
+                "status": "transaction_restored" if restored else "transaction_conflict",
+                "failure": str(exc), "transaction_id": transaction_id,
+                "paths": failed_paths,
+                "kept_transaction_ids": list(transaction_ids),
+            })
+            notice = (
+                f"Nexus could not apply {executor_name}'s change set to "
+                + ", ".join(failed_paths) + f" ({exc}). "
+                + (
+                    "That one transaction was undone as a whole; every earlier change stays "
+                    "applied. Re-read the files and send the change again."
+                    if restored else
+                    "Nexus could not fully undo that transaction because a file changed "
+                    "during the write; check those files as they are now."
+                )
+            )
+            pass_policy_denials.append(notice)
+            notices.append(notice)
+            return [], "\n".join(notices)
+        applied_id = str(manifest.get("transaction_id") or "")
+        if applied_id:
+            transaction_ids.append(applied_id)
+            pass_transaction_ids.append(applied_id)
+        changed_now = [
+            str(one.get("path")) for one in manifest.get("changes", [])
+            if isinstance(one, dict)
+        ]
+        pass_changed.extend(path for path in changed_now if path not in pass_changed)
+        all_changed.extend(path for path in changed_now if path not in all_changed)
+        return changed_now, "\n".join(notices)
+
     for pass_number in _round_numbers(round_limit):
         work_passes = pass_number
         ledger.record_state("prompt_context_checkpoint", {
@@ -10960,64 +13453,127 @@ def work_together(
         pass_changed: list[str] = []
         pass_transaction_ids: list[str] = []
         pass_policy_denials: list[str] = []
+        pass_signature: list[Any] = []
+        pass_state: list[Any] = []
         requested_paths = [
             str(path) for _one, value in plans for path in value.get("needs_files", [])
             if isinstance(path, str)
         ]
         for executor in participants:
+            mutation_saga.touch()
             executor_name = str(executor.get("name") or "The acting agent")
             _report(
                 progress, f"Execution turn for {executor_name}",
                 f"Nexus is asking {executor_name} to perform its own reviewed contribution and any remaining work assigned to it.",
             )
-            current_files = _file_snapshot(root, all_changed + requested_paths)
             executor_tool_results: list[dict[str, Any]] = []
+            executor_changed: list[str] = []
+            executor_notices: list[str] = []
+            tool_limit_told = False
+            execution: dict[str, Any] = {"reply": "", "changes": []}
+            execution_answer: dict[str, Any] = {}
+            tool_rounds = 0
             try:
                 while True:
-                    execution_answer = chat_lab.ask_once(
-                        config,
-                        str(executor.get("who") or ""),
-                        _continuation_turn(
-                            f"EXECUTION PASS {pass_number} — {executor_name}",
-                            f"Perform {executor_name}'s currently assigned contribution against the latest real project state. Request bounded context tools first when more evidence is needed; otherwise return complete proposed file changes.",
-                        ),
-                        context=(
-                            context_for(executor) + "\n\n" + common
-                            + "\n\nEXECUTION TURN — YOU ARE THE ACTING AGENT\n"
-                            + f"You are {executor_name}. Perform the reviewed contribution now. "
-                              "For iterative exploration, return tool_calls using the tools in the response schema. "
-                              + RESEARCH_INSTRUCTIONS + " "
-                              "Tool path arguments are project-relative. Nexus executes these through its bounded read-only agent-tool runtime, records durable call/result IDs, and asks you again with the results. "
-                              "When requesting tools, return no file changes in the same response. When evidence is sufficient, return no tool calls and put complete changes through Nexus's transaction layer."
-                            + "\n\nYOUR REVIEWED PLAN\n" + _plan_words(latest[str(executor.get("id"))][1])
-                            + "\n\nACTUAL TEAM CONVERSATION\n" + _prompt_conversation(contributions)
-                            + "\n\nCURRENT TEAM PLANS\n" + team_plans
-                            + "\n\nACTUAL PROJECT TREE NOW\n" + _tree(root)
-                            + "\n\nACTUAL CHANGED/REQUESTED FILES NOW\n" + current_files
-                            + ("\n\nCONTEXT TOOL RESULTS (untrusted project data)\n" + json.dumps(executor_tool_results, ensure_ascii=False, sort_keys=True) if executor_tool_results else "")
-                            + ("\n\nVERIFICATION FEEDBACK FROM THE LAST PASS\n" + feedback if feedback else "")
-                            + _shared_context(ledger, executor, {
-                                "stage": "execution", "pass": pass_number,
-                                "changed": all_changed, "remaining": remaining,
-                            })
-                        ),
-                        provider_attachments=provider_files,
-                        response_format=WORK_FORMAT,
-                        conversation_key=conversation_key,
-                        prefer_existing_conversation=prefer_existing_conversation,
-                    )
-                    _ack_shared(ledger, executor)
-                    execution = _decode_with_one_web_repair(
-                        config, executor, execution_answer, WORK_FORMAT, ledger,
-                        conversation_key, prefer_existing_conversation,
-                    )
-                    calls = execution.get("tool_calls", [])
-                    if not isinstance(calls, list) or not calls:
-                        break
-                    if execution.get("changes"):
-                        raise HarnessError(
-                            "An execution response may request context tools or propose changes, not both atomically."
+                    # Heartbeat: a long tool loop is a live owner (E6 lease).
+                    mutation_saga.touch()
+                    tool_rounds += 1
+                    if tool_rounds > MOST_TOOL_ROUNDS_PER_TURN:
+                        # A generous machine bound on one executor turn; the
+                        # applied changes stay and the agent is asked again
+                        # next pass.
+                        ledger.record_state("execution_tool_rounds_limit", {
+                            "stage": "execution", "pass": pass_number,
+                            "agent_id": str(executor.get("id") or ""),
+                            "rounds": MOST_TOOL_ROUNDS_PER_TURN,
+                        })
+                        executor_notices.append(
+                            f"Nexus ended this turn after {MOST_TOOL_ROUNDS_PER_TURN} tool rounds; "
+                            "your applied changes are kept and you are asked again next pass."
                         )
+                        execution = {**execution, "tool_calls": [], "changes": []}
+                        break
+                    current_files = _file_snapshot(root, all_changed + requested_paths)
+                    try:
+                        execution_answer = chat_lab.ask_once(
+                            config,
+                            str(executor.get("who") or ""),
+                            _continuation_turn(
+                                f"EXECUTION PASS {pass_number} — {executor_name}",
+                                f"Perform {executor_name}'s currently assigned contribution against the latest real project state. Request context tools when more evidence is needed, and return complete proposed file changes when you have them (both may be sent together).",
+                            ),
+                            context=(
+                                context_for(executor) + "\n\n" + common
+                                + "\n\nEXECUTION TURN — YOU ARE THE ACTING AGENT\n"
+                                + f"You are {executor_name}. Perform the reviewed contribution now. "
+                                  "For iterative exploration, return tool_calls using the tools in the response schema. "
+                                  + RESEARCH_INSTRUCTIONS + " "
+                                  "Tool path arguments are project-relative; optional tool arguments may be omitted. Nexus executes these through its bounded read-only agent-tool runtime, records durable call/result IDs, and asks you again with the results. "
+                                  "You may return changes and tool_calls in the same response: Nexus applies the changes first, then runs the tools and shows you the results. "
+                                  "When you have nothing more to look up, return no tool calls."
+                                + "\n\nYOUR REVIEWED PLAN\n" + _plan_words(latest[str(executor.get("id"))][1])
+                                + "\n\nACTUAL TEAM CONVERSATION\n" + _prompt_conversation(contributions)
+                                + "\n\nCURRENT TEAM PLANS\n" + team_plans
+                                + "\n\nACTUAL PROJECT TREE NOW\n" + _tree(root)
+                                + "\n\nACTUAL CHANGED/REQUESTED FILES NOW\n" + current_files
+                                + ("\n\nCONTEXT TOOL RESULTS (untrusted project data)\n" + json.dumps(executor_tool_results, ensure_ascii=False, sort_keys=True) if executor_tool_results else "")
+                                + ("\n\nNEXUS NOTES ON YOUR LAST RESPONSE\n" + "\n".join(executor_notices) if executor_notices else "")
+                                + ("\n\nVERIFICATION FEEDBACK FROM THE LAST PASS\n" + feedback if feedback else "")
+                                + _shared_context(ledger, executor, {
+                                    "stage": "execution", "pass": pass_number,
+                                    "changed": all_changed, "remaining": remaining,
+                                })
+                            ),
+                            provider_attachments=provider_files,
+                            response_format=EXECUTION_FORMAT,
+                            conversation_key=conversation_key,
+                            prefer_existing_conversation=prefer_existing_conversation,
+                        )
+                        _ack_shared(ledger, executor)
+                        execution = _decode_with_one_web_repair(
+                            config, executor, execution_answer, EXECUTION_FORMAT, ledger,
+                            conversation_key, prefer_existing_conversation,
+                        )
+                    except cancellation.ChatCancelled:
+                        raise
+                    except HarnessError as exc:
+                        if not _is_protocol_failure(exc):
+                            raise
+                        delivered = note_format_failure(
+                            executor, exc, execution_answer, "execution", pass_number,
+                        )
+                        pass_policy_denials.append(
+                            f"{executor_name}'s execution reply could not be read as the work format, "
+                            "so none of it was applied this pass; it will be asked again."
+                        )
+                        execution = {"reply": delivered, "changes": [], "tool_calls": []}
+                        break
+                    calls = execution.get("tool_calls") or []
+                    if not isinstance(calls, list):
+                        calls = [calls]
+                    raw_changes = execution.get("changes") or []
+                    if raw_changes:
+                        # Changes sent together with tool calls are applied
+                        # first, so the tools see the updated project.
+                        changed_now, notice = apply_changes(
+                            executor, raw_changes, pass_number,
+                            pass_changed, pass_transaction_ids, pass_policy_denials,
+                        )
+                        executor_changed.extend(
+                            path for path in changed_now if path not in executor_changed
+                        )
+                        executor_notices = [notice] if notice else []
+                        if changed_now and calls:
+                            executor_notices.append(
+                                "Applied before running your tools: " + ", ".join(changed_now)
+                            )
+                        pass_signature.append(["changes", str(executor.get("id") or ""), raw_changes])
+                        execution = {**execution, "changes": []}
+                    else:
+                        executor_notices = []
+                    if not calls:
+                        break
+                    pass_signature.append(["tools", str(executor.get("id") or ""), calls])
                     if context_tools is None:
                         context_tools = _ProjectContextTools(
                             config, root, ledger, project, text, all_changed, progress,
@@ -11036,17 +13592,96 @@ def work_together(
                         "pass": pass_number, "calls": calls,
                     })
                     tool_scope = "swarm-context-v1:" + str(tool_step["hash"])
-                    for call in calls:
-                        if not isinstance(call, dict):
-                            raise HarnessError("A context tool call is malformed")
-                        result = context_tools.execute(
-                            str(executor.get("id") or "agent"), call,
-                            execution_scope=tool_scope,
-                        )
+                    limit_reached = False
+                    for index, call in enumerate(calls):
+                        unrunnable = ""
+                        if index >= MOST_TOOL_CALLS_PER_REPLY:
+                            unrunnable = "over_cap"
+                        elif not isinstance(call, dict) or not str(call.get("name") or ""):
+                            unrunnable = "malformed"
+                        if unrunnable:
+                            # A call Nexus cannot run still spends one call of
+                            # the session allowance, exactly like an unknown
+                            # tool, so a stream of malformed calls reaches the
+                            # same limit instead of looping without end.
+                            try:
+                                context_tools.count_unrunnable_call(
+                                    str(executor.get("id") or "agent"), unrunnable,
+                                )
+                            except AgentToolCallLimitReached as exc:
+                                limit_reached = True
+                                executor_tool_results.append({
+                                    "call_id": call.get("call_id") if isinstance(call, dict) else None,
+                                    "name": call.get("name") if isinstance(call, dict) else None,
+                                    "result": {"status": "error", "content": json.dumps({
+                                        "error": str(exc), "code": "tool_call_limit_reached",
+                                        "recovery": "Answer now with what you have.",
+                                    })},
+                                })
+                                continue
+                            executor_tool_results.append({
+                                "call_id": call.get("call_id") if isinstance(call, dict) else None,
+                                "name": call.get("name") if isinstance(call, dict) else None,
+                                "result": {"status": "error", "content": json.dumps(
+                                    {
+                                        "error": f"Nexus runs at most {MOST_TOOL_CALLS_PER_REPLY} tool calls per response; this one was not run.",
+                                        "code": "tool_call_not_run",
+                                        "recovery": "Send it again in your next response.",
+                                    } if unrunnable == "over_cap" else {
+                                        # One malformed call is reported to the agent as a
+                                        # tool error; it never fails the whole response.
+                                        "error": "This tool call is malformed: it needs a tool name and an arguments object.",
+                                        "code": "malformed_tool_call",
+                                        "received": str(call)[:200],
+                                    }
+                                )},
+                            })
+                            continue
+                        prepared, notes = _tool_call_with_defaults(call, index)
+                        try:
+                            result = context_tools.execute(
+                                str(executor.get("id") or "agent"), prepared,
+                                execution_scope=tool_scope,
+                            )
+                        except AgentToolCallLimitReached as exc:
+                            # Running out of tool calls is not a failed run.
+                            # Tell the agent, keep every applied change, and
+                            # let it answer with what it already has.
+                            limit_reached = True
+                            result = {
+                                "call_id": prepared.get("call_id"),
+                                "name": prepared.get("name"),
+                                "status": "error",
+                                "content": json.dumps({
+                                    "error": str(exc),
+                                    "code": "tool_call_limit_reached",
+                                    "recovery": (
+                                        "No more context tool calls are available in this "
+                                        "exploration epoch. Answer now with what you have: "
+                                        "return your complete file changes, or no changes "
+                                        "and say plainly what is missing."
+                                    ),
+                                }),
+                            }
+                        if notes:
+                            result = {**result, "nexus_notes": notes}
                         executor_tool_results.append({
-                            "call_id": call.get("call_id"), "name": call.get("name"),
+                            "call_id": prepared.get("call_id"), "name": prepared.get("name"),
                             "result": result,
                         })
+                    if limit_reached:
+                        ledger.record_state("context_tool_call_limit_reached", {
+                            "stage": "execution", "pass": pass_number,
+                            "agent_id": str(executor.get("id") or ""),
+                            "told_agent_before": tool_limit_told,
+                        })
+                        if tool_limit_told:
+                            # The agent was already told and still only asked
+                            # for tools. End its turn with no changes instead
+                            # of asking forever; nothing is rolled back.
+                            execution = {**execution, "tool_calls": [], "changes": []}
+                            break
+                        tool_limit_told = True
             except cancellation.ChatCancelled:
                 if context_tools is not None:
                     context_tools.close()
@@ -11071,7 +13706,7 @@ def work_together(
                     ledger,
                     budget,
                     "execution",
-                    checkpoint={"pass": pass_number, **write_authority_state},
+                    checkpoint=paused_checkpoint(pass_number),
                     cause=exc,
                     mutation_root=root,
                     transaction_ids=transaction_ids,
@@ -11085,108 +13720,21 @@ def work_together(
                     ledger,
                     executor,
                     "execution",
-                    checkpoint={"pass": pass_number, **write_authority_state},
+                    checkpoint=paused_checkpoint(pass_number),
                     cause=exc,
                     mutation_root=root,
                     transaction_ids=transaction_ids,
                     mutation_saga=mutation_saga,
                 )
-            if read_only_run and execution.get("changes"):
-                ledger.record_state("read_only_proposal_rejected", {
-                    "stage": "execution", "pass": pass_number,
-                    "agent_id": str(executor.get("id") or ""),
-                    "proposed_paths": [
-                        str(one.get("path") or "") for one in execution.get("changes", [])
-                        if isinstance(one, dict)
-                    ],
-                    "write_policy": "DENY_ALL",
-                })
-                changes = []
-            else:
-                raw_changes = execution.get("changes")
-                pass_grants = _with_test_companion_grants(
-                    root, raw_changes, compiled_exact_grants, goal_spec, requirement_contract,
-                ) if compiled_exact_grants else None
-                try:
-                    changes = _validated_changes(
-                        root, raw_changes,
-                        explicit_write_roots if write_scope_restricted and explicit_write_roots else None,
-                        [
-                            str(one) for one in requirement_contract.get("protected_paths", [])
-                            if isinstance(one, str)
-                        ],
-                        pass_grants,
-                    )
-                except HarnessError as exc:
-                    ledger.record_state("execution_scope_denied", {
-                        "stage": "execution", "pass": pass_number,
-                        "agent_id": str(executor.get("id") or ""),
-                        "reason": str(exc), "goal_spec_digest": goal_spec.get("spec_digest"),
-                        "status": "incomplete",
-                    })
-                    changes = []
-                    pass_policy_denials.append("Nexus write-policy denial: " + str(exc))
-            executor_changed: list[str] = []
-            if changes:
-                _report(
-                    progress, f"Applying {executor_name}'s proposed changes",
-                    "Nexus is checking paths and fresh baselines before opening the atomic transaction."
-                )
-                try:
-                    with swarm_runs.post_provider_mutation():
-                        transaction_id = FileTransaction.new_transaction_id()
-                        mutation_saga.prepare(transaction_id)
-                        manifest = FileTransaction(
-                            root,
-                            max_files=12,
-                            max_bytes=int(config.get("execution.max_changed_bytes")),
-                        ).apply(
-                            changes, transaction_id=transaction_id,
-                            allowed_exact_capabilities=pass_grants,
-                            allowed_write_roots=(
-                                explicit_write_roots
-                                if write_scope_restricted and explicit_write_roots else None
-                            ),
-                            protected_paths=[
-                                str(one) for one in requirement_contract.get("protected_paths", [])
-                                if isinstance(one, str)
-                            ],
-                        )
-                        _record_applied_transaction(
-                            ledger, mutation_saga, transaction_id, manifest,
-                        )
-                except HarnessError as exc:
-                    recovery = mutation_saga.compensate("transaction_failed")
-                    ledger.record_state("mutation_failed", {
-                        "stage": "execution", "pass": pass_number,
-                        "status": "paused", "failure": str(exc),
-                        "mutation_recovery": recovery,
-                    })
-                    raise SwarmError(
-                        "Nexus stopped because the project transaction conflicted or failed; "
-                        f"mutation recovery is {recovery['status']}."
-                    ) from exc
-                transaction_id = str(manifest.get("transaction_id") or "")
-                if transaction_id:
-                    transaction_ids.append(transaction_id)
-                executor_changed = [
-                    str(one.get("path")) for one in manifest.get("changes", [])
-                    if isinstance(one, dict)
-                ]
-                if transaction_id:
-                    pass_transaction_ids.append(transaction_id)
-                pass_changed.extend(
-                    path for path in executor_changed if path not in pass_changed
-                )
-                all_changed.extend(
-                    path for path in executor_changed if path not in all_changed
-                )
             execution_words = str(
                 execution.get("reply") or "Execution turn finished."
             ).strip()
-            execution_words += "\nStaged provisionally in this run (team verification pending): " + (
+            execution_words += "\nApplied in this turn (team verification pending): " + (
                 ", ".join(executor_changed) or "none"
             )
+            if executor_notices:
+                execution_words += "\nNexus: " + " ".join(executor_notices)
+            pass_signature.append(["reply", str(executor.get("id") or ""), execution.get("reply")])
             execution_turn = _contribution(
                 executor, execution_answer,
                 (
@@ -11205,7 +13753,7 @@ def work_together(
                 "applied_in_turn": executor_changed,
                 "changed": all_changed,
             })
-            final_answer = execution_answer
+            final_answer = execution_answer or final_answer
 
         current_files = _file_snapshot(root, all_changed + requested_paths)
         _report(
@@ -11216,7 +13764,12 @@ def work_together(
         pass_remaining: list[str] = []
         verification_feedback: list[str] = []
         verification_feedback.extend(pass_policy_denials)
+        verification_answers = 0
+        pass_format_failures: list[tuple[dict[str, Any], HarnessError]] = []
+        pass_abstained: list[str] = []
         for one in participants:
+            mutation_saga.touch()
+            answer = {}
             try:
                 answer = chat_lab.ask_once(
                     config, str(one.get("who") or ""),
@@ -11230,7 +13783,8 @@ def work_together(
                         + "\n\nACTUAL PROJECT TREE NOW\n" + _tree(root)
                         + "\n\nACTUAL CHANGED/REQUESTED FILES NOW\n" + current_files
                         + "\n\nVerify the real on-disk result, not the lead's claims. Set goal_complete true only if the whole user goal is fulfilled. "
-                          "Otherwise give specific corrective feedback and list every remaining item."
+                          "Otherwise give specific corrective feedback and list every remaining item. "
+                          "Optional suggestions that do not block completion may be listed if each starts with \"Optional:\"."
                         + _shared_context(ledger, one, {
                             "stage": "verification",
                             "pass": pass_number,
@@ -11259,18 +13813,58 @@ def work_together(
                     pass
                 raise
             except HarnessError as exc:
-                _pause_provider_failure(
-                    ledger,
-                    one,
-                    "verification",
-                    checkpoint={"pass": pass_number, **write_authority_state},
-                    cause=exc,
-                    mutation_root=root,
-                    transaction_ids=transaction_ids,
-                    mutation_saga=mutation_saga,
+                if not _is_protocol_failure(exc):
+                    _pause_provider_failure(
+                        ledger,
+                        one,
+                        "verification",
+                        checkpoint=paused_checkpoint(pass_number),
+                        cause=exc,
+                        mutation_root=root,
+                        transaction_ids=transaction_ids,
+                        mutation_saga=mutation_saga,
+                    )
+                # A review that did not fit the format never confirms
+                # completion. As in team discussion, it blocks this pass until
+                # the verifier has failed the format several passes in a row
+                # (then it abstains, so one broken route cannot hold the team
+                # forever). Its words are shown to the others.
+                pass_format_failures.append((one, exc))
+                delivered = note_format_failure(one, exc, answer, "verification", pass_number)
+                verifier_id = str(one.get("id") or "")
+                streak = verifier_format_streak.get(verifier_id, 0) + 1
+                verifier_format_streak[verifier_id] = streak
+                shown = delivered or (
+                    "(reply could not be read as the verification format: "
+                    + (_provider_reason(ledger, exc) or "no reason given") + ")"
                 )
+                pass_signature.append(["verification-format", verifier_id, shown])
+                turn = _contribution(one, answer, "agent_verification", shown)
+                turn["structured_state_unavailable"] = True
+                contributions.append(turn)
+                _show_turn(live_turn, {"who": "them", **turn})
+                _share_turn(ledger, turn, {
+                    "stage": "verification", "pass": pass_number,
+                    "structured_state_unavailable": True,
+                })
+                verification_feedback.append(f"{one.get('name')}: {shown}")
+                if streak < _MOST_FAILED_TURNS_IN_A_ROW:
+                    pass_complete = False
+                    pass_remaining.append(
+                        f"{one.get('name')}'s verification could not be read, so it does not "
+                        "confirm completion yet; it is asked again next pass."
+                    )
+                    pass_state.append([verifier_id, "format"])
+                else:
+                    pass_abstained.append(str(one.get("name") or verifier_id))
+                continue
+            verifier_format_streak.pop(str(one.get("id") or ""), None)
+            verification_answers += 1
             one_remaining = _remaining(value)
-            one_complete = value.get("goal_complete") is True and not one_remaining
+            one_blocking = _blocking_remaining(one_remaining)
+            one_complete = value.get("goal_complete") is True and not one_blocking
+            pass_signature.append(["verification", str(one.get("id") or ""), value])
+            pass_state.append([str(one.get("id") or ""), one_complete])
             words = str(value.get("feedback") or "").strip()
             if one_remaining:
                 words += "\nRemaining: " + "; ".join(one_remaining)
@@ -11286,11 +13880,31 @@ def work_together(
                 "speaker_remaining": one_remaining,
             })
             pass_complete = pass_complete and one_complete
-            pass_remaining.extend(one_remaining)
+            pass_remaining.extend(one_blocking)
             if not one_complete:
                 verification_feedback.append(f"{one.get('name')}: {words}")
+        if verification_answers == 0:
+            pass_complete = False
+            passes_without_verification_answer += 1
+            if passes_without_verification_answer >= 3 and pass_format_failures:
+                if context_tools is not None:
+                    context_tools.close()
+                    context_tools = None
+                _pause_provider_failure(
+                    ledger,
+                    [one for one, _exc in pass_format_failures],
+                    "verification",
+                    checkpoint=paused_checkpoint(pass_number),
+                    cause=pass_format_failures[0][1],
+                    mutation_root=root,
+                    transaction_ids=transaction_ids,
+                    mutation_saga=mutation_saga,
+                )
+        else:
+            passes_without_verification_answer = 0
         remaining = list(dict.fromkeys(pass_remaining))
         provider_consensus = pass_complete
+        abstained_verifiers = list(pass_abstained)
         if pass_complete:
             try:
                 deterministic_verification = _run_selected_project_verification(
@@ -11320,6 +13934,22 @@ def work_together(
                 raise
             if deterministic_verification["status"] == "passed":
                 goal_complete = True
+                machine_verified = True
+            elif deterministic_verification["status"] == "unavailable":
+                # No usable test command, no containment profile for this
+                # toolchain (go, cargo, dotnet, mvn, gradle, make, pwsh ...),
+                # a missing runner or an unapproved discovered command: Nexus
+                # cannot check the work, so it does not veto it. Every agent
+                # agreed the goal is done; complete it and say plainly that it
+                # was not machine-verified. No pass is fabricated.
+                goal_complete = True
+                machine_verified = False
+                ledger.record_state("completed_without_machine_verification", {
+                    "stage": "verification", "pass": pass_number,
+                    "basis": deterministic_verification.get("basis"),
+                    "reason": deterministic_verification.get("reason"),
+                    "status": "agent_verified",
+                })
             else:
                 pass_complete = False
                 verification_problem = str(deterministic_verification.get("reason") or "Deterministic verification did not pass.")
@@ -11333,6 +13963,7 @@ def work_together(
             "remaining": remaining,
             "verification_basis": deterministic_verification.get("basis", "provider_claims_only"),
             "deterministically_verified": deterministic_verification.get("status") == "passed",
+            "machine_verified": machine_verified,
             "deterministic_verification": deterministic_verification,
         })
         if goal_complete:
@@ -11340,79 +13971,29 @@ def work_together(
             break
         if context_tools is not None and pass_transaction_ids:
             context_tools.renew_after_progress(pass_transaction_ids)
-        feedback = "\n\n".join(verification_feedback)
-        relevant_changed = [
-            path for path in all_changed
-            if _delta_path_matches_requirement(root, requirement_contract, path)
-        ]
-        project_state = _project_state_digest(root, relevant_changed)
-        verification_state = str(deterministic_verification.get("status") or "not_run")
-        transaction_evidence: set[str] = set()
-        for transaction_id in transaction_ids:
-            try:
-                manifest = FileTransaction(root).load_manifest(transaction_id)
-            except (HarnessError, OSError):
-                continue
-            if manifest.get("state") != "applied":
-                continue
-            records = manifest.get("changes", [])
-            if not isinstance(records, list):
-                continue
-            authenticated = [
-                {
-                    "path": record.get("path"),
-                    "before": record.get("before_sha256"),
-                    "after": record.get("after_sha256"),
-                    "delete": record.get("delete") is True,
-                }
-                for record in records
-                if isinstance(record, dict)
-                and isinstance(record.get("path"), str)
-                and _delta_path_matches_requirement(
-                    root, requirement_contract, str(record.get("path")),
-                )
-            ]
-            if authenticated:
-                transaction_evidence.add(hashlib.sha256(json.dumps(
-                    authenticated, sort_keys=True, separators=(",", ":"),
-                    ensure_ascii=False,
-                ).encode("utf-8")).hexdigest())
-        valid_receipts = sorted({
-            str(receipt.get("receipt_digest") or receipt.get("direct_probe_digest") or "")
-            for receipt in deterministic_verification.get("causal_receipts", [])
-            if isinstance(receipt, dict)
-            and str(receipt.get("receipt_digest") or receipt.get("direct_probe_digest") or "")
-        })
-        progress_key = hashlib.sha256(json.dumps({
-            "goal_spec_digest": goal_spec.get("spec_digest"),
-            "acceptance_target_ratification": acceptance_target.get("ratification_digest", ""),
-            "project_state": project_state,
-            "verification_status": verification_state,
-            "verification_reason": deterministic_verification.get("reason"),
-            "unmet_requirements": deterministic_verification.get(
-                "requirement_evidence", {}
-            ).get("execution", {}).get("unmet", []),
-            # Provider prose, context call IDs/results and keyword-shaped reads
-            # are deliberately excluded. Only sealed receipts and authenticated
-            # operation deltas can reset long-horizon progress.
-            "valid_receipts": valid_receipts,
-            "transactions": sorted(transaction_evidence),
-        }, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
-        deterministic_unmet = deterministic_verification.get("requirement_evidence", {})
-        if isinstance(deterministic_unmet, dict):
-            deterministic_unmet = deterministic_unmet.get("execution", deterministic_unmet)
-        deterministic_unmet = (
-            deterministic_unmet.get("unmet", [])
-            if isinstance(deterministic_unmet, dict) else []
-        )
-        if work_progress_guard.stalled(((
-            "project", progress_key, _progress_terms(deterministic_unmet),
-        ),)):
-            remaining.append(
-                "Nexus detected a repeated end-of-pass project state with unchanged deterministic verification; the run can be resumed after new evidence or user input."
-            )
-            work_stopped_because = "stalled"
+        # Nexus never stops a working team on a progress heuristic. Only a
+        # long stretch of exactly identical passes (same replies, same tool
+        # calls, same changes, same project, same checks) earns a notice.
+        pass_signature.append(["project", _project_state_digest(root, all_changed)])
+        pass_signature.append([
+            "verification", deterministic_verification.get("status"),
+            deterministic_verification.get("reason"),
+        ])
+        project_digest = _project_state_digest(root, all_changed)
+        if work_no_change.stuck([
+            pass_state, project_digest, deterministic_verification.get("status"),
+        ]):
+            remaining.append(_no_change_guard_note(work_no_change.reason))
+            work_stopped_because = "no_change_guard"
             break
+        loop_notice = work_repetition.observe(pass_signature)
+        if loop_notice:
+            ledger.record_state("repetition_noticed", {
+                "stage": "execution", "pass": pass_number,
+                "identical_passes": work_repetition.identical,
+            })
+            verification_feedback.append(loop_notice)
+        feedback = "\n\n".join(verification_feedback)
     if not goal_complete and not work_stopped_because:
         remaining.append(
             f"The user-set limit of {round_limit} project execution/verification round(s) was reached."
@@ -11431,17 +14012,16 @@ def work_together(
             raise SwarmError(
                 "Nexus refused to complete the informational run because project-wide zero-write authority was violated."
             )
-    mutation_recovery = {"status": "not_needed", "rolled_back_transaction_ids": []}
+    mutation_recovery: dict[str, Any] = {"status": "not_needed", "rolled_back_transaction_ids": []}
     applied_unverified = bool(all_changed) and provider_consensus and not goal_complete
-    if not goal_complete and transaction_ids and not applied_unverified:
-        mutation_recovery = mutation_saga.compensate("incomplete")
-        if mutation_recovery["status"] == "rolled_back":
-            all_changed = list(dict.fromkeys(resumed_changed_paths))
-        else:
-            remaining.append(
-                "Automatic rollback stopped at a project-file conflict; inspect the transaction manifests before retrying."
-            )
-            work_stopped_because = "rollback_conflict"
+    if not goal_complete and transaction_ids:
+        # An incomplete run keeps the agents' applied work. It is reported as
+        # incomplete with exactly what was done, and it stays resumable.
+        mutation_recovery = {
+            "status": "kept",
+            "kept_transaction_ids": list(transaction_ids),
+            "rolled_back_transaction_ids": [],
+        }
     terminal_status = (
         "complete" if goal_complete else
         "needs_verification" if applied_unverified and deterministic_verification.get("status") == "failed" else
@@ -11506,23 +14086,41 @@ def work_together(
         "remaining": remaining,
     })
     if goal_complete:
-        mutation_saga.complete("deterministically_verified")
+        mutation_saga.complete(
+            "deterministically_verified" if machine_verified else "agent_verified"
+        )
     elif applied_unverified:
         mutation_saga.complete(
             "needs_verification"
             if deterministic_verification.get("status") == "failed"
             else "applied_unverified"
         )
+    elif transaction_ids:
+        # Incomplete, but the applied work is kept and stays resumable.
+        mutation_saga.complete("incomplete_kept")
     else:
         mutation_saga.complete("no_mutations")
     reply = (
         "The connected agents completed their assigned execution turns and deterministic verification passed."
+        if goal_complete and machine_verified else
+        (
+            "The connected agents completed their assigned execution turns and the agents whose "
+            "verification could be read agreed the goal is done."
+            if abstained_verifiers else
+            "The connected agents completed their assigned execution turns and all agreed the goal is done."
+        )
         if goal_complete else
         "The connected agents stopped without completing every assigned execution turn."
     )
-    if goal_complete:
+    if goal_complete and machine_verified:
         reply += (
             "\n\nNexus verification: selected-project deterministic checks passed."
+        )
+    elif goal_complete:
+        reply += (
+            "\n\nNexus verification: not machine-verified. "
+            + str(deterministic_verification.get("reason") or "No deterministic check was available.")
+            + " The result rests on the agents' agreement."
         )
     else:
         if applied_unverified:
@@ -11536,8 +14134,50 @@ def work_together(
             reply += "\nRemaining: " + "; ".join(remaining)
     if all_changed:
         reply += "\n\nNexus applied: " + ", ".join(all_changed)
+        if not goal_complete:
+            reply += (
+                "\nThese changes are kept in the project; resuming this run continues from them."
+            )
     else:
         reply += "\n\nNexus applied no project-file changes."
+    if goal_complete and abstained_verifiers:
+        reply += (
+            "\nNot counted: the verification from " + ", ".join(abstained_verifiers)
+            + f" could not be read {_MOST_FAILED_TURNS_IN_A_ROW} passes in a row, so it neither "
+              "confirmed nor blocked completion; check its messages above."
+        )
+    if refused_changes:
+        reply += (
+            f"\nNexus refused {len(refused_changes)} individual proposed change(s) "
+            "(the rest were applied): "
+            + "; ".join(
+                f"{one.get('path') or '(no path)'}: {one.get('reason')}"
+                for one in refused_changes[:20]
+            )
+            + (" ..." if len(refused_changes) > 20 else "")
+        )
+    if transaction_failures:
+        reply += (
+            "\nChange sets that could not be applied (each was undone on its own; "
+            "everything else stays applied): "
+            + "; ".join(
+                ", ".join(one.get("paths") or []) + f" ({one.get('failure')})"
+                for one in transaction_failures[:10]
+            )
+        )
+    if format_failures:
+        names = list(dict.fromkeys(str(one.get("name") or "an agent") for one in format_failures))
+        reply += (
+            "\nSome replies did not match the requested format and were skipped for that turn "
+            "only (nothing was rolled back): " + ", ".join(names) + "."
+        )
+    if left_out_notice:
+        reply += "\n" + left_out_notice
+    if read_only_unapplied:
+        reply += (
+            "\nProposed but not applied because you asked for a read-only run: "
+            + ", ".join(read_only_unapplied)
+        )
     kept = chat_lab.keep_multiparty_exchange(
         config,
         str(lead.get("who") or ""),
@@ -11559,6 +14199,7 @@ def work_together(
         state={
             "resume_token": "" if goal_complete else ledger.session_id,
             **write_authority_state,
+            "machine_verified": goal_complete and machine_verified,
             "changed": all_changed,
             "transaction_ids": transaction_ids,
             "deterministic_verification": deterministic_verification,
@@ -11577,9 +14218,14 @@ def work_together(
         "transaction_ids": transaction_ids,
         "changed": all_changed,
         "goal_complete": goal_complete,
+        # "verified" means the goal was verified complete, by deterministic
+        # checks or, when none could run, by every agent's agreement;
+        # "machine_verified" says which.
         "verified": goal_complete,
+        "machine_verified": goal_complete and machine_verified,
         "verification_status": (
-            "deterministically_verified" if goal_complete else
+            "deterministically_verified" if goal_complete and machine_verified else
+            "agent_verified" if goal_complete else
             "needs_verification" if applied_unverified and deterministic_verification.get("status") == "failed" else
             "applied_unverified" if applied_unverified else "incomplete"
         ),
@@ -11599,4 +14245,9 @@ def work_together(
         "round_limit": round_limit,
         "stopped_because": work_stopped_because,
         "remaining": remaining,
+        "refused_changes": refused_changes,
+        "transaction_failures": transaction_failures,
+        "format_failures": format_failures,
+        **({"participants_left_out": left_out_notice} if left_out_notice else {}),
+        **({"prior_run_notices": prior_run_notices} if prior_run_notices else {}),
     }

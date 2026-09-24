@@ -44,6 +44,8 @@
       "external-browser.js",
       "email-browser-worker.js",
       "web-chat-shell-preload.js",
+      "mail-notifier.js",
+      "mail-toast-preload.js",
       "pages/**",
       "nexus-harness.ico",
       "build-info.json",
@@ -79,7 +81,7 @@
       {
         "from": "../src",
         "to": "harness/src",
-        "filter": ["**/*", "!**/__pycache__/**", "!**/*.pyc", "!**/*.pyo"]
+        "filter": ["**/*", "!**/__pycache__/**", "!**/*.pyc", "!**/*.pyo", "!**/*.egg-info/**"]
       },
       {
         "from": "../scripts/harness.py",

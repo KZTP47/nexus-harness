@@ -676,7 +676,8 @@ def check_a_custom_member(said: Any) -> dict[str, Any]:
 
 
 def check_it(
-    config: LoadedConfig, graph: Any, here: dict[str, dict] | None = None
+    config: LoadedConfig, graph: Any, here: dict[str, dict] | None = None,
+    *, warnings: list[str] | None = None,
 ) -> list[str]:
     """Everything wrong with a team, said in words somebody can act on.
 
@@ -685,6 +686,11 @@ def check_it(
     tool waiting on a sign-in can sit there for the best part of a minute.
     Doing that once for a list of ten teams rather than ten times is the
     difference between a view that opens and one that hangs.
+
+    Hand in a `warnings` list to receive the temporary things separately: an
+    assistant that is on this machine but not ready yet (signed out, still
+    installing) says something about running the team right now, not about
+    the team itself. Without that list they are reported with the rest.
     """
 
     problems: list[str] = []
@@ -725,7 +731,7 @@ def check_it(
                 "Choose one from the list."
             )
         elif not known.get("ready"):
-            problems.append(
+            (problems if warnings is None else warnings).append(
                 f"{label} is set to {known.get('label') or route}, which is not ready yet: "
                 f"{known.get('why_not') or 'it was not found on this machine'}."
             )
@@ -774,7 +780,9 @@ def load_team(config: LoadedConfig, name: str) -> dict[str, Any]:
 
 
 def save_team(config: LoadedConfig, name: str, graph: Any, *, was: str = "") -> dict[str, Any]:
-    """Write a team down, refusing one that could not really run.
+    """Write a team down, refusing one that is malformed or names nobody real.
+
+    A member that is only temporarily not ready is saved with a warning.
 
     Hand in `was` when changing a team that already exists and its name has
     changed, so the old one is moved rather than left behind under the old
@@ -785,7 +793,10 @@ def save_team(config: LoadedConfig, name: str, graph: Any, *, was: str = "") -> 
         raise TeamError(
             "A team name is letters, numbers, spaces, dashes and underscores, up to 64 of them."
         )
-    problems = check_it(config, graph)
+    # A member that is only temporarily not ready does not stop a save: the
+    # team is kept and the readiness is handed back as a warning.
+    warnings: list[str] = []
+    problems = check_it(config, graph, warnings=warnings)
     if problems:
         raise TeamError("This team cannot be saved yet: " + " ".join(problems[:3]))
     wanted = str(name).strip()
@@ -813,6 +824,9 @@ def save_team(config: LoadedConfig, name: str, graph: Any, *, was: str = "") -> 
             pass
     value = saved.to_dict(include_graph=True)
     value["plain"] = in_plain_words(saved.graph)
+    value["warnings"] = warnings
+    if warnings:
+        value["issues"] = list(dict.fromkeys([*value.get("issues", []), *warnings]))[:5]
     return value
 
 

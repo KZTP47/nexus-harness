@@ -1794,6 +1794,34 @@ test('a failing inbox tab leads the next scan instead of being demoted again',as
     assert.ok(result.warnings.some(w=>/Other inbox tab did not finish loading/.test(w)&&/checked first on the next scan/.test(w)),
       'the warning must say the failed tab is checked first next time');
     assert.equal(result.messages.length,1,'the working tab must still import its mail');
+    assert.equal(result.has_more,true,'an unread tab means more remains, so a first-connect baseline cannot end before it');
+    // Next scan: the failing tab leads, fails again, and the other tab is checked instead.
+    const fallback=await operate(value,{command:'sync',connection:{email:'person@example.test'},cursor:result.cursor});
+    assert.ok(fallback.warnings.some(w=>/was checked instead/.test(w)),JSON.stringify(fallback.warnings));
+    assert.equal(fallback.has_more,true,'the tab that failed is still unread');
+  } finally {await browser.close();}
+});
+
+test('a scan whose budget ends before the second inbox tab says more remains',async()=>{
+  const installed=findInstalledBrowser();
+  assert.ok(installed,'Chrome or Edge required for browser mail fixture test');
+  const browser=await chromium.launch({executablePath:installed.executable,headless:true});
+  try {
+    const page=await browser.newPage();
+    const pane=id=>`<div data-convid="${id}"><h2 data-testid="conversation-subject">Thread</h2><article data-message-id="m-${id}"><div data-testid="SenderPersona"><span title="${id}@example.test">s</span></div><div role="document">Body ${id}</div></article></div>`;
+    await page.route('**/*',route=>route.fulfill({contentType:'text/html',body:
+      '<button id="mectrl_main_trigger" aria-label="person@example.test">Account</button><main role="main">'
+      +'<div role="tablist"><button role="tab" aria-selected="true">Focused</button><button role="tab" aria-selected="false">Other</button></div>'
+      +`<div role="option" data-convid="thread1" onclick='document.querySelector("#pane").innerHTML=${JSON.stringify(pane('thread1')).replaceAll("'",'&#39;')}'>Thread</div>`
+      +'<section id="pane"></section></main>'}));
+    await page.goto('https://outlook.office.com/mail/inbox');
+    await page.bringToFront();
+    await page.locator('[data-convid="thread1"]').click({trial:true,timeout:15000});
+    // The request started long ago: after the first tab the reserve is already reached.
+    const result=await operate({page,provider:'browser_outlook',lastInboxRefresh:Date.now()},
+      {command:'sync',connection:{email:'person@example.test'},_startedAt:Date.now()-96000});
+    assert.ok(result.warnings.some(w=>/scan work budget was reached/.test(w)),JSON.stringify(result.warnings));
+    assert.equal(result.has_more,true);
   } finally {await browser.close();}
 });
 test('the inbox scan scrolls the virtualised list and reads conversations below the first viewport',async()=>{
@@ -1948,7 +1976,7 @@ test('virtualized mailbox cursor resumes beyond the scroll budget and survives r
     for(let scan=0;scan<18&&hasMore;scan++){
       await page.goto('https://outlook.office.com/mail/inbox');
       const result=await operate({page,provider:'browser_outlook',lastInboxRefresh:Date.now()}, {command:'sync',connection:{email:'owner@example.test'},cursor});
-      for(const message of result.messages)imported.add(message.message_id);
+      for(const message of result.messages){imported.add(message.message_id);assert.equal(message.first_seen_at,null,'rows found by scrolling while the backlog drains are never new arrivals');}
       cursor=result.cursor;hasMore=result.has_more;
       resumed ||= JSON.parse(cursor).walks.Focused.top>0;
     }
@@ -1975,4 +2003,65 @@ test('conversation cursor imports every visible message beyond a 20-message batc
     assert.equal(imported.size,23);assert.equal(hasMore,false);
     assert.deepEqual(JSON.parse(cursor).message_offsets,{});
   }finally{await browser.close();}
+});
+
+test('first_seen_at stamps only conversations that arrive in a tracked inbox, stays stable across scans and restarts, and never floods an upgraded cursor', {timeout:180000}, async()=>{
+  const browser=await chromium.launch({executablePath:findInstalledBrowser().executable,headless:true});
+  try {
+    // Newest first; a conversation shows every message it holds. No message carries a date.
+    let list=[['A',1],['B',1]];
+    const handler=route=>{
+      const rows=list.map(([id,count])=>`<div role="option" data-convid="${id}" onclick="openMail('${id}',${count})">${id} ${count}</div>`).join('');
+      return route.fulfill({contentType:'text/html',body:`<button id="mectrl_main_trigger" aria-label="owner@example.test">Account</button><main role="main">${rows}<section id="pane"></section></main><script>function openMail(id,count){document.querySelector('#pane').innerHTML='<h2 data-testid="conversation-subject">Thread '+id+'</h2>'+Array.from({length:count},(_,i)=>'<article data-convid="'+id+'" data-message-id="'+id+'-'+(i+1)+'"><span email="sender@example.test">Sender</span><div role="document">Body '+id+' '+(i+1)+'</div></article>').join('');}</script>`});
+    };
+    let page=await browser.newPage();await page.route('**/*',handler);
+    const scan=async cursor=>{
+      await page.goto('https://outlook.office.com/mail/inbox');
+      const result=await operate({page,provider:'browser_outlook',lastInboxRefresh:Date.now()},{command:'sync',connection:{email:'owner@example.test'},cursor});
+      return {result,stamps:Object.fromEntries(result.messages.map(message=>[message.message_id,message.first_seen_at]))};
+    };
+    const iso=/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/;
+    // A fresh connection's baseline: everything already listed is reported as not observed arriving.
+    const first=await scan('');
+    assert.deepEqual(first.stamps,{'A-1':null,'B-1':null});
+    assert.ok(first.result.messages.every(message=>'first_seen_at' in message));
+    // A conversation arriving between scans is stamped with the scan that first listed it.
+    list=[['C',1],['A',1],['B',1]];
+    const arrivedAfter=Date.now();
+    const second=await scan(first.result.cursor);
+    assert.deepEqual(Object.keys(second.stamps),['C-1']);
+    assert.match(second.stamps['C-1'],iso);
+    const arrived=Date.parse(second.stamps['C-1']);
+    assert.ok(arrived>=arrivedAfter&&arrived<=Date.now());
+    assert.ok(!second.result.cursor.includes('"C"')&&!second.result.cursor.includes('Body'),'the state holds digests, not row ids or mail content');
+    // After a worker restart, the conversation keeps its stamp for a later message, and a newer arrival is later still.
+    await page.close();page=await browser.newPage();await page.route('**/*',handler);
+    await new Promise(resolve=>setTimeout(resolve,20));
+    list=[['D',1],['C',2],['A',1],['B',1]];
+    const third=await scan(second.result.cursor);
+    assert.equal(third.stamps['C-2'],second.stamps['C-1'],'a stamp never moves once observed');
+    assert.match(third.stamps['D-1'],iso);
+    assert.ok(Date.parse(third.stamps['D-1'])>arrived,'a newer arrival is stamped later');
+    const stable=await scan(third.result.cursor);
+    assert.deepEqual(stable.result.messages,[]);
+    const before=JSON.parse(third.result.cursor).first_seen,after=JSON.parse(stable.result.cursor).first_seen;
+    assert.deepEqual(Object.keys(after).sort(),Object.keys(before).sort());
+    for(const key of Object.keys(before))assert.equal(after[key][0],before[key][0],'first observations are unchanged by another scan');
+    // A cursor from before this state is a baseline: nothing already listed, nor new mail in it, looks newly arrived.
+    const legacy=JSON.parse(stable.result.cursor);
+    for(const key of ['first_seen_contract','first_seen','first_seen_tabs'])delete legacy[key];
+    list=[['E',1],['A',2],['D',1],['C',2],['B',1]];
+    const upgraded=await scan(JSON.stringify(legacy));
+    assert.deepEqual(upgraded.stamps,{'E-1':null,'A-2':null},'an upgrade stamps nothing with the upgrade time');
+    list=[['F',1],['E',1],['A',2],['D',1],['C',2],['B',1]];
+    const resumed=await scan(upgraded.result.cursor);
+    assert.match(resumed.stamps['F-1'],iso,'tracking resumes after the upgrade baseline');
+    // The private state stays bounded.
+    const crowded=JSON.parse(resumed.result.cursor);
+    for(let index=0;index<2500;index++)crowded.first_seen[createHash('sha256').update(String(index)).digest('hex').slice(0,32)]=[0,index];
+    list=[['F',2],['E',1],['A',2],['D',1],['C',2],['B',1]];
+    const bounded=await scan(JSON.stringify(crowded));
+    assert.equal(Object.keys(JSON.parse(bounded.result.cursor).first_seen).length,2000);
+    assert.equal(bounded.stamps['F-2'],resumed.stamps['F-1'],'the least recently listed entries are the ones dropped');
+  } finally {await browser.close();}
 });

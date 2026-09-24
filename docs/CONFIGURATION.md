@@ -119,10 +119,14 @@ Each named profile reads only its `api_key_env`. It does not fall back to `HARNE
 `max_concurrency` also bounds saved-chat provider dispatches for that profile.
 The slot pool is shared by every Nexus process using the same project, while
 different saved chat IDs retain independent transcripts, cancellation, and
-progress state. A chat above the limit waits for a slot instead of colliding
-with a live CLI/account request; Stop remains available while it waits. Set a
-value above `1` only for a provider profile whose connection is known to support
-parallel requests.
+progress state. A chat above the limit queues for a slot instead of colliding
+with a live CLI/account request, and the wait never fails the turn. Freed slots
+go to waiters first come, first served, so a looping goal cannot keep taking
+them. Stop remains available while it waits. When `max_concurrency` is not set, a
+command-line assistant profile (`claude-cli`, `codex-cli`, `copilot-cli`,
+`gemini-cli`, `assistant-cli`) gets 4 slots, because each request is its own
+process. Every other profile gets 1. An explicit value, including `1`, always
+wins.
 
 `allow_project_graphs: true` lets a graph submitted by a project or the visual editor select that profile. Keep this opt-in in trusted config only. It grants that graph permission to send its selected state to the profile endpoint. Built-in workflows and the legacy `provider` route do not need this flag.
 

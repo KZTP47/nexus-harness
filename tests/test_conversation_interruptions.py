@@ -160,25 +160,24 @@ class PlanningInterruptionTests(unittest.TestCase):
             self.assertEqual(result["status"], "discovery_required")
             self.assertNotIn("ratification_digest", result)
 
-    def test_real_retrieval_advances_but_missing_and_repeated_files_do_not(self):
+    def test_real_retrieval_is_observed_and_repetition_only_notices(self):
+        # Nexus never stops agents on a progress heuristic: a long exactly
+        # identical stretch only earns a notice, and any change resets it.
         with tempfile.TemporaryDirectory() as folder:
             canonical = Path(folder).resolve()
             root = canonical / ".." / canonical.name
-            guard = swarm_work._ProgressGuard()
-            state = (swarm_work._canonical_progress_state("agent", False, False, {"remaining": ["Inspect"]}),)
+            notice = swarm_work._RepetitionNotice()
             for number in range(20):
                 path = "module" + str(number) + ".py"
                 (root / path).write_text("value = " + str(number))
                 observed = set()
                 text = swarm_work._requested_files(root, [({}, {"needs_files": [path]})], observations=observed)
                 self.assertIn("value =", text)
-                self.assertFalse(guard.stalled(state, observations={"agent": observed}))
-            for number in range(14):
-                observed = set()
-                swarm_work._requested_files(root, [({}, {"needs_files": ["missing" + str(number)]})], observations=observed)
-                self.assertFalse(observed)
-                stalled = guard.stalled(state, observations={"agent": observed})
-            self.assertTrue(stalled)
+                self.assertEqual(notice.observe(["agent", sorted(observed)]), "")
+            said = [notice.observe(["agent", "same reply"]) for _ in range(6)]
+            self.assertEqual(said[:5], [""] * 5)
+            self.assertIn("NEXUS NOTICE", said[5])
+            self.assertEqual(notice.observe(["agent", "a different reply"]), "")
 
 
 if __name__ == "__main__":

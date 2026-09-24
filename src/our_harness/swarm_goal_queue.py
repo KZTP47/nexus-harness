@@ -1065,16 +1065,27 @@ class SwarmGoalQueueStore:
             if verified:
                 current["state"] = "complete"
                 current["last_error"] = ""
+                # Agents may finish a goal no automatic check could cover; the
+                # queue still moves on, but never claims a machine check passed.
+                checked = result.get("machine_verified") is not False
+                current["verification_status"] = (
+                    "deterministically_verified" if checked else "agent_verified"
+                )
+                how = "" if checked else " (agents agreed it is done; no automatic check was available)"
                 document["cursor"] = cursor + 1
                 if document["cursor"] >= len(document["items"]):
                     document["status"] = "complete"
                     document["note"] = (
-                        f"All {len(document['items'])} board goals are verified complete."
+                        f"All {len(document['items'])} board goals are complete."
+                        + ("" if all(
+                            one.get("verification_status") != "agent_verified"
+                            for one in document["items"]
+                        ) else " Some were agreed done by the agents without an automatic check.")
                     )
                 else:
                     document["status"] = "queued"
                     document["note"] = (
-                        f"Goal {cursor + 1} is verified. Goal {cursor + 2} is the exact next goal."
+                        f"Goal {cursor + 1} is done{how}. Goal {cursor + 2} is the exact next goal."
                     )
             else:
                 current["state"] = "paused"

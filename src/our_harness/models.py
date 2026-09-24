@@ -147,6 +147,9 @@ class ProviderWorkspaceContext:
     project_path: str
     execution_path: str
     execution_mode: str = "isolated"
+    # Commands the user explicitly denied. Native CLIs that support command
+    # restrictions receive them as real rules; others are told plainly.
+    denied_commands: tuple[tuple[str, ...], ...] = ()
 
 
 @dataclass(frozen=True)

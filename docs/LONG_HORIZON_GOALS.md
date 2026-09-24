@@ -190,14 +190,20 @@ both agents' completion, and task evidence for the user's criteria. It does not
 turn arbitrary wording into a fixed set of inferred test scenarios. Configured
 commands retain their execution scope; discovered commands still require the
 user's approval and run in a disposable, protected copy of the project.
-Executable deliverables such as games, apps and scripts require executed,
-meaningful checks. If none are configured or discoverable, Nexus reports the
-missing evidence and gives the team a bounded repair task to author checks and
-expose a test command at the selected project root. File existence, an unchanged
-snapshot and agreement between agents cannot prove that an application works.
-Static document work and read-only inspection can still complete from relevant
-artifact evidence without inventing tests or unnecessary edits. Explicitly
-requested testing always needs actual execution evidence. If discovered checks
+Executed tests are required only when the user explicitly asked for tests or
+test runs ("add unit tests", "make sure the tests pass", "run the test suite",
+"build it and test it"). Nexus never infers a test requirement from wording such
+as "game", "app", "website" or "script", or from changed `.py`/`.js` files: a
+goal like "make the website footer say 2026" or "write a script that renames
+photos" in a project without tests completes on the agents' own evidence, and
+the result reports accurately that no tests ran. Negated requests ("no tests
+needed", "don't write tests") do not count. When tests were explicitly requested
+and none are configured or discoverable, Nexus reports `runtime_verification_required`
+and the team authors checks and exposes a test command at the selected project
+root. An agent's reasoned conclusion that nothing needed changing is a valid
+completion; an empty change set is recorded as `no_file_changes_recorded`, never
+a veto. Configured checks the user selected still run, and a failing one is still
+a failure. If discovered checks
 need approval, approve them in the project's settings and press **Resume team**. Resume
 adopts the current settings for that exact project, records their new fingerprint,
 and clears obsolete test observations while retaining the agents' work and chat.
@@ -214,7 +220,62 @@ No-progress fingerprints include public discussion, semantic evidence, and
 before/after content. New discussion can continue without artificial file edits.
 Fresh transaction IDs or timestamps alone are not progress. Repeated identical questions,
 handoffs, delegations, verification failures, and unchanged work are bounded,
-while genuinely changed proposals reset the relevant counter.
+while genuinely changed proposals reset the relevant counter. Repeated identical
+context-tool results do not pause a goal: after four, the agent's next context
+carries a notice that its last calls returned the same result, and the agent
+decides what to do next. Only a generous machine guard applies: after 200
+identical results in a row the goal pauses with a clear note, keeping all work,
+so a stuck loop cannot spend unlimited provider calls. Resume resets that count
+and the closeout correction count, so one more event does not re-pause at once.
+Goal agents in a private copy are told when Nexus kept ignored files (such as
+`.env`) that they deleted there; the goal note and `held_back_deletions` record
+it for the user. With `NEXUS_AGENT_GIT_HISTORY=1`, agents are told that the copy's
+read-only git history starts at `nexus/accepted-baseline` and that pushing or
+changing remotes is not part of the task. A closeout judge's
+verdict that Nexus cannot accept (for example, one that cites no concrete
+evidence for a criterion) is returned to the judge as feedback with the reason;
+after five in a row the goal pauses with a note. An approval must be
+unambiguous: a recognised approve verdict with action `complete`, or no verdict
+with `complete`; any other wording or a verdict/action conflict is treated as a
+request for changes. If Nexus itself cannot build the judge's inspection
+snapshot, the goal pauses with the verdict kept; the judge is never asked to
+"correct" a harness problem.
+
+Agent tools have generous machine-only limits: `run_command` defaults to a
+10-minute timeout and may request up to 60 minutes, returns up to 200 KB of output
+(beginning and end kept around a truncation marker, and shown to the agent as returned), and `write_file` accepts up
+to 10 million characters. Private working copies exclude dependency and cache
+trees from copying, comparison and publication, and skip links with a note. See
+[agent access](AGENT_ACCESS.md#machine-limits-for-agent-tools) for the full table.
+
+A goal records each agent's versioned provider route identity
+(`nexus/route-identity/v1`) beside its saved route binding. When only a tunable
+changes (model, effort, timeout, flags) or the provider program is updated, the
+identity is unchanged: the goal keeps running and Nexus refreshes the saved
+binding at the next quiet claim, re-tying the saved access, collaboration roles
+and private drafts exactly as a reviewed reconnect does (recorded in
+`route_tunable_refreshes`). Only a changed identity (another provider kind,
+account, endpoint or program) reports `provider_setup_changed` with
+`route_identity_changed` and waits for the user's reviewed reconnect. Goals saved
+before the identity was recorded backfill it while their binding still matches.
+
+## Limits
+
+Only limits the user set explicitly apply to a goal's lifetime. Shared and
+adaptive team goals alike have no cumulative provider-call or context-tool-call
+ceiling unless `max_provider_calls` / `max_context_tool_calls` were supplied (zero
+also means unlimited). Older goals whose saved budget recorded the former adaptive
+engine defaults (1,000 provider calls, 500 context-tool calls), or saved exactly
+those numbers before provenance was recorded, no longer enforce them; consumed
+counters are never reset. Other saved legacy ceilings are kept because they may
+have been the user's choice. Per-call safety bounds (tool time, output size,
+execution timeouts) are unchanged.
+
+Messages to an assigned agent are bounded per message (20,000 characters) and by
+unread text awaiting delivery (240,000 characters), which protects prompts and the
+machine. The lifetime history is no longer capped at 128 messages; only a runaway
+guard (50,000 messages or 50 million characters) remains, which no real goal
+reaches.
 
 Review is risk based. Broad, destructive, sensitive configuration/security,
 or previously failing changes trigger review. An independent review requires

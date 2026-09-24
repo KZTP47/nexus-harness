@@ -846,3 +846,115 @@ for (const setup of ["provider", "collaboration"]) {
     assert.equal(f.notices.at(-1), explanation);
   });
 }
+
+// A board-goal queue sends through the same compact handler as the user, but
+// the composer is the user's. The goal must go with its own words only.
+function queuedBoardGoalFixture() {
+  const f = fixture("compact");
+  f.attachment = {name: "users-own-notes.txt", type: "text/plain", size: 4, data: "data:text/plain;base64,dGVzdA=="};
+  f.context.swarmChatAttachments.set(f.key, [f.attachment]);
+  f.context.swarmChats = [];
+  f.context.countWhatIsTypedTo = () => {};
+  f.focused = 0;
+  f.box.focus = () => { f.focused += 1; };
+  f.restoredDrafts = [];
+  f.context.restoreSwarmChatDraft = (key, words) => { f.restoredDrafts.push(words); };
+  f.context.beginSwarmChatActivity = (agentId, mode, agent, words) => {
+    f.activity = {id: "queued-goal-activity", stateKey: f.key, chatKey: f.key,
+      attachmentsCleared: false, localTurns: [{who: "you", text: words}]};
+    return f.activity;
+  };
+  vm.runInContext(section("function restoreSwarmActivityDraft", "function normalizedUserQuestions"), f.context);
+  f.sendQueued = () => vm.runInContext(`sendWhatIsTypedTo(state.agent.id, "work",
+    {allowed: true, confirmed: true, boardGoal: true},
+    {queueId: "queue-portable", itemId: "item-two", text: "Ship the second board goal"})`, f.context);
+  return f;
+}
+
+test("compact: a queued board goal sends its own words and leaves the user's draft, files and keyboard alone", async () => {
+  const f = queuedBoardGoalFixture();
+  const answered = await f.sendQueued();
+  const sent = f.calls.find((one) => one.url === "/api/swarm/say");
+  assert.equal(sent.body.text, "Ship the second board goal");
+  assert.deepEqual(sent.body.attachments, [], "the user's pending files must not ride along with a queued goal");
+  assert.equal(sent.body.goal_queue_id, "queue-portable");
+  assert.equal(sent.body.goal_item_id, "item-two");
+  assert.equal(sent.draft, "Use keyboard controls too", "the composer must not be overwritten before the send");
+  assert.equal(f.box.value, "Use keyboard controls too");
+  assert.equal(f.context.swarmChatComposerDrafts.get(f.key).value, "Use keyboard controls too");
+  assert.deepEqual(f.context.swarmChatAttachments.get(f.key), [f.attachment],
+    "a successful queued goal must not clear files the user attached for their own message");
+  assert.equal(f.focused, 0);
+  assert.deepEqual(answered, {said: []});
+});
+
+test("compact: the user's own work send still takes the composer and its files (control)", async () => {
+  const f = queuedBoardGoalFixture();
+  f.inventory = [];
+  f.context.longGoals = [];
+  await vm.runInContext(`sendWhatIsTypedTo(state.agent.id, "chat")`, f.context);
+  const sent = f.calls.find((one) => one.url === "/api/swarm/say");
+  assert.equal(sent.body.text, "Use keyboard controls too");
+  assert.deepEqual(sent.body.attachments, [f.attachment]);
+  assert.equal(f.box.value, "");
+  assert.equal(f.context.swarmChatAttachments.has(f.key), false);
+});
+
+test("compact: a queued board goal that fails never puts its words into the user's composer", async () => {
+  const f = queuedBoardGoalFixture();
+  f.context.request = async (url, options = {}) => {
+    f.calls.push({url, body: options.body ? JSON.parse(options.body) : null});
+    throw new Error("The provider refused this turn.");
+  };
+  const answered = await f.sendQueued();
+  assert.equal(answered, null);
+  assert.deepEqual(f.restoredDrafts, []);
+  assert.equal(f.box.value, "Use keyboard controls too");
+  assert.deepEqual(f.context.swarmChatAttachments.get(f.key), [f.attachment]);
+  // The activity feed's own failure path restores drafts from the activity.
+  // A queued goal's activity is marked so that path leaves the composer too.
+  f.context.restoreSwarmActivityDraft(f.activity);
+  assert.deepEqual(f.restoredDrafts, []);
+  f.context.theBigOne = "";
+  f.context.restoreSwarmActivityDraft({...f.activity, leavesComposerAlone: false});
+  assert.deepEqual(f.restoredDrafts, ["Ship the second board goal"], "an ordinary activity is still restored");
+});
+
+test("compact: an answer that arrives after its chat card was closed is still returned", async () => {
+  const f = queuedBoardGoalFixture();
+  const card = f.context.theChatCardFor();
+  let closed = false;
+  const reach = f.context.request;
+  f.context.request = async (url, options) => {
+    const said = await reach(url, options);
+    if (url === "/api/swarm/say") closed = true;
+    return said;
+  };
+  f.context.theChatCardFor = () => (closed ? null : card);
+  const answered = await f.sendQueued();
+  assert.equal(closed, true);
+  assert.deepEqual(answered, {said: []},
+    "a board-goal queue waiting on this answer must see that it was answered");
+});
+
+test("finished board work says verified only when an automatic check passed", () => {
+  const context = vm.createContext({
+    normalizedParticipantOutcome() { return null; }, automaticRoundStopWords() { return ""; },
+  });
+  vm.runInContext(section("function goalAutomaticChecksPassed", "function finishLongHorizonAdmissionActivity")
+    + section("function workResponseWords", "async function resumeSwarmWork"), context);
+  const words = (answered) => context.workResponseWords(answered, "Builder", "Builder answered.");
+  const checked = words({status: "complete", goal_complete: true, verified: true, machine_verified: true,
+    verification_status: "deterministically_verified", changed: ["a.txt"]});
+  assert.match(checked, /done and the automatic checks passed/);
+  assert.match(checked, /applied 1 file change/);
+  const agreed = words({status: "complete", goal_complete: true, verified: true, machine_verified: false,
+    verification_status: "agent_verified", changed: [],
+    deterministic_verification: {status: "not_configured", requirement_contract: {planned_effect_paths: ["docs/guide.md"]},
+      requirement_evidence: {artifacts: {advisory_unmet: []}}}});
+  assert.match(agreed, /Agents agreed it is done; no automatic check was available/);
+  assert.doesNotMatch(agreed, /verified|checks passed/i);
+  assert.match(agreed, /Hint: the goal's wording mentions docs\/guide\.md/);
+  assert.equal(words({status: "incomplete"}).startsWith("The long-horizon goal is still incomplete"), true);
+  assert.equal(words({status: "", said: []}), "Builder answered.", "ordinary chat replies are unchanged");
+});

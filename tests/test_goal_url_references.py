@@ -3,7 +3,6 @@ import unittest
 from pathlib import Path
 
 from our_harness import swarm_work
-from our_harness.models import HarnessError
 
 
 class GoalURLReferenceTests(unittest.TestCase):
@@ -32,13 +31,17 @@ class GoalURLReferenceTests(unittest.TestCase):
                 self.assertFalse(any("index.html" in path or "private.py" in path or "secret.json" in path for path in paths))
 
     def test_url_does_not_hide_unsafe_local_paths(self):
+        # An unsafe spelling next to a URL is reported to the agents and never
+        # grants anything, not even the part after "//" as a top-level file.
         for path in ("../private.py", "safe/../private.py", "tests/file.py:stream", "tests//unsafe.py"):
             for quote in ("", '"', "`"):
                 with self.subTest(path=path, quote=quote):
-                    with self.assertRaises(HarnessError):
-                        swarm_work._goal_named_paths(
-                            f"Use https://example.test/docs and create {quote}{path}{quote}"
-                        )
+                    goal = f"Use https://example.test/docs and create {quote}{path}{quote}"
+                    self.assertEqual(swarm_work._goal_named_paths(goal), [])
+                    with tempfile.TemporaryDirectory() as temporary:
+                        spec = swarm_work._compile_goal_spec(Path(temporary), goal)
+                    self.assertIn(path, spec["ignored_path_tokens"])
+                    self.assertEqual(spec["write_policy"]["grants"], [])
 
 
 if __name__ == "__main__":

@@ -104,7 +104,9 @@ class LongHorizonCollaborationRecoveryTests(unittest.TestCase):
         self.assertLessEqual(len(seen), 4)
         self.assertIn("no new evidence", result["note"])
 
-    def test_tool_only_repeat_loop_pauses_durably_and_resumes_with_a_different_observation(self):
+    def test_tool_only_repeat_loop_is_a_notice_and_the_agent_keeps_control(self):
+        # Agents lead: identical tool results are reported to the agent as a
+        # notice. Nexus never pauses the goal for them.
         (self.project / "same.js").write_text("export const unchanged = true;\n")
         (self.project / "next.js").write_text("export const usefulNextStep = true;\n")
         goal = self.create("tool-only-loop")
@@ -113,33 +115,51 @@ class LongHorizonCollaborationRecoveryTests(unittest.TestCase):
         self.runtime.store._mutate(goal["goal_id"], sequence_peer)
         self.assertEqual(goal["budget"]["max_provider_calls"], 0)
         self.assertEqual(goal["budget"]["max_context_tool_calls"], 0)
-        def repeated(number, _route, _kwargs):
-            return reply("work", "I will read this source again, request " + str(number),
-                         tool_calls=[read("same.js", call_id="new-id-" + str(number))])
-        result, seen = self.run_replies(goal, repeated)
-        self.assertEqual(result["status"], "paused", result["note"])
-        self.assertEqual(len(seen), 5)
-        self.assertIn("same context-tool request", result["note"])
-        progress = result["tasks"][0]["context_progress"]
-        self.assertEqual(progress["identical_repeats"], 4)
-        self.assertEqual(result["budget"]["context_tool_calls"], 5)
-        events = self.runtime.store.events(goal["goal_id"])["events"]
-        self.assertTrue(any(one["type"] == "context_progress_paused" for one in events))
-        self.assertFalse(any(one["type"] == "task_failed" for one in events))
-        self.restart()
-        self.assertEqual(self.runtime.store.get(goal["goal_id"])["tasks"][0]["context_progress"], progress)
-        self.runtime.store.control(goal["goal_id"], "resume")
-        still_paused, repeated_seen = self.run_replies(goal, repeated)
-        self.assertEqual(still_paused["status"], "paused")
-        self.assertEqual(len(repeated_seen), 1)
-        self.runtime.store.control(goal["goal_id"], "resume")
-        complete, continued = self.run_replies(goal, [
+        repeated = [reply("work", "I will read this source again, request " + str(number),
+                          tool_calls=[read("same.js", call_id="new-id-" + str(number))]) for number in range(6)]
+        complete, seen = self.run_replies(goal, [
+            *repeated,
             reply("work", "I will inspect the other source to answer the open question.", tool_calls=[read("next.js")]),
             reply(), reply(),
         ])
         self.assertEqual(complete["status"], "complete", complete["note"])
-        self.assertIn("usefulNextStep", continued[1][1])
+        self.assertEqual(len(seen), 9)
+        self.assertTrue(any("NEXUS NOTICE" in context for _route, context in seen[4:7]))
+        self.assertIn("usefulNextStep", seen[7][1])
+        events = self.runtime.store.events(goal["goal_id"])["events"]
+        self.assertTrue(any(one["type"] == "context_progress_observed" for one in events))
+        self.assertFalse(any(one["type"] in {"context_progress_paused", "goal_paused", "task_failed"} for one in events))
         self.assertNotIn("context_progress", complete["tasks"][0])
+        self.restart()
+        self.assertEqual(self.runtime.store.get(goal["goal_id"])["status"], "complete")
+
+    def test_endless_identical_repeats_hit_the_machine_guard_and_keep_work(self):
+        # The guard is generous (hundreds of repeats); it is lowered here only
+        # to keep the test fast. It pauses with a clear note, never fails.
+        (self.project / "same.js").write_text("export const unchanged = true;\n")
+        goal = self.create("repeat-guard")
+        def sequence_peer(document, _db):
+            document["tasks"][1].update({"state": "waiting", "depends_on": [document["tasks"][0]["id"]]})
+        self.runtime.store._mutate(goal["goal_id"], sequence_peer)
+        forever = lambda *_args: reply("work", "I will read it again.", tool_calls=[read("same.js")])
+        with mock.patch.object(long_horizon, "MAX_IDENTICAL_TOOL_REPEATS", 5):
+            paused, seen = self.run_replies(goal, forever)
+        self.assertEqual(paused["status"], "paused")
+        self.assertIn("identical tool result", paused["note"])
+        self.assertLessEqual(len(seen), 8)
+        events = self.runtime.store.events(goal["goal_id"])["events"]
+        self.assertTrue(any(one["type"] == "goal_paused" and one["payload"].get("reason") == "identical_tool_repeat_guard"
+                            for one in events))
+        self.assertFalse(any(one["type"] == "task_failed" for one in events))
+        self.restart()
+        self.assertEqual(self.runtime.store.get(goal["goal_id"])["status"], "paused")
+        # Resume starts the guard's count again instead of re-pausing at once.
+        resumed = self.runtime.store.control(goal["goal_id"], "resume")
+        self.assertNotIn("context_progress", resumed["tasks"][0])
+        with mock.patch.object(long_horizon, "MAX_IDENTICAL_TOOL_REPEATS", 5):
+            continued, more = self.run_replies(goal, [forever(), reply(), reply()])
+        self.assertEqual(continued["status"], "complete", continued["note"])
+        self.assertEqual(len(more), 3)
 
     def test_targeted_user_message_refreshes_tool_progress_without_exposing_it_to_the_peer(self):
         (self.project / "same.js").write_text("export const unchanged = true;\n")
@@ -148,9 +168,14 @@ class LongHorizonCollaborationRecoveryTests(unittest.TestCase):
             document["tasks"][1].update({"state": "waiting", "depends_on": [document["tasks"][0]["id"]]})
         self.runtime.store._mutate(goal["goal_id"], sequence_peer)
         repeat = lambda *_args: reply("work", "I will inspect the same source.", tool_calls=[read("same.js")])
-        paused, _seen = self.run_replies(goal, repeat)
+        def repeat_until_the_user_pauses(number, *_args):
+            # The user, not Nexus, decides to stop the repetition here.
+            if number == 6:
+                self.runtime.store.control(goal["goal_id"], "pause")
+            return repeat()
+        paused, _seen = self.run_replies(goal, repeat_until_the_user_pauses)
         self.assertEqual(paused["status"], "paused")
-        self.assertEqual(paused["tasks"][0]["context_progress"]["identical_repeats"], 4)
+        self.assertGreaterEqual(paused["tasks"][0]["context_progress"]["identical_repeats"], 4)
         private = "Check whether the exported value is a boolean before concluding."
         self.runtime.store.control(goal["goal_id"], "message", {"task_id": paused["tasks"][0]["id"], "text": private})
         continued, contexts = self.run_replies(goal, [repeat(), reply(), reply()])
@@ -158,7 +183,8 @@ class LongHorizonCollaborationRecoveryTests(unittest.TestCase):
         self.assertIn(private, contexts[0][1])
         self.assertNotIn(private, next(context for route, context in contexts if route == "peer-route"))
         events = self.runtime.store.events(goal["goal_id"])["events"]
-        self.assertEqual(sum(one["type"] == "context_progress_paused" for one in events), 1)
+        self.assertFalse(any(one["type"] == "context_progress_paused" for one in events))
+        self.assertTrue(any(one["type"] == "context_progress_observed" for one in events))
 
     def test_distinct_tool_only_exploration_remains_open_until_agents_complete(self):
         for number in range(12):
@@ -225,7 +251,7 @@ class LongHorizonCollaborationRecoveryTests(unittest.TestCase):
         self.runtime.store._mutate(goal["goal_id"], old_verification)
         self.restart()
         resumed = self.runtime.store.control(goal["goal_id"], "resume")
-        self.assertEqual(resumed["verification_contract"]["schema_version"], 4)
+        self.assertEqual(resumed["verification_contract"]["schema_version"], goal_verification.SCHEMA_VERSION)
         self.assertEqual(resumed["verification_contract"]["test_commands"], [command])
         self.assertEqual(resumed["tasks"][1]["context_steps"][0]["state"], "superseded")
         seen = []

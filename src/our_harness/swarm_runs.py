@@ -122,12 +122,17 @@ class _ProviderResourceStore:
     @contextmanager
     def resource(
         self, run_id: str, route: str, conversation_key: str,
-        timeout: float = 180.0,
+        timeout: float | None = 180.0,
+        checkpoint: Callable[[], None] | None = None,
     ) -> Iterator[str]:
         key = hashlib.sha256(f"{route}\0{conversation_key}".encode()).hexdigest()
         began = time.monotonic()
+        pause = 0.05
         while True:
+            if checkpoint is not None:
+                checkpoint()
             with self._tx() as db:
+                _release_leftovers(db, self.database)
                 held = db.execute(
                     "SELECT * FROM resources WHERE resource_key=?", (key,)
                 ).fetchone()
@@ -143,17 +148,19 @@ class _ProviderResourceStore:
                         ),
                     )
                     break
-            if time.monotonic() - began >= timeout:
+            if timeout is not None and time.monotonic() - began >= timeout:
                 raise HarnessError("The selected provider conversation is busy in another Swarm run")
-            time.sleep(0.05)
+            time.sleep(pause)
+            if timeout is None:
+                pause = min(0.5, pause * 1.5)
         try:
             yield key
         finally:
-            with self._tx() as db:
-                db.execute(
-                    "DELETE FROM resources WHERE resource_key=? AND run_id=? AND owner_pid=? AND owner_token=?",
-                    (key, run_id, os.getpid(), _process_token(os.getpid())),
-                )
+            # Retries a busy database and never replaces the exception that
+            # ended the turn; an unreleased row is removed by the next poll.
+            _delete_lease_quietly(
+                self, key, os.getpid(), _process_token(os.getpid()), run_id=run_id,
+            )
 
 
 def _canonical(value: object) -> str:
@@ -1963,26 +1970,43 @@ class SwarmRunStore:
                 self._release_board_lease(db, str(row["run_id"]))
 
     @contextmanager
-    def resource(self, run_id: str, route: str, conversation_key: str, timeout: float = 180.0) -> Iterator[str]:
+    def resource(
+        self, run_id: str, route: str, conversation_key: str,
+        timeout: float | None = 180.0,
+        checkpoint: Callable[[], None] | None = None,
+    ) -> Iterator[str]:
+        """Hold one exclusive provider resource lease.
+
+        ``timeout=None`` queues until the lease frees (a crashed owner is
+        reclaimed); ``checkpoint`` runs on every poll so Stop still wins.
+        A finite timeout is kept only for callers that must fail fast, such
+        as the whole-turn lease that refuses a duplicate send.
+        """
         key = hashlib.sha256(f"{route}\0{conversation_key}".encode()).hexdigest()
         began = time.monotonic()
+        pause = 0.05
         while True:
+            if checkpoint is not None:
+                checkpoint()
             with self._tx() as db:
+                _release_leftovers(db, self.database)
                 held = db.execute("SELECT * FROM resources WHERE resource_key=?", (key,)).fetchone()
                 if not held or not _owner_is_alive(int(held["owner_pid"]), str(held["owner_token"])):
                     db.execute("INSERT OR REPLACE INTO resources(resource_key,run_id,owner_pid,owner_token,acquired_ms) VALUES(?,?,?,?,?)", (key, run_id, os.getpid(), _process_token(os.getpid()), int(time.time()*1000)))
                     break
-            if time.monotonic() - began >= timeout:
+            if timeout is not None and time.monotonic() - began >= timeout:
                 raise HarnessError("The selected provider conversation is busy in another Swarm run")
-            time.sleep(0.05)
+            time.sleep(pause)
+            if timeout is None:
+                pause = min(0.5, pause * 1.5)
         try:
             yield key
         finally:
-            with self._tx() as db:
-                db.execute(
-                    "DELETE FROM resources WHERE resource_key=? AND run_id=? AND owner_pid=? AND owner_token=?",
-                    (key, run_id, os.getpid(), _process_token(os.getpid())),
-                )
+            # Retries a busy database and never replaces the exception that
+            # ended the turn; an unreleased row is removed by the next poll.
+            _delete_lease_quietly(
+                self, key, os.getpid(), _process_token(os.getpid()), run_id=run_id,
+            )
 
     @contextmanager
     def conversation_turn(
@@ -2129,7 +2153,15 @@ def _provider_capacity_slot(
     store: object, run_id: str, project_scope: str, profile_id: str,
     maximum: int, timeout: float,
 ) -> Iterator[str]:
-    """Claim one configured provider slot using the crash-fenced lease table."""
+    """Claim one configured provider slot, first come first served.
+
+    Every claimer takes a ticket in the crash-fenced lease table first, and a
+    freed slot goes to the oldest live ticket. Without the queue, a waiter
+    polling every few hundred milliseconds could lose every freed slot to a
+    loop that re-claimed within milliseconds, so it could wait until Stop.
+    Waiting never fails the turn; Stop and cancellation are checked on every
+    poll, and a crashed holder or waiter is reclaimed.
+    """
 
     count = max(1, min(32, int(maximum)))
     keys = [
@@ -2140,50 +2172,147 @@ def _provider_capacity_slot(
         ).hexdigest()
         for slot in range(count)
     ]
-    began = time.monotonic()
+    del timeout  # Kept in the capacity tuple for callers; the wait is unbounded.
+    domain = hashlib.sha256(
+        f"nexus-provider-profile-queue-v1\0{project_scope}\0{profile_id}".encode("utf-8")
+    ).hexdigest()
+    ticket_prefix = f"capacity-ticket:{domain}:"
+    # Zero-padded wall-clock nanoseconds order tickets across processes on
+    # one machine; the random suffix keeps simultaneous tickets distinct.
+    ticket = f"{ticket_prefix}{time.time_ns():020d}:{uuid.uuid4().hex}"
+    pause = 0.05
     pid = os.getpid()
     owner_token = _process_token(pid)
     claimed = ""
-    while not claimed:
-        _capacity_checkpoint(store, run_id)
-        # Both SwarmRunStore and its lightweight unscoped counterpart expose
-        # the same private transactional resource table boundary.
-        with store._tx() as db:  # type: ignore[attr-defined]
-            for key in keys:
-                held = db.execute(
-                    "SELECT * FROM resources WHERE resource_key=?", (key,)
-                ).fetchone()
-                if held and _owner_is_alive(
-                    int(held["owner_pid"]), str(held["owner_token"])
-                ):
-                    continue
+    with store._tx() as db:  # type: ignore[attr-defined]
+        db.execute(
+            "INSERT OR REPLACE INTO resources"
+            "(resource_key,run_id,owner_pid,owner_token,acquired_ms) "
+            "VALUES(?,?,?,?,?)",
+            (ticket, run_id, pid, owner_token, int(time.time() * 1000)),
+        )
+    try:
+        while not claimed:
+            _capacity_checkpoint(store, run_id)
+            # Both SwarmRunStore and its lightweight unscoped counterpart expose
+            # the same private transactional resource table boundary.
+            candidate = ""
+            with store._tx() as db:  # type: ignore[attr-defined]
+                _release_leftovers(db, getattr(store, "database", ""))
+                now_ms = int(time.time() * 1000)
+                # Heartbeat: a ticket whose waiter stopped polling (its
+                # cleanup failed, or its thread is gone) goes stale even
+                # while its process lives, so it can never block the queue.
                 db.execute(
                     "INSERT OR REPLACE INTO resources"
                     "(resource_key,run_id,owner_pid,owner_token,acquired_ms) "
                     "VALUES(?,?,?,?,?)",
-                    (key, run_id, pid, owner_token, int(time.time() * 1000)),
+                    (ticket, run_id, pid, owner_token, now_ms),
                 )
-                claimed = key
+                waiting = []
+                for row in db.execute(
+                    "SELECT * FROM resources WHERE resource_key >= ? AND resource_key < ? "
+                    "ORDER BY resource_key",
+                    (ticket_prefix, ticket_prefix + "\uffff"),
+                ).fetchall():
+                    if row["resource_key"] == ticket or (
+                        now_ms - int(row["acquired_ms"]) < _TICKET_STALE_MS
+                        and _owner_is_alive(int(row["owner_pid"]), str(row["owner_token"]))
+                    ):
+                        waiting.append(str(row["resource_key"]))
+                    else:
+                        db.execute(
+                            "DELETE FROM resources WHERE resource_key=?",
+                            (row["resource_key"],),
+                        )
+                free = []
+                for key in keys:
+                    held = db.execute(
+                        "SELECT * FROM resources WHERE resource_key=?", (key,)
+                    ).fetchone()
+                    if not held or not _owner_is_alive(
+                        int(held["owner_pid"]), str(held["owner_token"])
+                    ):
+                        free.append(key)
+                position = waiting.index(ticket) if ticket in waiting else 0
+                if position < len(free):
+                    db.execute(
+                        "INSERT OR REPLACE INTO resources"
+                        "(resource_key,run_id,owner_pid,owner_token,acquired_ms) "
+                        "VALUES(?,?,?,?,?)",
+                        (free[0], run_id, pid, owner_token, int(time.time() * 1000)),
+                    )
+                    db.execute("DELETE FROM resources WHERE resource_key=?", (ticket,))
+                    candidate = free[0]
+            # Only a committed claim counts: if the commit fails, the rollback
+            # restores this ticket and the finally below must still remove it.
+            claimed = candidate
+            if claimed:
                 break
-        if claimed:
-            break
-        if time.monotonic() - began >= max(1.0, float(timeout)):
-            raise HarnessError(
-                f"Provider profile {profile_id} is still at its configured capacity "
-                f"of {count} concurrent request{'s' if count != 1 else ''}. "
-                "The queued chat was left intact; try again after another answer finishes."
-            )
-        time.sleep(0.05)
+            time.sleep(pause)
+            pause = min(0.25, pause * 1.5)
+    finally:
+        if not claimed:
+            # Never replace the original exception (for example Stop): an
+            # undeleted ticket stops heartbeating and expires on its own.
+            _delete_lease_quietly(store, ticket, pid, owner_token)
     try:
         _capacity_checkpoint(store, run_id)
         yield claimed
     finally:
-        with store._tx() as db:  # type: ignore[attr-defined]
-            db.execute(
-                "DELETE FROM resources WHERE resource_key=? AND run_id=? "
-                "AND owner_pid=? AND owner_token=?",
-                (claimed, run_id, pid, owner_token),
-            )
+        _delete_lease_quietly(store, claimed, pid, owner_token, run_id=run_id)
+
+
+# A waiter heartbeats its ticket on every poll (at most every 0.25 s); one not
+# refreshed for this long has no live waiter behind it.
+_TICKET_STALE_MS = 30_000
+
+
+def _delete_lease_quietly(
+    store: object, key: str, pid: int, owner_token: str, *, run_id: str | None = None,
+) -> bool:
+    """Release one lease, retrying a busy database; never raise."""
+
+    for attempt in range(3):
+        try:
+            with store._tx() as db:  # type: ignore[attr-defined]
+                if run_id is None:
+                    db.execute(
+                        "DELETE FROM resources WHERE resource_key=? AND owner_pid=? "
+                        "AND owner_token=?", (key, pid, owner_token),
+                    )
+                else:
+                    db.execute(
+                        "DELETE FROM resources WHERE resource_key=? AND run_id=? "
+                        "AND owner_pid=? AND owner_token=?", (key, run_id, pid, owner_token),
+                    )
+            return True
+        except (sqlite3.Error, OSError):
+            time.sleep(0.1 * (attempt + 1))
+    # A slot row has no heartbeat, so remember it: the next claimer in this
+    # process removes it inside its own transaction.
+    with _UNRELEASED_LOCK:
+        _UNRELEASED.add((str(getattr(store, "database", "")), key, pid, owner_token))
+    return False
+
+
+_UNRELEASED: set[tuple[str, str, int, str]] = set()
+_UNRELEASED_LOCK = threading.Lock()
+
+
+def _release_leftovers(db: sqlite3.Connection, database: object) -> None:
+    """Remove this process's unreleased leases from the same database."""
+    where = str(database or "")
+    with _UNRELEASED_LOCK:
+        leftovers = [one for one in _UNRELEASED if one[0] == where]
+    for one in leftovers:
+        _where, key, pid, owner_token = one
+        db.execute(
+            "DELETE FROM resources WHERE resource_key=? AND owner_pid=? AND owner_token=?",
+            (key, pid, owner_token),
+        )
+        with _UNRELEASED_LOCK:
+            _UNRELEASED.discard(one)
 
 
 def _provider_effect_key(route: str, conversation_key: str, digest: str) -> str:
@@ -2232,9 +2361,13 @@ def provider_effect(
     store = current[0] if current else _unscoped_store(config)
     run_id = current[1] if current else f"unscoped-{os.getpid()}-{uuid.uuid4().hex}"
     capacity = _provider_capacity_spec(config, route)
+    # A web conversation stays single-flight (one visible provider thread),
+    # but a turn waiting behind another one queues instead of failing.
     with store.resource(
         run_id, route,
         _provider_resource_conversation_key(route, conversation_key, digest),
+        timeout=None,
+        checkpoint=lambda: _capacity_checkpoint(store, run_id),
     ):
         capacity_scope = (
             _provider_capacity_slot(store, run_id, *capacity)

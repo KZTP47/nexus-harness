@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import ast
+import json
 import os
 import re
+import subprocess
 from importlib.resources import files
 from pathlib import Path
 from typing import Any, Iterable
@@ -75,7 +77,193 @@ def _result(mode: str, scanned_files: int, syntax_ok: bool, findings: list[dict[
     }
 
 
+# Bound at import: a build script that fakes its own ``subprocess.run`` calls
+# (node, electron-builder) must not answer, or swallow the answers meant for,
+# the audit's Git query.
+_run_git = subprocess.run
+
+
+def _git_ignored(root: Path) -> set[str] | None:
+    """Paths under ``root`` that Git ignores, or None when Git cannot say.
+
+    Ignored directories are reported once, with a trailing slash. Anything
+    that stops Git from answering (no Git, not a work tree, a timeout)
+    returns None; the caller then skips nothing, so the audit fails closed.
+    """
+    try:
+        inside = _run_git(
+            ["git", "-C", str(root), "rev-parse", "--is-inside-work-tree"],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        if inside.returncode != 0 or inside.stdout.strip() != "true":
+            return None
+        listed = _run_git(
+            ["git", "-C", str(root), "ls-files", "-z", "--others", "--ignored",
+             "--exclude-standard", "--directory", "--", "."],
+            capture_output=True, timeout=120, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if listed.returncode != 0:
+        return None
+    return {
+        entry for entry in listed.stdout.decode("utf-8", errors="surrogateescape").split("\0")
+        if entry
+    }
+
+
+def _glob_pattern(pattern: str) -> re.Pattern[str]:
+    """An electron-builder style glob (``**``, ``*``, ``?``) as a regex."""
+
+    out = ""
+    index = 0
+    while index < len(pattern):
+        if pattern.startswith("**/", index):
+            out += "(?:.*/)?"
+            index += 3
+        elif pattern.startswith("**", index):
+            out += ".*"
+            index += 2
+        elif pattern[index] == "*":
+            out += "[^/]*"
+            index += 1
+        elif pattern[index] == "?":
+            out += "[^/]"
+            index += 1
+        else:
+            out += re.escape(pattern[index])
+            index += 1
+    return re.compile(out)
+
+
+def _joined(base: str, relative: str) -> str | None:
+    """``relative`` resolved from the repository-relative folder ``base``."""
+
+    parts = [part for part in base.split("/") if part]
+    for part in relative.replace("\\", "/").split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if not parts:
+                return None
+            parts.pop()
+        else:
+            parts.append(part)
+    return "/".join(parts)
+
+
+class _ShippedTrees:
+    """What the packagers copy straight from the working tree.
+
+    They copy files, not Git's index: ``scripts/build_zipapp.py`` copies
+    ``src`` minus its own ignore patterns, and electron-builder copies
+    ``desktop/package.json``'s ``build.files`` plus every ``extraResources``
+    source through that entry's ``filter``. A file Git ignores inside what one
+    of them copies still ships.
+    """
+
+    # scripts/build_zipapp.py: shutil.ignore_patterns("__pycache__", "*.pyc",
+    # "*.pyo", "*.egg-info", "build", "dist") applied to every path component.
+    _ZIPAPP_LEAVES_OUT = re.compile(
+        r"(?:.*/)?(?:__pycache__|[^/]*\.egg-info|build|dist)(?:/.*)?|(?:.*/)?[^/]*\.py[co]"
+    )
+
+    def __init__(self, root: Path) -> None:
+        # (folder prefix, filter patterns that must match, patterns that must not)
+        self.copies: list[tuple[str, list[re.Pattern[str]], list[re.Pattern[str]]]] = [
+            ("src/", [], [self._ZIPAPP_LEAVES_OUT]),
+        ]
+        self.exact: set[str] = set()
+        self.included: list[re.Pattern[str]] = []
+        self.excluded: list[re.Pattern[str]] = []
+        self.literal_starts: list[str] = []
+        try:
+            manifest = json.loads((root / "desktop" / "package.json").read_text(encoding="utf-8"))
+            build = manifest.get("build") if isinstance(manifest, dict) else None
+        except (OSError, ValueError):
+            build = None
+        if not isinstance(build, dict):
+            # Without a readable desktop manifest, still count what it has
+            # always shipped: all of ``src`` and two files outside it.
+            self.copies.append(("src/", [], []))
+            self.exact.update({"scripts/harness.py", "THIRD_PARTY_NOTICES.md"})
+            return
+        for entry in build.get("files") or []:
+            if not isinstance(entry, str) or not entry:
+                continue
+            negated = entry.startswith("!")
+            pattern = _joined("desktop", entry[1:] if negated else entry)
+            if pattern is None:
+                continue
+            (self.excluded if negated else self.included).append(_glob_pattern(pattern))
+            if not negated:
+                self.literal_starts.append(re.split(r"[*?]", pattern, maxsplit=1)[0])
+        for entry in build.get("extraResources") or []:
+            source = entry.get("from") if isinstance(entry, dict) else entry
+            if not isinstance(source, str) or not source:
+                continue
+            target = _joined("desktop", source)
+            if not target:
+                continue
+            if not (root / target).is_dir():
+                self.exact.add(target)
+                continue
+            wanted: list[re.Pattern[str]] = []
+            unwanted: list[re.Pattern[str]] = []
+            rules = entry.get("filter") if isinstance(entry, dict) else None
+            for rule in ([rules] if isinstance(rules, str) else rules or []):
+                if isinstance(rule, str) and rule:
+                    if rule.startswith("!"):
+                        unwanted.append(_glob_pattern(rule[1:]))
+                    else:
+                        wanted.append(_glob_pattern(rule))
+            self.copies.append((f"{target}/", wanted, unwanted))
+
+    def ships(self, label: str) -> bool:
+        if label in self.exact:
+            return True
+        for prefix, wanted, unwanted in self.copies:
+            if not label.startswith(prefix):
+                continue
+            inside = label[len(prefix):]
+            if ((not wanted or any(pattern.fullmatch(inside) for pattern in wanted))
+                    and not any(pattern.fullmatch(inside) for pattern in unwanted)):
+                return True
+        return (any(pattern.fullmatch(label) for pattern in self.included)
+                and not any(pattern.fullmatch(label) for pattern in self.excluded))
+
+    def may_contain(self, folder: str) -> bool:
+        """Whether a shipped file could lie inside ``folder`` (ending in ``/``)."""
+
+        starts = [*(prefix for prefix, _wanted, _unwanted in self.copies),
+                  *self.exact, *self.literal_starts]
+        return any(one.startswith(folder) or folder.startswith(one) for one in starts)
+
+
+# Ignored on purpose and shipped on purpose: the exact commit/build label the
+# release build writes from tracked sources. Still scanned for machine paths.
+GENERATED_SHIPPED_INPUTS = {"desktop/build-info.json"}
+
+
+def _is_ignored(label: str, ignored: set[str]) -> bool:
+    if label in ignored:
+        return True
+    parts = label.rstrip("/").split("/")
+    return any("/".join(parts[:count]) + "/" in ignored for count in range(1, len(parts)))
+
+
 def audit_distribution(root: Path) -> dict[str, Any]:
+    """Audit what a release built from this working tree could carry.
+
+    Everything is scanned except the generated and third-party trees named in
+    ``EXCLUDED_PARTS``. In a Git checkout, files Git ignores are skipped only
+    outside the trees the packagers copy (``_ShippedTrees``): a scratch clone
+    at the repository root never ships. An ignored file inside a shipped tree
+    (a local ``.env``, a dump under ``src``) does ship, so it is still scanned
+    and also reported as "ignored file would ship". When Git cannot say what
+    is ignored, nothing is skipped.
+    """
+
     root = root.resolve()
     findings: list[dict[str, str]] = []
     package_root = root / "src" / "our_harness"
@@ -84,13 +272,31 @@ def audit_distribution(root: Path) -> dict[str, Any]:
         return _result("source", 0, False, findings)
     scanned_files = 0
     syntax_ok = True
+    ignored = _git_ignored(root)
+    shipped = _ShippedTrees(root)
     for directory, subdirectories, filenames in os.walk(root, followlinks=False):
-        subdirectories[:] = [name for name in subdirectories if name not in EXCLUDED_PARTS]
+        relative = Path(directory).relative_to(root).as_posix()
+        prefix = "" if relative == "." else f"{relative}/"
+        subdirectories[:] = [
+            name for name in subdirectories
+            if name not in EXCLUDED_PARTS and not (
+                ignored is not None
+                and _is_ignored(f"{prefix}{name}/", ignored)
+                and not shipped.may_contain(f"{prefix}{name}/")
+            )
+        ]
         for filename in filenames:
             path = Path(directory) / filename
-            if not path.is_file() or path.suffix.lower() not in TEXT_SUFFIXES:
+            if not path.is_file():
                 continue
             label = path.relative_to(root).as_posix()
+            if ignored is not None and _is_ignored(label, ignored):
+                if not shipped.ships(label):
+                    continue
+                if label not in GENERATED_SHIPPED_INPUTS:
+                    findings.append({"path": label, "line": "0", "message": "ignored file would ship"})
+            if path.suffix.lower() not in TEXT_SUFFIXES:
+                continue
             if (label in RECORDED_AUDIT_NOTES or label in NON_DISTRIBUTABLE_PROJECT_FILES
                     or filename.endswith((".test.js", ".test.cjs"))):
                 continue

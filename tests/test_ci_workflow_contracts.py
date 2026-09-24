@@ -153,6 +153,18 @@ def steps_in(job: str) -> list[str]:
 
 
 class WorkflowCoverageContractsTests(unittest.TestCase):
+    def test_every_desktop_build_installs_the_distribution_gate_first(self):
+        # build_windows_desktop.py imports our_harness.distribution_gate, which
+        # needs LangGraph; a job that builds without it fails before packaging.
+        builds = [
+            (jobs_in((WORKFLOWS / "checks.yml").read_text(encoding="utf-8"))["desktop"], "npm run build -- --win dir"),
+            ((WORKFLOWS / "windows-release.yml").read_text(encoding="utf-8"), "npm run build -- --win nsis"),
+        ]
+        for source, build in builds:
+            with self.subTest(build=build):
+                self.assertIn("langgraph>=1.2.11,<2", source)
+                self.assertLess(source.index("langgraph>=1.2.11,<2"), source.index(build))
+
     def test_desktop_browser_tests_run_after_the_exact_runtime_is_built(self):
         desktop = jobs_in((WORKFLOWS / "checks.yml").read_text(encoding="utf-8"))["desktop"]
         self.assertLess(desktop.index("npm run build -- --win dir"), desktop.index("run: npm test"))

@@ -81,6 +81,139 @@ A_NO_IS_WORTH_MENTIONING_FOR = 24 * 60 * 60
 FAILURE_CONTEXT_VERSION = 1
 PROVIDER_PRINCIPAL_VERSION = 1
 PROVIDER_PRINCIPAL_CONTRACT = "nexus/provider-principal/v1"
+# Which provider a saved conversation belongs to, separated from how that
+# provider is tuned. The route fingerprint above hashes the whole profile, so
+# on its own it cannot tell "the user picked another model" from "this route
+# now signs in to another account". The identity digest covers only what
+# decides who answers: the route name, the provider kind, the endpoint
+# authority, the credential slot and account scope, and the configured program
+# (the first word of its command, not where PATH currently resolves it or what
+# version it reports). Everything in ROUTE_TUNABLE_FIELDS - model, effort,
+# timeouts, flags, output caps, concurrency and similar - is a tunable: a
+# change there is applied from the next turn and never pauses a chat.
+#
+# v2 adds account selectors carried in the command line or environment
+# settings (``--profile other``, ``--account``, ``--config`` pointing at
+# another profile, ``--api-key-env``, ``CODEX_HOME=...``-style overrides):
+# v1 treated every flag as a tunable, so such a switch continued silently.
+# Model, effort, timeout and output flags remain tunables.
+#
+# v3 inverts that deny-list into an allow-list: the whole command line
+# (program, positional words and every flag), the argument list, environment
+# settings and, for the local provider, its execution block are identity,
+# minus only flags known to tune an answer for that provider kind (model,
+# reasoning effort, output format, verbosity, timeouts). A wrapper or bridge
+# (``python bridge_x.py``, ``npx -y pkg``, ``ssh host``, ``wsl -d distro``)
+# and an unknown flag therefore count as a different provider. For
+# ``assistant-cli`` and ``local`` nothing is known to be tunable, so the whole
+# argv is identity. v1/v2 are kept only to recognise and migrate old records.
+#
+# v4 strips tunable flags only after the kind's own program (``claude``,
+# ``codex``, ...) in the command, so a wrapper's ``-m``/``--model`` (``python
+# -m bridge_a``) stays identity; a tunable flag never swallows a following
+# flag as its value; the endpoint's username and non-credential query
+# parameters (``?tenant=``) are identity; and a missing command means the
+# kind's default program.
+#
+# v5 accepts the program word only at ``command[0]`` or as the target of a
+# known launcher (``npx``/``bunx``/``pnpm dlx``/``yarn dlx``, ``node``,
+# ``cmd /c``, ``wsl ... --``/``-e``); an ssh host, docker container or wsl
+# distro that happens to be called ``codex`` is not the program. It also
+# recognises ``@scope/pkg@version`` package specs, npm-vendored binaries
+# (``codex-x86_64-pc-windows-msvc.exe``) and ``node .../<pkg>/cli.js``. When
+# the command has no recognised program, its ``arguments`` go to something
+# else and are identity as a whole too.
+ROUTE_IDENTITY_VERSION = 5
+ROUTE_IDENTITY_CONTRACT = "nexus/route-identity/v5"
+ROUTE_IDENTITY_CONTRACTS = {
+    1: "nexus/route-identity/v1",
+    2: "nexus/route-identity/v2",
+    3: "nexus/route-identity/v3",
+    4: "nexus/route-identity/v4",
+    5: "nexus/route-identity/v5",
+}
+CLI_PACKAGES_BY_KIND = {
+    "claude-cli": frozenset({"@anthropic-ai/claude-code"}),
+    "codex-cli": frozenset({"@openai/codex"}),
+    "gemini-cli": frozenset({"@google/gemini-cli"}),
+    "copilot-cli": frozenset({"@github/copilot"}),
+}
+_PACKAGE_LAUNCHERS = frozenset({"npx", "bunx"})
+_DLX_LAUNCHERS = frozenset({"pnpm", "yarn"})
+# The program each CLI kind runs by default; tunable flags are recognised only
+# after the first command word with this basename.
+CLI_PROGRAM_BY_KIND = {
+    "claude-cli": "claude", "codex-cli": "codex", "gemini-cli": "gemini",
+    "copilot-cli": "copilot",
+}
+_SECRET_QUERY_NAME = re.compile(
+    r"(key|token|secret|password|passwd|pwd|sig|signature|auth|credential|code|session)",
+    re.IGNORECASE,
+)
+_TUNABLE_ENV_NAME = re.compile(r"^[A-Z0-9_]*_(MODEL|REASONING_EFFORT)$")
+# flag -> whether it takes a value. ``--flag=value`` is also recognised.
+_COMMON_TUNABLE_FLAGS = {
+    "--model": True, "--reasoning-effort": True, "--timeout": True,
+    "--verbose": False, "--quiet": False,
+}
+TUNABLE_FLAGS_BY_KIND: dict[str, dict[str, bool]] = {
+    "claude-cli": {
+        **_COMMON_TUNABLE_FLAGS, "-p": False, "--print": False,
+        "--output-format": True, "--input-format": True, "--max-turns": True,
+        "--effort": True, "--fallback-model": True,
+        "--no-session-persistence": False, "--include-partial-messages": False,
+        "--permission-mode": True, "--append-system-prompt": True,
+    },
+    "codex-cli": {
+        **_COMMON_TUNABLE_FLAGS, "-m": True, "--json": False, "-q": False,
+        "--color": True,
+    },
+    "gemini-cli": {
+        **_COMMON_TUNABLE_FLAGS, "-m": True, "--output-format": True,
+    },
+    "copilot-cli": {
+        **_COMMON_TUNABLE_FLAGS, "-s": False, "--silent": False,
+        "--no-banner": False, "--no-color": False,
+    },
+}
+# Kinds whose command line is entirely identity.
+WHOLE_ARGV_IDENTITY_KINDS = frozenset({"assistant-cli", "local"})
+# Long flags that choose which account, profile, credential or config home a
+# CLI uses. Matched on the flag name, with ``--flag value`` or ``--flag=value``.
+ACCOUNT_SELECTOR_FLAGS = frozenset({
+    "--profile", "--account", "--user", "--login", "--org", "--organization",
+    "--tenant", "--project", "--config", "--config-dir", "--config-file",
+    "--config-home", "--settings", "--settings-file", "--home", "--api-key",
+    "--api-key-env", "--auth", "--auth-file", "--auth-mode", "--credentials",
+    "--credentials-file", "--token", "--token-file", "--endpoint", "--base-url",
+    "--api-base", "--host", "--provider", "--model-provider", "--env",
+})
+# Short spellings are only unambiguous per tool: ``-p`` is Codex's
+# ``--profile`` but Claude's ``--print``.
+ACCOUNT_SELECTOR_SHORT_FLAGS = {
+    "codex-cli": frozenset({"-p", "-c"}),
+}
+# ``--config key=value`` overrides that only tune an answer.
+TUNABLE_CONFIG_KEYS = frozenset({
+    "model", "model_reasoning_effort", "model_reasoning_summary",
+    "model_verbosity", "reasoning_effort", "hide_agent_reasoning",
+    "show_raw_agent_reasoning", "model_max_output_tokens",
+    "model_context_window", "stream_idle_timeout_ms", "request_max_retries",
+    "stream_max_retries", "temperature", "max_output_tokens", "timeout",
+})
+_ACCOUNT_SELECTOR_ENV = re.compile(
+    r"^(HOME|USERPROFILE|APPDATA|LOCALAPPDATA|XDG_[A-Z0-9_]+|[A-Z0-9_]*("
+    r"_HOME|_CONFIG_DIR|_CONFIG|_CONFIG_FILE|_PROFILE|_API_KEY|_KEY|_TOKEN|"
+    r"_ACCOUNT|_BASE_URL|_ENDPOINT|_PROJECT|_ORG|_ORGANIZATION|_TENANT|"
+    r"_CREDENTIALS|_AUTH))$"
+)
+ROUTE_TUNABLE_FIELDS = frozenset({
+    "model", "reasoning_effort", "timeout_seconds", "arguments", "temperature",
+    "max_output_tokens", "role_output_caps", "prompt_cache_key",
+    "prompt_cache_retention", "max_concurrency", "pricing_ref",
+    "allow_project_graphs", "max_data_class", "api_mode", "time_zone",
+    "label", "display_name", "description", "notes",
+})
 PROVIDER_TRANSPORT_CONTRACT_REVISIONS: dict[str, str] = {
     "codex-cli": "codex-cli/isolated-exec/v1",
     "claude-cli": "claude-cli/subscription-exec/v1",
@@ -941,6 +1074,335 @@ def _route_failure_context(
         "provider_principal_version": PROVIDER_PRINCIPAL_VERSION,
         "provider_principal_fingerprint_sha256": principal_fingerprint,
         "provider_principal_contract": PROVIDER_PRINCIPAL_CONTRACT,
+    }
+
+
+def _route_profile(config: LoadedConfig, route: str) -> tuple[str, dict[str, Any], str]:
+    named = str(route or "").strip()
+    routes = config.get("providers", {}) or {}
+    profile = routes.get(named) if isinstance(routes, dict) else None
+    if not isinstance(profile, dict) and named in ("", "default"):
+        profile = config.get("provider", {}) or {}
+    if not isinstance(profile, dict):
+        profile = {}
+    kind = str(profile.get("kind") or profile.get("name") or "").strip()
+    if named.startswith("web:"):
+        kind = "web-chat"
+    return named, profile, kind
+
+
+def _selector_env(name: object) -> bool:
+    return bool(_ACCOUNT_SELECTOR_ENV.fullmatch(str(name or "").strip().upper()))
+
+
+def route_account_selectors(config: LoadedConfig, route: str) -> list[list[str]]:
+    """Account/profile/config-home selectors in a route's argv or env settings.
+
+    Returned for hashing only (they may include a key); never persisted.
+    """
+
+    _named, profile, kind = _route_profile(config, route)
+    short = ACCOUNT_SELECTOR_SHORT_FLAGS.get(kind, frozenset())
+    found: list[list[str]] = []
+    command = profile.get("command")
+    arguments = profile.get("arguments")
+    for source, words in (
+        ("command", command[1:] if isinstance(command, (list, tuple)) else []),
+        ("arguments", arguments if isinstance(arguments, (list, tuple)) else []),
+    ):
+        words = [str(one) for one in words]
+        at = 0
+        while at < len(words):
+            word = words[at]
+            flag, joined, value = word.partition("=")
+            if flag.startswith("--"):
+                name = flag.lower()
+            elif flag in short:
+                name = flag
+            else:
+                name = ""
+                # A bare NAME=VALUE word (``env CODEX_HOME=... codex``).
+                if joined and _selector_env(flag):
+                    found.append([source, "env", flag.upper(), value])
+            if name and (name in ACCOUNT_SELECTOR_FLAGS or name in short):
+                if not joined:
+                    following = words[at + 1] if at + 1 < len(words) else ""
+                    if following and not following.startswith("-"):
+                        value = following
+                        at += 1
+                if name in {"--config", "-c"} and "=" in value:
+                    key = value.split("=", 1)[0].strip().strip('"').lower()
+                    if key in TUNABLE_CONFIG_KEYS:
+                        at += 1
+                        continue
+                if name in {"--env", "-e"} and "=" in value:
+                    env_name = value.split("=", 1)[0]
+                    if not _selector_env(env_name):
+                        at += 1
+                        continue
+                found.append([source, name, value])
+            at += 1
+    for key in ("env", "environment"):
+        held = profile.get(key)
+        if isinstance(held, dict):
+            for env_name, value in sorted(held.items(), key=lambda one: str(one[0])):
+                if _selector_env(env_name):
+                    found.append([key, "env", str(env_name).upper(), str(value)])
+    return found
+
+
+def _program_name(word: str) -> str:
+    name = word.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    for suffix in (".exe", ".cmd", ".bat", ".ps1", ".js", ".mjs"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
+def _is_program(kind: str, word: str) -> bool:
+    """Whether one command word is the kind's own CLI (v5 spellings)."""
+
+    program = CLI_PROGRAM_BY_KIND.get(kind)
+    if not program:
+        return False
+    text = word.replace("\\", "/")
+    packages = CLI_PACKAGES_BY_KIND.get(kind, frozenset())
+    # ``@openai/codex@latest`` -> ``@openai/codex``; ``codex@1.2`` -> ``codex``.
+    spec = text[1:].split("@", 1)[0] if text.startswith("@") else text.split("@", 1)[0]
+    spec = "@" + spec if text.startswith("@") else spec
+    if spec.lower() in packages:
+        return True
+    lowered = text.lower()
+    if any(f"node_modules/{package}/" in lowered for package in packages):
+        return True
+    name = _program_name(spec)
+    return name == program or bool(re.fullmatch(
+        re.escape(program) + r"-(x86_64|aarch64|arm64|x64|i686)-[a-z0-9_-]+", name))
+
+
+def _program_position(kind: str, listed: list[str]) -> int | None:
+    """Index of the kind's program in a command, or None (all identity)."""
+
+    if not listed:
+        return None
+    if _is_program(kind, listed[0]):
+        return 0
+    first = _program_name(listed[0])
+    at: int | None = None
+    if first in _PACKAGE_LAUNCHERS:
+        at = 1
+    elif first in _DLX_LAUNCHERS and len(listed) > 1 and listed[1] == "dlx":
+        at = 2
+    elif first == "node":
+        at = 1
+    elif first == "cmd" and len(listed) > 1 and listed[1].lower() in {"/c", "/k"}:
+        at = 2
+    elif first == "wsl":
+        marker = next((index for index, word in enumerate(listed)
+                       if word in {"--", "-e", "--exec"}), None)
+        at = None if marker is None else marker + 1
+    if at is None:
+        return None
+    if first in _PACKAGE_LAUNCHERS | _DLX_LAUNCHERS | {"node"}:
+        while at < len(listed) and listed[at].startswith("-"):
+            at += 1  # the launcher's own flags (npx -y, node --no-warnings)
+    if at < len(listed) and _is_program(kind, listed[at]):
+        return at
+    return None
+
+
+def _identity_words(
+    kind: str, words: object, *, version: int = ROUTE_IDENTITY_VERSION,
+    from_command: bool = False,
+) -> list[str]:
+    """A command line with only the known tunable flags (and values) removed.
+
+    From v4, in a ``command`` every word up to and including the kind's own
+    program is identity: wrapper and interpreter flags (``python -m x``,
+    ``ssh -m host``, ``npx --model=pkg``) are never mistaken for the CLI's
+    tunable flags. A command without that program is identity as a whole.
+    """
+
+    if not isinstance(words, (list, tuple)):
+        return []
+    listed = [str(one) for one in words]
+    if kind in WHOLE_ARGV_IDENTITY_KINDS:
+        return listed
+    kept: list[str] = []
+    at = 0
+    if version >= 4 and from_command:
+        if version >= 5:
+            found = _program_position(kind, listed)
+        else:
+            program = CLI_PROGRAM_BY_KIND.get(kind)
+            found = next((index for index, word in enumerate(listed)
+                          if program and _program_name(word) == program), None)
+        if found is None:
+            return listed
+        kept = listed[:found + 1]
+        at = found + 1
+    tunable = TUNABLE_FLAGS_BY_KIND.get(kind, _COMMON_TUNABLE_FLAGS)
+    while at < len(listed):
+        word = listed[at]
+        flag, joined, value = word.partition("=")
+        following = listed[at + 1] if at + 1 < len(listed) else ""
+        # v4: a flag never takes another flag as its value.
+        takes_next = bool(following) and (version < 4 or not following.startswith("-"))
+        if kind == "codex-cli" and flag in {"-c", "--config"}:
+            setting = value if joined else (following if takes_next else "")
+            key = setting.split("=", 1)[0].strip().strip('"').lower()
+            if "=" in setting and key in TUNABLE_CONFIG_KEYS:
+                at += 1 if joined else 2
+                continue
+        if flag in tunable and (not joined or flag.startswith("--") or version >= 4):
+            if tunable[flag] and not joined and takes_next:
+                at += 2
+            elif tunable[flag] and not joined and version >= 4:
+                kept.append(word)  # A value-taking flag with no value: keep it.
+                at += 1
+            else:
+                at += 1
+            continue
+        kept.append(word)
+        at += 1
+    return kept
+
+
+def _endpoint_identity(endpoint: str) -> dict[str, Any]:
+    """v4: username and non-credential query parameters of an endpoint."""
+
+    try:
+        parsed = urlsplit(endpoint) if endpoint else None
+    except ValueError:
+        return {}
+    if not parsed or not parsed.scheme or not parsed.netloc:
+        return {}
+    from urllib.parse import parse_qsl
+
+    query = sorted(
+        [name, value] for name, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if not _SECRET_QUERY_NAME.search(name)
+    )
+    return {"username": parsed.username or "", "query": query}
+
+
+def route_identity(
+    config: LoadedConfig, route: str, *, version: int = ROUTE_IDENTITY_VERSION,
+) -> dict[str, Any]:
+    """Return the versioned, non-secret identity of one provider route.
+
+    The digest changes when the route could answer as a different provider:
+    another route name, provider kind, endpoint authority, credential slot,
+    account scope, anything in its command line or argument list except the
+    flags ``TUNABLE_FLAGS_BY_KIND`` names for that kind (``assistant-cli`` and
+    ``local``: the whole command line), its environment settings, or (local
+    provider) its execution mode and container. It ignores tunables
+    (``ROUTE_TUNABLE_FIELDS`` and the listed flags), the resolved executable
+    path, its file identity, its reported version, and transport/engine
+    contract revisions. Those are recorded by the route and effective-dispatch
+    fingerprints and refreshed automatically.
+
+    ``version=1``/``2`` recompute the previous contracts, used only to
+    recognise and migrate saved records. This is intentionally a separate value from
+    ``_route_failure_context``, whose exact output other stores persist and
+    compare.
+    """
+
+    if version not in ROUTE_IDENTITY_CONTRACTS:
+        raise ValueError(f"Unknown route identity version: {version}")
+    named, profile, kind = _route_profile(config, route)
+    # Only a digest is persisted, exactly as for the route fingerprint, so the
+    # raw profile is used: the redactor would turn every ``api_key_env`` name
+    # into the same placeholder and hide a switch to another account slot.
+    # Credentials embedded in an endpoint URL are dropped; rotating them is
+    # not a change of provider.
+    endpoint = str(profile.get("endpoint") or "").strip()
+    try:
+        parsed = urlsplit(endpoint) if endpoint else None
+        port = parsed.port if parsed else None
+    except ValueError:
+        parsed, port = None, None
+    endpoint_authority = (
+        f"{parsed.scheme.lower()}://{(parsed.hostname or '').lower()}"
+        f"{':' + str(port) if port else ''}{parsed.path.rstrip('/')}"
+        if parsed and parsed.scheme and parsed.netloc else endpoint
+    )
+    command = profile.get("command")
+    program = (
+        str(command[0]) if isinstance(command, (list, tuple)) and command else ""
+    )
+    excluded = {"kind", "name", "endpoint", "command"}
+    if version >= 2:
+        # Environment settings contribute only their selectors (below).
+        excluded |= {"env", "environment"}
+    settings = {
+        key: value for key, value in profile.items()
+        if key not in ROUTE_TUNABLE_FIELDS and key not in excluded
+    }
+    material = {
+        "route": named,
+        "kind": kind,
+        "endpoint_authority": endpoint_authority,
+        "program": program,
+        "settings": settings,
+    }
+    if version == 2:
+        material["account_selectors"] = route_account_selectors(config, route)
+    if version >= 3:
+        if version >= 4 and not (isinstance(command, (list, tuple)) and command) \
+                and kind in CLI_PROGRAM_BY_KIND:
+            command = [CLI_PROGRAM_BY_KIND[kind]]
+        environment = {
+            key: profile.get(key) for key in ("env", "environment")
+            if profile.get(key) is not None
+        }
+        if version >= 4:
+            environment = {
+                key: (
+                    {name: value for name, value in held.items()
+                     if not _TUNABLE_ENV_NAME.fullmatch(str(name).upper())}
+                    if isinstance(held, dict) else held
+                )
+                for key, held in environment.items()
+            }
+        material = {
+            "route": named,
+            "kind": kind,
+            "endpoint_authority": endpoint_authority,
+            "settings": {
+                key: value for key, value in settings.items()
+                if key not in {"arguments"}
+            },
+            "command": _identity_words(kind, command, version=version, from_command=True),
+            # Absent and "only tunable flags" are the same identity.
+            "arguments": (
+                [str(one) for one in profile.get("arguments") or []]
+                if version >= 5 and kind not in WHOLE_ARGV_IDENTITY_KINDS
+                and isinstance(command, (list, tuple))
+                and _program_position(kind, [str(one) for one in command]) is None
+                else _identity_words(kind, profile.get("arguments"), version=version)
+            ),
+            "environment": environment,
+            "execution": {
+                "mode": config.get("execution.mode"),
+                "docker_image": config.get("execution.docker_image"),
+                "docker_network": config.get("execution.docker_network"),
+            } if kind == "local" else None,
+        }
+        if version >= 4:
+            material["endpoint"] = _endpoint_identity(endpoint)
+    contract = ROUTE_IDENTITY_CONTRACTS[version]
+    digest = hashlib.sha256(json.dumps({
+        "route_identity_version": version,
+        "route_identity_contract": contract,
+        "material": material,
+    }, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        default=lambda value: f"<{type(value).__name__}>",
+    ).encode("utf-8")).hexdigest()
+    return {
+        "route_identity_version": version,
+        "route_identity_contract": contract,
+        "route_identity_sha256": digest,
     }
 
 
@@ -2136,9 +2598,24 @@ def _structured_value(text: str) -> Any:
     return json.loads(held)
 
 
+class StructuredReplyError(ChatError):
+    """The provider answered, but its reply did not match the requested format.
+
+    This is a protocol slip by an agent that did reply, not a transport
+    failure: callers can keep the agent in the run instead of treating its
+    provider as unavailable.
+    """
+
+
 def _contract_failure(text: str, response_format: ResponseFormat) -> str:
     from . import contracts
 
+    # A format may bring its own tolerant check of what it receives (extra
+    # keys, omitted optional fields, prose around the JSON). Its owner then
+    # decodes the reply the same way, so accepting it here loses nothing.
+    received_problem = getattr(response_format, "received_problem", None)
+    if callable(received_problem):
+        return str(received_problem(text) or "")
     try:
         value = _structured_value(text)
     except json.JSONDecodeError as exc:
@@ -2178,7 +2655,7 @@ def _complete_with_one_schema_repair(
     if not failure:
         return response
     if not bool(getattr(provider, "structured_retry_is_safe", False)):
-        raise ChatError(
+        raise StructuredReplyError(
             f"The assistant returned malformed {request.response_format.name} JSON. "
             "Nexus did not retry because this provider call is not proven side-effect-free: "
             f"{failure}"
@@ -2212,7 +2689,7 @@ def _complete_with_one_schema_repair(
     ), "schema_repair")
     second_failure = _contract_failure(repaired.text, request.response_format)
     if second_failure:
-        raise ChatError(
+        raise StructuredReplyError(
             f"The assistant returned malformed {request.response_format.name} JSON twice. "
             f"Nexus kept the real cause and stopped instead of applying a partial result: "
             f"{second_failure}"
@@ -2673,6 +3150,17 @@ def ask_once(
         # ask_once owns collaboration and relay calls. Their failures are as
         # real as ordinary chat failures and must update route health too, or a
         # broken provider remains falsely ready and gets relaunched forever.
+        # A reply in the wrong format is not a broken route: the provider did
+        # answer, so it stays ready and the caller keeps it in the run.
+        if isinstance(exc, StructuredReplyError):
+            _write_down_that_it_would_not(config, named, "")
+            raise StructuredReplyError(
+                _without_personal_account_details(
+                    redactor.text(
+                        f"{named or 'The assistant'} answered in the wrong format: {safe_reason}"
+                    )
+                )
+            ) from exc
         _write_down_that_it_would_not(config, named, safe_reason)
         raise ChatError(
             _without_personal_account_details(

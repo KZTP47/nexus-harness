@@ -2,7 +2,7 @@
 const {chromium} = require('playwright-core');
 const {findInstalledBrowser} = require('./external-browser');
 const readline = require('node:readline');
-const {createHash} = require('node:crypto');
+const {createHash,randomUUID} = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const sessions = new Map();
@@ -30,6 +30,8 @@ const NEXT_SCAN = 'It will be checked again on the next scan.';
 // Walking the list costs budget the conversations themselves need, so collection
 // is capped well before the work deadline and resumes on the next scan.
 const ROW_LIMIT = 200;
+// First-observation stamps are kept for the conversations the worker saw most recently.
+const FIRST_SEEN_LIMIT = 2000;
 // A conversation the mailbox never paints must not be retried ahead of new
 // mail on every scan, so each failure pushes its next attempt further out.
 const FAILURE_COOLDOWN_MS = 300000;
@@ -38,6 +40,10 @@ const ROW_STEPS = 40;
 const COLLECT_MS = 8000;
 const SCROLL_SETTLE_MS = 150;
 const REVEAL_MS = 6000;
+// Latest Send click after the request started; the bridge stops waiting at 150 s.
+const DISPATCH_BY_MS = 100000;
+// A missing, malformed or future request start never stretches a deadline.
+const requestStart = value => Number.isFinite(value)&&value<=Date.now() ? value : Date.now();
 // outlook.cloud.microsoft rewrites /mail/inbox to /mail/, outlook.live.com uses /mail/0/inbox and an opened conversation appends /id/<item>.
 const INBOX_PATH = /^\/mail(?:\/\d+)?\/inbox(?:\/id\/[^/]+)?\/?$/i;
 const BARE_PATH = /^\/mail(?:\/\d+)?(?:\/id\/[^/]+)?\/?$/i;
@@ -160,7 +166,20 @@ function readMessage(options) {
   const stamp=Array.from(envelope.querySelectorAll('time[datetime]')).map(node=>node.getAttribute('datetime'))
     .find(value=>value&&Number.isFinite(Date.parse(value)))||'';
   const received_at=stamp?new Date(Date.parse(stamp)).toISOString():'';
-  return {sender,subject,body,received_at,message_id:message_id || ''};
+  const message={sender,subject,body,received_at,message_id:message_id || ''};
+  if(options.replyControl) {
+    const expected=options.approvedOriginal;
+    if(!expected || sender!==expected.sender || subject!==expected.subject || body!==expected.body)return null;
+    // Use the same proved, single-message envelope as the reader. Outlook can
+    // expose both a header Reply and a footer Reply for this same message.
+    const controls=[...envelope.querySelectorAll('button,[role="button"],[role="link"]')].filter(node=>
+      !element.contains(node) && !node.closest('[contenteditable="true"]') &&
+      getComputedStyle(node).visibility!=='hidden' && [...node.getClientRects()].some(r=>r.width>0&&r.height>0) &&
+      !node.disabled && node.getAttribute('aria-disabled')!=='true' &&
+      (node.getAttribute('aria-label')||node.getAttribute('title')||node.innerText.trim())==='Reply');
+    return controls[0] || null;
+  }
+  return message;
 }
 async function resolveSenderCard(page,expectedMessageId='') {
   const senderNodeId=await page.evaluate(expected=>Array.from(document.querySelectorAll('[role="document"], [aria-label="Message body"]'))
@@ -354,7 +373,13 @@ async function reloadInbox(value,timeout,follow=NEXT_SCAN) {
   const target=inboxUrl(value);
   // Stamped before navigating: a slow navigation is still in flight when the next scan starts and must be awaited, not restarted.
   value.lastInboxRefresh=Date.now();value.lastOpenedRow='';value.paneDirty=false;value.inboxReady=false;value.folderPending=true;value.ownLoadPending=true;
-  try { await value.page.goto(target,{waitUntil:'domcontentloaded',timeout}); }
+  try {
+    // Gmail routes folders with fragments. goto to the same document can be
+    // only a hash navigation and cannot recover an expired or frozen session.
+    const sameDocument=value.page.url().split('#')[0]===target.split('#')[0];
+    await value.page.goto(target,{waitUntil:'domcontentloaded',timeout});
+    if(sameDocument&&target.includes('#'))await value.page.reload({waitUntil:'domcontentloaded',timeout});
+  }
   catch(error) { if (!isTimeout(error)) throw error; throw new Error(`The mailbox page did not finish loading after ${Math.round(timeout/1000)} s (${new URL(target).hostname}, navigating). ${follow}`); }
 }
 async function probeInbox(value,grace) {
@@ -510,13 +535,13 @@ async function status(value, connection, identityTimeout=policy(value.provider).
   return {...identity,actual_browser_mode:value.mode || 'headed',state:identity.email ? 'connected' : 'sign_in_required',message:identity.email ? 'Browser connected. Keep Nexus running to check new mail.' : 'Sign in in the Nexus mail browser. If already signed in, open the account menu so Nexus can identify your mailbox.'};
 }
 async function handle(request) {
-  if (!['open','status','sync','send'].includes(request.command)) throw new Error('Unknown browser mail command.');
+  if (!['open','status','sync','send','prepare'].includes(request.command)) throw new Error('Unknown browser mail command.');
   const key=request.connection?.id;
   const previous=operations.get(key) || Promise.resolve();
   const operation=previous.catch(()=>{}).then(async()=>{
     const started=Date.now();
     let value;
-    try{value=await session(request);}catch(error){if(request.command==='send')return {status:'not_sent',error:publicError(error).slice(0,400),submission_id:request.submission_id};throw error;}
+    try{value=await session(request);}catch(error){if(['send','prepare'].includes(request.command))return {status:'not_sent',error:publicError(error).slice(0,400),submission_id:request.submission_id};throw error;}
     return operate(value,{...request,_startedAt:started});
   });
   operations.set(key,operation);
@@ -524,7 +549,22 @@ async function handle(request) {
 }
 async function operate(value,request) {
   // A send stamps the conversation it re-opens itself; an Outlook self-reload during it must not erase that row.
-  if (request.command==='send') { value.replying=true; try { return await sendReviewed(value,request); } finally { value.replying=false; } }
+  if (['send','prepare'].includes(request.command)) {
+    request={...request,_startedAt:requestStart(request._startedAt)}; // The preparation retry shares one dispatch deadline.
+    value.replying=true;
+    try {
+      let result=await sendReviewed(value,request);
+      // Retry only preparation that demonstrably stopped before a composer or
+      // dispatch. One fresh mailbox document, same durable submission identity.
+      if(result.status==='not_sent'&&result.retryable_preparation&&!await hasComposer(value.page)) {
+        try {
+          await reloadInbox(value,policy(value.provider).goto,'Your draft is saved. Use Review & send reply to try again.');
+          result=await sendReviewed(value,{...request,_preparationRetry:true});
+        }catch(error){result={status:'not_sent',submission_id:request.submission_id,error:publicError(error).slice(0,400)};}
+      }
+      return result;
+    }finally{value.replying=false;}
+  }
   if(request.command==='sync'&&!request._singleTab){
     // Both tabs share one work budget; the bridge waits 150 seconds from the request,
     // including browser startup and a final in-flight bounded browser operation.
@@ -537,23 +577,25 @@ async function operate(value,request) {
     try{first=await operate(value,{...request,_singleTab:true,_scanDeadline:scanDeadline});}
     catch(error){
       // A tab that cannot load must not strand the other one for the whole scan.
+      // A tab left unread means more remains: a first-connect history baseline must
+      // not end before it, or that tab's whole history would look newly arrived.
       const held=JSON.parse(request.cursor||'{}');
       if(!held.split_inbox||!await recoverableTab(error))throw error;
       const fallback={...held,next_tab:held.next_tab==='Other'?'Focused':'Other'};
       const only=await operate(value,{...request,_singleTab:true,_scanDeadline:scanDeadline,cursor:JSON.stringify(fallback)});
       // Its own cursor already names the failed tab, which therefore leads the next scan.
-      return {...only,warnings:[...only.warnings,'The '+(fallback.next_tab==='Other'?'Focused':'Other')+' inbox tab did not finish loading, so the other tab was checked instead. '+NEXT_SCAN]};
+      return {...only,has_more:true,warnings:[...only.warnings,'The '+(fallback.next_tab==='Other'?'Focused':'Other')+' inbox tab did not finish loading, so the other tab was checked instead. '+NEXT_SCAN]};
     }
     const firstCursor=JSON.parse(first.cursor||'{}');
     if(!firstCursor.split_inbox)return first;
-    if(Date.now()>=scanDeadline-RESERVE_MS)return {...first,warnings:[...first.warnings,'The scan work budget was reached. The other inbox tab will be checked on the next scan.']};
+    if(Date.now()>=scanDeadline-RESERVE_MS)return {...first,has_more:true,warnings:[...first.warnings,'The scan work budget was reached. The other inbox tab will be checked on the next scan.']};
     let second;
     try{second=await operate(value,{...request,_singleTab:true,_secondPass:true,_scanDeadline:scanDeadline,cursor:first.cursor});}
     catch(error){
       if(!await recoverableTab(error))throw error;
       // The cursor already names the tab that just failed, so it leads the next scan
       // with the full work budget instead of being demoted to second place again.
-      return {...first,warnings:[...first.warnings,'The '+(firstCursor.next_tab==='Other'?'Other':'Focused')+' inbox tab did not finish loading. Imported messages were preserved; that tab is checked first on the next scan.']};
+      return {...first,has_more:true,warnings:[...first.warnings,'The '+(firstCursor.next_tab==='Other'?'Other':'Focused')+' inbox tab did not finish loading. Imported messages were preserved; that tab is checked first on the next scan.']};
     }
     return {messages:[...first.messages,...second.messages].filter((message,index,all)=>all.findIndex(other=>other.source_id===message.source_id)===index),
       failed_messages:[...first.failed_messages||[],...second.failed_messages||[]].filter((failure,index,all)=>all.findIndex(other=>other.source_id===failure.source_id)===index),
@@ -586,6 +628,12 @@ async function operate(value,request) {
   for(const key of Object.keys(rowCache)){const entry=rowCache[key];if(!/^[a-f0-9]{64}$/.test(key)||!entry||!/^[a-f0-9]{64}$/.test(entry.signature)||!Number.isFinite(entry.checked_at)||entry.checked_at>Date.now())delete rowCache[key];}
   const rowFailures=cacheValid&&cursor.parser_contract===PARSER_CONTRACT&&cursor.row_failures&&typeof cursor.row_failures==='object'&&!Array.isArray(cursor.row_failures)?{...cursor.row_failures}:{};
   for(const key of Object.keys(rowFailures)){const entry=rowFailures[key];if(!/^[a-f0-9]{64}$/.test(key)||!entry||!Number.isInteger(entry.count)||entry.count<1||!Number.isFinite(entry.at)||entry.at>Date.now())delete rowFailures[key];}
+  // When this worker first saw each conversation row: list observation only, never mail
+  // content. A tab without this state (fresh, reconnected or upgraded cursor) is a baseline.
+  const firstValid=cacheValid&&cursor.first_seen_contract==='browser-first-seen/v1';
+  const firstSeen=firstValid&&cursor.first_seen&&typeof cursor.first_seen==='object'&&!Array.isArray(cursor.first_seen)?{...cursor.first_seen}:{};
+  for(const key of Object.keys(firstSeen)){const entry=firstSeen[key];if(!/^[a-f0-9]{32}$/.test(key)||!Array.isArray(entry)||entry.length!==2||!entry.every(n=>Number.isSafeInteger(n)&&n>=0&&n<=Date.now())||entry[0]>entry[1])delete firstSeen[key];else firstSeen[key]=[...entry];}
+  const firstTabs=firstValid&&cursor.first_seen_tabs&&typeof cursor.first_seen_tabs==='object'&&!Array.isArray(cursor.first_seen_tabs)?{...cursor.first_seen_tabs}:{};
   if(!cacheValid&&value.lastScanCacheBinding)await ensureInbox(value,{force:true,deadline:workDeadline});
   value.lastScanCacheBinding=cacheBinding;
   let tabName=cursor.next_tab==='Other'?'Other':'Focused';let splitInbox=false;
@@ -614,6 +662,18 @@ async function operate(value,request) {
   let tabSettled=true;
   await selectInboxTab();
   const snapshotRows=async()=> (await value.page.evaluate(readRows,{provider:value.provider,signatures:true})).map(({summary,...row})=>({...row,signature:digest(summary)}));
+  const firstKey=row=>digest([row.attr,row.id]).slice(0,32);
+  // A list is newest first. On a tab already tracked, an unknown row listed above a row seen
+  // before, or at the top of a list that was empty, has arrived: it is stamped now. Rows of a
+  // baseline scan or found by scrolling below known rows existed already: 0, reported as null.
+  const observe=(snapshot,atTop=false)=>{
+    const now=Date.now(),tab=firstTabs[tabName];let knownBelow=false;
+    for(const row of [...snapshot].reverse()){
+      const entry=firstSeen[firstKey(row)];
+      if(entry){entry[1]=now;knownBelow=true;continue;}
+      firstSeen[firstKey(row)]=[tab&&(knownBelow||(atTop&&tab.empty))?now:0,now];
+    }
+  };
   // One viewport is a few conversations, so the list is walked to its end to find
   // the mail below it; a scan that never scrolled could only ever see the top.
   const scrollTo=async top=>{
@@ -638,6 +698,7 @@ async function operate(value,request) {
     const add=async(resume='')=>{
       let overflow=false;
       const snapshot=await snapshotRows();
+      observe(snapshot,top===0);
       const start=resume?snapshot.findIndex(row=>row.id===resume)+1:0;
       for (const row of snapshot.slice(start)) {
         if(found.has(row.id))continue;
@@ -652,6 +713,7 @@ async function operate(value,request) {
       for(const row of walk.pending)found.set(row.id,row);
       await scrollTop();
       const fresh=await snapshotRows();
+      observe(fresh,true);
       for(const row of (fresh.length<=ROW_LIMIT?fresh:fresh.slice(0,10))){
         if(found.has(row.id))found.set(row.id,{...row,top:0});
         else if(found.size<ROW_LIMIT)found.set(row.id,{...row,top:0});
@@ -682,7 +744,8 @@ async function operate(value,request) {
   const collected = await collectRows();
   const rows = collected.rows;
   const nextTab=splitInbox?(tabName==='Focused'?'Other':'Focused'):undefined;
-  const cacheFields=()=>({parser_contract:PARSER_CONTRACT,message_offsets:messageOffsets,walk_contract:'browser-walk/v1',walks:progress,row_cache_contract:'browser-row-cache/v1',row_cache_binding:cacheBinding,row_cache:Object.fromEntries(Object.entries(rowCache).sort((a,b)=>b[1].checked_at-a[1].checked_at).slice(0,200)),row_failures:Object.fromEntries(Object.entries(rowFailures).sort((a,b)=>b[1].at-a[1].at).slice(0,200)),split_inbox:splitInbox,next_tab:nextTab});
+  const cacheFields=()=>({parser_contract:PARSER_CONTRACT,message_offsets:messageOffsets,walk_contract:'browser-walk/v1',walks:progress,row_cache_contract:'browser-row-cache/v1',row_cache_binding:cacheBinding,row_cache:Object.fromEntries(Object.entries(rowCache).sort((a,b)=>b[1].checked_at-a[1].checked_at).slice(0,200)),row_failures:Object.fromEntries(Object.entries(rowFailures).sort((a,b)=>b[1].at-a[1].at).slice(0,200)),split_inbox:splitInbox,next_tab:nextTab,
+    first_seen_contract:'browser-first-seen/v1',first_seen:Object.fromEntries(Object.entries(firstSeen).sort((a,b)=>b[1][1]-a[1][1]).slice(0,FIRST_SEEN_LIMIT)),first_seen_tabs:{...firstTabs,[tabName]:{empty:!rows.length}}});
   if (!rows.length && (inboxStatus==='empty'||await value.page.evaluate(inboxState,value.provider)==='empty')) return {messages:[],failed_messages:[],has_more:false,cursor:JSON.stringify({...cursor,contract:SYNC_CONTRACT,...cacheFields()}),warnings:notes};
   const seen=cursor.seen || [];
   if (!Array.isArray(seen) || seen.some(id=>typeof id!=='string') || seen.length>5000) throw new Error('Browser mail cursor is invalid.');
@@ -934,7 +997,8 @@ async function operate(value,request) {
     parsedCount++;
     const source_id=sourceHash(value.provider,row,message);
     const browser_reference={contract:REPLY_CONTRACT,provider:value.provider,row_attr:row.attr,row_id:row.id,message_id:message.message_id,source_hash:source_id,content_hash:contentHash(message),...(splitInbox?{inbox_tab:tabName}:{})};
-    if (!seen.includes(source_id)) { if(message.sender.toLowerCase()!==refreshed.email.toLowerCase()) messages.push({source_id,...message,browser_reference}); seen.push(source_id); }
+    const first=firstSeen[firstKey(row)]?.[0];
+    if (!seen.includes(source_id)) { if(message.sender.toLowerCase()!==refreshed.email.toLowerCase()) messages.push({source_id,...message,first_seen_at:first?new Date(first).toISOString():null,browser_reference}); seen.push(source_id); }
     }catch(error){
       const identity=await status(value,request.connection);
       if(identity.state!=='connected')throw new Error('Mailbox sign-in changed while checking mail. Reconnect the browser.');
@@ -974,6 +1038,7 @@ async function operate(value,request) {
     // Add arrivals/reordered visible rows without retrying the same failed row
     // indefinitely. Unreadable rows are never added to the durable seen set.
     const currentRows=await snapshotRows();
+    observe(currentRows);
     const arrivals=currentRows.length<=ROW_LIMIT?currentRows:currentRows.slice(0,10);
     const additions=arrivals.filter(item=>changed(item)&&!cooling(item)&&!attempted.has(item.id)&&!ordered.some(queued=>queued.id===item.id));
     ordered.splice(ordered.indexOf(row)+1,0,...additions);
@@ -1005,6 +1070,104 @@ function acknowledgement() {
   return Array.from(document.querySelectorAll('[role="status"], [role="alert"]'))
     .filter(e=>e.getClientRects().length && !e.closest('[role="document"], .a3s, [contenteditable="true"]'))
     .map(e=>e.innerText.trim()).filter(text=>/^(Message sent\.?|Your message has been sent\.?)$/i.test(text));
+}
+// Outlook can send without a toast and then display another saved draft from
+// the same conversation. A separate, read-only Sent Items view supplies a
+// before/after witness without navigating away from the approved composer.
+function sentFolderControl() {
+  const nodes=[...document.querySelectorAll('[role="treeitem"]')].filter(e=>
+    e.getClientRects().length&&!e.querySelector('[role="treeitem"]')&&/\bSent Items\b/.test(e.innerText));
+  return nodes.length>0&&nodes.length<=2?nodes.at(-1):null;
+}
+function sentPaneSnapshot() {
+  const stamps=[...document.querySelectorAll('[id^="MSG_"][id$="_DATETIME"]')].map(e=>e.textContent.trim());
+  const ids=[...document.querySelectorAll('[id^="MSG_"][id$="_FROM"]')].map(e=>e.id.slice(4,-5));
+  return {ids,stamps};
+}
+function sentBodyWitness({body,recipient,before}) {
+  const result=[];
+  for(const from of document.querySelectorAll('[id^="MSG_"][id$="_FROM"]')) {
+    const id=from.id.slice(4,-5),stamp=document.getElementById('MSG_'+id+'_DATETIME')?.textContent.trim();
+    if(!stamp||before.ids.includes(id)||before.stamps.includes(stamp))continue;
+    const to=document.getElementById('MSG_'+id+'_TO');
+    const addresses=(to?.innerText||'').match(/[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9.-]+\.[A-Z]{2,}/ig)||[];
+    if(addresses.length!==1||addresses[0].toLowerCase()!==recipient)continue;
+    let scope=from.parentElement;
+    while(scope&&scope!==document.body&&!scope.querySelector('[role="document"]'))scope=scope.parentElement;
+    if(!scope||scope===document.body)continue;
+    const docs=[...scope.querySelectorAll('[role="document"]')].filter(e=>e.getClientRects().length&&!e.isContentEditable);
+    if(docs.length!==1||scope.querySelectorAll('[id^="MSG_"][id$="_FROM"]').length!==1)continue;
+    const header=scope.cloneNode(true);header.querySelectorAll('[role="document"]').forEach(e=>e.remove());
+    if(/This message hasn['’]t been sent\./.test(header.textContent))continue;
+    // PRE is the exact text transaction we insert. A tenant may append a
+    // separate classification footer; never accept a substring of prose.
+    const exact=!docs[0].querySelector('blockquote')&&(docs[0].innerText.replace(/\r\n/g,'\n')===body||
+      [...docs[0].querySelectorAll('pre')].some(e=>{
+        if(e.closest('blockquote')||e.textContent.replace(/\r\n/g,'\n')!==body)return false;
+        const prefix=document.createRange();prefix.selectNodeContents(docs[0]);prefix.setEndBefore(e);
+        return !prefix.toString().trim();
+      }));
+    if(exact)result.push({id,stamp});
+  }
+  return result.length===1?result[0]:null;
+}
+async function sentViewSnapshot(view,ref) {
+  const selected=await view.page.evaluate(()=>[...document.querySelectorAll('[role="treeitem"][aria-selected="true"]')].some(e=>/\bSent Items\b/.test(e.innerText)));
+  if(!selected)throw new Error('Sent Items is not selected.');
+  const rows=await view.page.evaluate(readRows,view.provider);
+  const matches=rows.filter(row=>row.attr===ref.row_attr&&row.id===ref.row_id);
+  if(!matches.length)return {ids:[],stamps:[],absent:true};
+  if(matches.length!==1)throw new Error('Sent conversation is ambiguous.');
+  await view.page.locator(rowSelector(view.provider,ref.row_attr,ref.row_id)).click({timeout:3000});
+  const deadline=Date.now()+3000;
+  do {
+    const pane=await view.page.evaluate(paneView,view.provider);
+    if(paneProvesRow(pane,[ref.row_id],new Set(rows.map(row=>row.id))))return await view.page.evaluate(sentPaneSnapshot);
+    await sleep(150);
+  }while(Date.now()<deadline);
+  throw new Error('Sent conversation has not loaded.');
+}
+async function openSentWitness(value,request) {
+  if(value.provider!=='browser_outlook')return null;
+  // Do not create another tab when the current layout has no supported folder.
+  const available=await value.page.evaluate(sentFolderControl);
+  if(!available)return null;
+  const page=await value.context.newPage(),view={page,provider:value.provider};
+  try {
+    page.setDefaultTimeout(5000);
+    await page.goto(new URL('/mail/inbox',value.page.url()).href,{waitUntil:'domcontentloaded',timeout:15000});
+    if((await status(view,request.connection,8000)).state!=='connected')throw new Error('Sent mailbox unavailable.');
+    const folder=await page.evaluateHandle(sentFolderControl);
+    if(!folder.asElement())throw new Error('Sent Items unavailable.');
+    await folder.asElement().click({timeout:3000});await folder.dispose();
+    await page.waitForFunction(()=>[...document.querySelectorAll('[role="treeitem"][aria-selected="true"]')].some(e=>/\bSent Items\b/.test(e.innerText)),null,{timeout:5000,polling:100});
+    // Let the folder list settle before recording absence or existing headers.
+    await sleep(1200);
+    view.before=await sentViewSnapshot(view,request.incoming.browser_reference);
+    // An unrendered/virtualized conversation or unhydrated pane is no baseline:
+    // an older identical reply would later look new. No evidence, stays unknown.
+    if(view.before.absent||!view.before.ids.length||!view.before.stamps.length)throw new Error('Sent baseline unavailable.');
+    return view;
+  }catch{await page.close().catch(()=>{});return null;}
+}
+async function confirmSentWitness(view,value,request) {
+  if(!view)return false;
+  const deadline=Date.now()+10000;
+  do {
+    try {
+      if((await status(view,request.connection,1000)).state!=='connected')return false;
+      const snapshot=await sentViewSnapshot(view,request.incoming.browser_reference);
+      const witness=!snapshot.absent&&await view.page.evaluate(sentBodyWitness,{body:request.body.replace(/\r\n/g,'\n'),recipient:String(request.incoming.reply_to||request.incoming.sender).toLowerCase(),before:view.before});
+      if(witness) {
+        let sender;
+        try{sender=(await view.page.evaluate(readMessage,{provider:view.provider,expectedMessageId:witness.id})).sender;}
+        catch{sender=(await resolveSenderCard(view.page,witness.id)).senderOverride;}
+        if(sender?.toLowerCase()===request.connection.email.toLowerCase())return true;
+      }
+    }catch{} // Missing evidence never authorizes another Send click.
+    await sleep(300);
+  }while(Date.now()<deadline);
+  return false;
 }
 function readComposer(provider) {
   const visible=e=>e && e.getClientRects().length && getComputedStyle(e).visibility!=='hidden';
@@ -1040,11 +1203,112 @@ function readComposer(provider) {
 }
 function saveSubmission(file,record,exclusive=false) {
   const data=JSON.stringify(record);
-  if(exclusive) { const fd=fs.openSync(file,'wx',0o600); try {fs.writeFileSync(fd,data);fs.fsyncSync(fd);} finally{fs.closeSync(fd);} }
+  if(exclusive) {
+    // A receipt that never became durable is removed: nothing is clicked before
+    // it exists, and an unreadable one would block every retry as uncertain.
+    const fd=fs.openSync(file,'wx',0o600); let durable=false;
+    try {fs.writeFileSync(fd,data);fs.fsyncSync(fd);durable=true;} finally{fs.closeSync(fd);if(!durable)fs.rmSync(file,{force:true});}
+  }
   else { const temp=file+'.tmp'; const fd=fs.openSync(temp,'w',0o600); try{fs.writeFileSync(fd,data);fs.fsyncSync(fd);}finally{fs.closeSync(fd);}fs.renameSync(temp,file); }
 }
+function insertReviewedBody({provider,body}) {
+  const selector=provider==='browser_gmail'
+    ? '[contenteditable="true"][role="textbox"][aria-label="Message Body"], .Am.Al.editable[contenteditable="true"][role="textbox"]'
+    : '[contenteditable="true"][aria-label="Message body"][role="textbox"], [contenteditable="true"][aria-label="Message body"][role="document"]';
+  const editors=[...document.querySelectorAll(selector)].filter(e=>e.getClientRects().length&&getComputedStyle(e).visibility!=='hidden');
+  if(editors.length!==1)throw new Error('A unique reply editor is required for text entry.');
+  const editor=editors[0];editor.focus();
+  const range=document.createRange();range.selectNodeContents(editor);
+  const selection=window.getSelection();selection.removeAllRanges();selection.addRange(range);
+  // One native editing transaction notifies the provider editor. textContent
+  // escapes all markup; PRE preserves spaces/newlines even when Outlook strips
+  // white-space styles, and avoids per-character timeouts and cursor relocation.
+  // HTML parsing drops one newline directly after <pre>; supply it so a leading blank line survives.
+  const text=document.createElement('pre');text.textContent=(/^\r?\n/.test(body)?'\n':'')+body;
+  if(!document.execCommand('insertHTML',false,text.outerHTML))throw new Error('The mailbox editor did not accept the reviewed text.');
+}
+function composerOwner(token) {
+  const visible=e=>e.getClientRects().length&&getComputedStyle(e).visibility!=='hidden';
+  // Only the one visible editor readComposer verifies carries the marker. A lone
+  // "Editing" tab can belong to an unrelated draft of another conversation.
+  const editors=[...document.querySelectorAll('[contenteditable="true"][aria-label="Message body"],[contenteditable="true"][aria-label="Message Body"],.Am.Al.editable[contenteditable="true"][role="textbox"]')].filter(visible);
+  const owner=editors.length===1?editors[0]:null;
+  if(!owner)return '';
+  if(token)owner.setAttribute('data-nexus-reply-owner',token);
+  return owner.getAttribute('data-nexus-reply-owner')||'';
+}
+async function rememberReplyComposer(value,file,binding,recipient) {
+  const current=await value.page.evaluate(readComposer,value.provider);
+  if(current.recipient!==recipient)return;
+  const owner=await value.page.evaluate(composerOwner,randomUUID());
+  if(!owner)return;
+  fs.mkdirSync(path.dirname(file),{recursive:true,mode:0o700});
+  saveSubmission(file,{contract:'browser-composer/v1',binding,body_hash:digest(current.body),owner});
+}
+// Outlook can replace the reading pane with a full-page composer. The original
+// and editor remain sibling mailbox tabs; switch only an unambiguous pair and
+// still require the full original identity/content proof after switching.
+function replyReviewTab({editing}) {
+  const visible=e=>e.getClientRects().length&&getComputedStyle(e).visibility!=='hidden';
+  const groups=[...document.querySelectorAll('[role="tablist"]')].map(group=>{
+    const tabs=[...group.querySelectorAll('[role="tab"]')].filter(visible);
+    const editors=tabs.filter(t=>/^Editing\s/.test(t.getAttribute('aria-label')||''));
+    const originals=tabs.filter(t=>!editors.includes(t));
+    // The editor tab must be the one showing the verified composer; an unselected
+    // editing tab is another draft and is never switched to.
+    return editors.length===1&&originals.length===1&&editors[0].getAttribute('aria-selected')==='true'?{editor:editors[0],original:originals[0]}:null;
+  }).filter(Boolean);
+  return groups.length===1?(editing?groups[0].editor:groups[0].original):null;
+}
+async function locateReplyRow(value,ref,deadline) {
+  const row=value.page.locator(rowSelector(value.provider,ref.row_attr,ref.row_id));
+  const unique=async()=>{
+    const matches=await visibleElements(row);
+    if(matches.length>1)throw new Error('The original conversation is ambiguous. Nothing was sent.');
+    return matches.length===1?matches[0]:null;
+  };
+  let found=await unique();
+  if(found)return found;
+  await value.page.evaluate(scrollList,{provider:value.provider,top:0});
+  await value.page.waitForTimeout(SCROLL_SETTLE_MS);
+  for(let step=0;step<ROW_STEPS&&Date.now()<deadline;step++) {
+    found=await unique();
+    if(found)return found;
+    const moved=await value.page.evaluate(scrollList,{provider:value.provider});
+    if(!moved.moved)break;
+    await value.page.waitForTimeout(SCROLL_SETTLE_MS);
+  }
+  found=await unique();
+  if(found)return found;
+  throw Object.assign(new Error('The original conversation could not be located in the inbox. It may have been moved or deleted. Your draft is saved; nothing was sent.'),{code:'reply_preparation'});
+}
+async function rebindReplyOriginal(value,incoming) {
+  // Outlook regenerates its short rendered MSG ids when switching between
+  // reading and editing tabs. Only reconcile inside the positively identified
+  // original conversation, with exactly one complete matching message.
+  if(value.provider!=='browser_outlook')return null;
+  const view=await value.page.evaluate(paneView,value.provider);
+  const known=new Set((await value.page.evaluate(readRows,value.provider)).map(row=>row.id));
+  if(!paneProvesRow(view,[incoming.browser_reference.row_id],known))return null;
+  const ids=[...new Set(view.bodies.map(([id])=>id).filter(Boolean))];
+  if(!ids.length||ids.length>20)return null;
+  const matches=[];
+  for(const id of ids) {
+    let candidate,override;
+    try { candidate=await value.page.evaluate(readMessage,{provider:value.provider,expectedMessageId:id}); }
+    catch(error) {
+      if(!/message sender is not ready/.test(String(error.message)))continue;
+      try{override=await resolveSenderCard(value.page,id);candidate=await value.page.evaluate(readMessage,{provider:value.provider,expectedMessageId:id,...override});}catch{continue;}
+    }
+    if(candidate.sender===incoming.sender&&candidate.subject===incoming.subject&&candidate.body===incoming.body)matches.push({candidate,override});
+  }
+  return matches.length===1?matches[0]:null;
+}
 async function sendReviewed(value,request) {
-  let dispatched=false,record,file;
+  let dispatched=false,record,file,recoveryFile,recoveryBinding,ownedComposer=false,sentView,stage='checking the mailbox';
+  // Measured from the request (browser start and the preparation retry included):
+  // Send click, toast and Sent Items checks need ~50 s under the 150 s bridge wait.
+  const dispatchDeadline=requestStart(request._startedAt)+DISPATCH_BY_MS;
   try {
     const incoming=request.incoming,ref=incoming?.browser_reference;
     if(!/^[a-f0-9]{32}$/.test(request.submission_id || '') || typeof request.body!=='string' || !request.body.trim() || request.body.length>200000) throw new Error('A valid approved reply and submission identity are required.');
@@ -1059,73 +1323,148 @@ async function sendReviewed(value,request) {
       if(previous.contract!==REPLY_CONTRACT || previous.binding!==binding)return {status:'unknown',submission_id:request.submission_id,error:'An existing submission receipt has a different approval binding. Check Sent mail; this approval will not be dispatched again.'};
       return {status:previous.status==='sent'?'sent':'unknown',submission_id:request.submission_id,evidence:previous.status==='sent'?'persisted_ui_acknowledgement':'persisted_dispatch_intent',error:previous.status==='sent'?'':'This reply already has an uncertain submission. Check the mailbox; it will not be sent again.'};
     }
-    const identity=await status(value,request.connection);
-    if(identity.state!=='connected') throw new Error('Reconnect this mailbox before sending.');
-    if(await hasComposer(value.page)) throw new Error('An existing reply composer is open. Finish or close it before sending this reviewed reply.');
-    // The bridge waits 150 seconds from the request; the inbox wait leaves room for reading, composing and the send acknowledgement.
-    const rescan='Rescan the inbox before replying.';
-    await ensureInbox(value,{deadline:(request._startedAt||Date.now())+70000,follow:rescan});
-    await status(value,request.connection);
-    if(value.provider==='browser_outlook'&&ref.inbox_tab){
-      if(!['Focused','Other'].includes(ref.inbox_tab))throw new Error('The original inbox tab reference is unsupported.');
-      const tab=value.page.getByRole('tab',{name:ref.inbox_tab==='Other'?/^Other(?:\s+\d+)?$/:/^Focused(?:\s+\d+)?$/});
-      if(await tab.count()!==1)throw new Error('The original inbox tab is no longer available. Rescan before replying.');
-      if(await tab.getAttribute('aria-selected')!=='true'){
-        try{if(!await selectTab(value,tab,ref.inbox_tab,1))throw new Error('The original inbox tab list did not refresh.');}
-        catch(error){throw new Error(`${error.message} ${rescan}`);}
-      }
-      await awaitInbox(value,policy(value.provider).settle,rescan);
-    }
-    const row=value.page.locator(rowSelector(value.provider,ref.row_attr,ref.row_id));
-    if((await visibleElements(row)).length!==1) throw new Error('The original conversation is no longer uniquely visible. Rescan the inbox before replying.');
-    await row.click();
-    value.lastOpenedRow=ref.row_id;
-    let original,senderOverride,cardAttempted=false;
-    const readStarted=Date.now();let deadline=readStarted+8000;
-    const matchesOriginal=candidate=>candidate && sourceHash(value.provider,{id:ref.row_id},candidate)===incoming.source_id && contentHash(candidate)===ref.content_hash && candidate.sender===incoming.sender && candidate.subject===incoming.subject && candidate.body===incoming.body;
-    while(Date.now()<deadline) {
-      try {
-        const candidate=await value.page.evaluate(readMessage,{provider:value.provider,expectedMessageId:ref.message_id,...senderOverride});
-        // A clicked thread can leave the previous readable pane mounted while
-        // the intended message hydrates. Readability alone is not selection.
-        if(matchesOriginal(candidate)){original=candidate;break;}
-      } catch(error) {
-        if(value.provider==='browser_outlook'&&!cardAttempted&&Date.now()-readStarted>=1000&&/sender is not ready/.test(String(error.message))) {
-          cardAttempted=true;
-          try{senderOverride=await resolveSenderCard(value.page,ref.message_id);}catch{}
-          // Card lookup may outlast initial hydration. Its result must pass the
-          // same identity/content checks on the next read; it never bypasses them.
-          deadline=Math.max(deadline,Date.now()+3000);
-        }
-      }
-      await new Promise(resolve=>setTimeout(resolve,150));
-    }
-    if(!matchesOriginal(original)) throw new Error('The original message content changed or a different message is open. Rescan and review before sending.');
-    if(await hasComposer(value.page)) throw new Error('An existing reply composer is open. It will not be overwritten.');
-    // Locate Reply only in the latest message envelope, outside the mail body.
-    const replyHandle=await value.page.evaluateHandle(({provider,expectedMessageId})=>{
-      const gmail=provider==='browser_gmail';
-      const bodies=[...document.querySelectorAll(gmail?'.a3s':'[role="document"], [aria-label="Message body"]')].filter(e=>e.innerText?.trim()&&getComputedStyle(e).visibility!=='hidden'&&Array.from(e.getClientRects()).some(rect=>rect.width>0&&rect.height>0)).filter(body=>{
-        if(!expectedMessageId)return true;
-        const node=body.closest('[data-legacy-message-id], [data-message-id], [data-item-id]');
-        const id=node?.getAttribute('data-legacy-message-id')||node?.getAttribute('data-message-id')||node?.getAttribute('data-item-id')||body.closest('[aria-label="Email message"]')?.querySelector('[id^="MSG_"][id$="_FROM"]')?.id.slice(4,-5);
-        return id===expectedMessageId;
-      });
-      if(expectedMessageId&&bodies.length!==1)return null;
-      const body=bodies.at(-1);let envelope=(!gmail&&body?.closest('[aria-label="Email message"]'))||body?.parentElement;
-      const sender=gmail?'.gD[email]':'[id^="MSG_"][id$="_FROM"], [data-testid="SenderPersona"] [title*="@"], [email], [smtp]';
-      while(envelope&&envelope!==document.body&&!envelope.querySelector(sender))envelope=envelope.parentElement;
-      if(!envelope||envelope===document.body)return null;
-      const candidates=[...envelope.querySelectorAll('button,[role="button"],[role="link"]')].filter(e=>e.getClientRects().length&&!body.contains(e)&&(e.getAttribute('aria-label')||e.innerText.trim())==='Reply');
-      return candidates.length===1?candidates[0]:null;
-    },{provider:value.provider,expectedMessageId:ref.message_id});
-    const reply=replyHandle.asElement();if(!reply)throw new Error('A unique Reply control is not available in the original message.');
-    await reply.click();
-    await value.page.locator(editorSelector(value.provider)).first().waitFor({state:'visible',timeout:8000});
-    const editors=await visibleElements(value.page.locator(editorSelector(value.provider)));
-    if(editors.length!==1)throw new Error('A unique new reply editor did not open.');
     const recipient=String(incoming.reply_to || incoming.sender).toLowerCase();
     if(!/^[^\s@<>;,]+@[^\s@<>;,]+$/.test(recipient))throw new Error('The approved reply recipient is not a single mailbox.');
+    recoveryFile=path.join(value.profile,'nexus-reviewed-composers',request.submission_id+'.json');
+    recoveryBinding=digest([REPLY_CONTRACT,value.provider,request.connection.email.toLowerCase(),incoming.source_id,ref.content_hash,recipient]);
+    let resume=false,savedOwner='';
+    if(await hasComposer(value.page)) {
+      try {
+        const saved=JSON.parse(fs.readFileSync(recoveryFile,'utf8'));
+        const current=await value.page.evaluate(readComposer,value.provider);
+        resume=saved.contract==='browser-composer/v1'&&saved.binding===recoveryBinding&&current.recipient===recipient&&saved.body_hash===digest(current.body)&&!!saved.owner&&saved.owner===await value.page.evaluate(composerOwner);
+        if(resume)savedOwner=saved.owner;
+      }catch{}
+      if(!resume)throw new Error('An existing reply composer is open or has been edited outside Nexus. Finish or close it before sending this reviewed reply.');
+    }
+    let identity=await status(value,request.connection);
+    if(identity.state!=='connected') {
+      // Restore the saved session once before requiring interactive sign-in.
+      // Never retry a dispatch or relax the mailbox identity check.
+      await reloadInbox(value,policy(value.provider).goto,'Sign in in the Nexus mail browser, then retry this reply.');
+      identity=await status(value,request.connection);
+      if(identity.state!=='connected') throw new Error('Sign in in the Nexus mail browser, then retry this reply. Your draft is saved; nothing was sent.');
+    }
+    // The bridge waits 150 seconds from the request; the inbox wait leaves room for reading, composing and the send acknowledgement.
+    const rescan='Rescan the inbox before replying.';
+    if(!resume) {
+      await ensureInbox(value,{deadline:(request._startedAt||Date.now())+70000,follow:rescan,force:request.command==='prepare'&&!request._preparationRetry});
+      if((await status(value,request.connection)).state!=='connected') throw new Error('Sign in in the Nexus mail browser, then retry this reply. Your draft is saved; nothing was sent.');
+      if(value.provider==='browser_outlook'&&ref.inbox_tab){
+        if(!['Focused','Other'].includes(ref.inbox_tab))throw new Error('The original inbox tab reference is unsupported.');
+        const tab=value.page.getByRole('tab',{name:ref.inbox_tab==='Other'?/^Other(?:\s+\d+)?$/:/^Focused(?:\s+\d+)?$/});
+        if(await tab.count()!==1)throw new Error('The original inbox tab is no longer available. Rescan before replying.');
+        if(await tab.getAttribute('aria-selected')!=='true'){
+          try{if(!await selectTab(value,tab,ref.inbox_tab,1))throw new Error('The original inbox tab list did not refresh.');}
+          catch(error){throw new Error(`${error.message} ${rescan}`);}
+        }
+        await awaitInbox(value,policy(value.provider).settle,rescan);
+      }
+      const row=await locateReplyRow(value,ref,Math.min(Date.now()+20000,(request._startedAt||Date.now())+90000));
+      await row.click();
+      value.lastOpenedRow=ref.row_id;
+    }
+    stage='verifying the original message';
+    let original,senderOverride,cardAttempted=false,returnTab,returned=false,rebound=false,rebindAttempted=false;
+    if(resume) {
+      const target=await value.page.evaluateHandle(replyReviewTab,{subject:incoming.subject,editing:false});
+      if(target.asElement()) {
+        returnTab=await value.page.evaluateHandle(replyReviewTab,{subject:incoming.subject,editing:true});
+        // The selected tab showing the verified, owned editor carries the token
+        // across the switch: re-selecting it may re-mount that editor unmarked.
+        await returnTab.evaluate((tab,token)=>tab.setAttribute('data-nexus-reply-owner',token),savedOwner);
+        await target.asElement().click();
+      }
+      await target.dispose();
+    }
+    const readStarted=Date.now();let deadline=readStarted+8000;
+    const matchesOriginal=candidate=>candidate && sourceHash(value.provider,{id:ref.row_id},candidate)===incoming.source_id && contentHash(candidate)===ref.content_hash && candidate.sender===incoming.sender && candidate.subject===incoming.subject && candidate.body===incoming.body;
+    try {
+      if(returnTab) {
+        // Returning from a full-page draft may leave an empty reading tab.
+        // Reopen the exact bound row without reloading away the saved composer.
+        if(value.provider==='browser_outlook'&&ref.inbox_tab) {
+          if(!['Focused','Other'].includes(ref.inbox_tab))throw new Error('The original inbox tab reference is unsupported.');
+          const tab=value.page.getByRole('tab',{name:ref.inbox_tab==='Other'?/^Other(?:\s+\d+)?$/:/^Focused(?:\s+\d+)?$/});
+          if(await tab.count()!==1)throw new Error('The original inbox tab is no longer available.');
+          if(await tab.getAttribute('aria-selected')!=='true')await selectTab(value,tab,ref.inbox_tab,1);
+        }
+        const row=await locateReplyRow(value,ref,Date.now()+10000);
+        await row.click();
+        deadline=Date.now()+8000;
+      }
+      while(Date.now()<deadline) {
+        try {
+          const candidate=await value.page.evaluate(readMessage,{provider:value.provider,expectedMessageId:ref.message_id,...senderOverride});
+          // A clicked thread can leave the previous readable pane mounted while
+          // the intended message hydrates. Readability alone is not selection.
+          if(matchesOriginal(candidate)){original=candidate;break;}
+        } catch(error) {
+          if(!rebindAttempted&&Date.now()-readStarted>=1000&&/bound original message/.test(String(error.message))) {
+            rebindAttempted=true;
+            const match=await rebindReplyOriginal(value,incoming);
+            if(match&&matchesOriginal({...match.candidate,message_id:ref.message_id})) {
+              original=match.candidate;senderOverride=match.override;rebound=true;break;
+            }
+          }
+          if(value.provider==='browser_outlook'&&!cardAttempted&&Date.now()-readStarted>=1000&&/sender is not ready/.test(String(error.message))) {
+            cardAttempted=true;
+            try{senderOverride=await resolveSenderCard(value.page,ref.message_id);}catch{}
+            // Card lookup may outlast initial hydration. Its result must pass the
+            // same identity/content checks on the next read; it never bypasses them.
+            deadline=Math.max(deadline,Date.now()+3000);
+          }
+        }
+        await new Promise(resolve=>setTimeout(resolve,150));
+    }
+    } finally {
+      if(returnTab) {
+        try{
+          await returnTab.asElement().click();
+          returned=await returnTab.evaluate((tab,token)=>tab.isConnected&&tab.getAttribute('aria-selected')==='true'&&tab.getAttribute('data-nexus-reply-owner')===token,savedOwner).catch(()=>false);
+        }finally{await returnTab.dispose();}
+      }
+    }
+    if(!matchesOriginal(rebound?{...original,message_id:ref.message_id}:original)) throw new Error('The original message content changed or a different message is open. Rescan and review before sending.');
+    if(resume) {
+      const saved=JSON.parse(fs.readFileSync(recoveryFile,'utf8'));
+      const current=await value.page.evaluate(readComposer,value.provider);
+      if(current.recipient!==recipient||saved.body_hash!==digest(current.body))throw new Error('The interrupted reply changed during recovery. It will not be overwritten.');
+      // Only an unmarked editor behind the same stamped, still selected tab
+      // inherits ownership; readComposer has just proved it is the only one.
+      const owner=await value.page.evaluate(composerOwner);
+      if(owner!==saved.owner&&!(returned&&!owner&&await value.page.evaluate(composerOwner,saved.owner)===saved.owner))throw new Error('The interrupted reply changed during recovery. It will not be overwritten.');
+    }
+    if(!resume&&await hasComposer(value.page)) throw new Error('An existing reply composer is open. It will not be overwritten.');
+    if(!resume) {
+      // Reply discovery shares the reader's envelope/identity/content proof.
+      let replyHandle,reply;
+      const replyDeadline=Date.now()+3000;
+      do {
+        try {
+          replyHandle=await value.page.evaluateHandle(readMessage,{provider:value.provider,expectedMessageId:original.message_id,...senderOverride,replyControl:true,approvedOriginal:incoming});
+          reply=replyHandle.asElement();
+          if(reply)break;
+          await replyHandle.dispose();
+        }catch(error){
+          if(!/bound original|mailbox layout cannot be read reliably/.test(String(error.message)))throw error;
+        }
+        await sleep(150);
+      }while(Date.now()<replyDeadline);
+      if(!reply)throw Object.assign(new Error('Reply is not ready in the original message. Nothing was sent; use Review & send reply to try again.'),{code:'reply_preparation'});
+      if(request.command==='prepare') { await replyHandle.dispose(); return {status:'ready',submission_id:request.submission_id}; }
+      stage='opening the reply editor';
+      ownedComposer=true;
+      await reply.click();
+      await replyHandle.dispose();
+    } else {
+      if(request.command==='prepare')return {status:'ready',submission_id:request.submission_id};
+      ownedComposer=true;
+    }
+    stage='loading the reply editor';
+    await value.page.waitForFunction(selector=>[...document.querySelectorAll(selector)].some(e=>e.getClientRects().length&&getComputedStyle(e).visibility!=='hidden'),editorSelector(value.provider),{timeout:8000,polling:150});
+    const editors=await visibleElements(value.page.locator(editorSelector(value.provider)));
+    if(editors.length!==1)throw new Error('A unique new reply editor did not open.');
     let composer=await value.page.evaluate(readComposer,value.provider);
     if(composer.recipient!==recipient)throw new Error('The browser Reply-To recipient differs from the reviewed recipient. Review this message in the mailbox.');
     // The editor can appear before its quoted thread and framework state are
@@ -1141,25 +1480,20 @@ async function sendReviewed(value,request) {
       await new Promise(resolve=>setTimeout(resolve,150));
     }
     if(!settled)throw new Error('The reply editor did not finish loading.');
-    const lines=request.body.replace(/\r\n/g,'\n').split('\n');
-    if(lines.length>2000)throw new Error('The reviewed reply has too many lines for reliable browser entry.');
-    await editors[0].fill('');
-    if(lines[0])await editors[0].pressSequentially(lines[0]);
-    // Soft line breaks avoid Chromium's block-editor normalization adding extra
-    // paragraph breaks. Read-back below must still equal the exact approved text.
-    for(const line of lines.slice(1)){await editors[0].press('Shift+Enter');if(line)await editors[0].pressSequentially(line);}
+    stage='entering the reviewed reply';
+    await value.page.evaluate(insertReviewedBody,{provider:value.provider,body:request.body.replace(/\r\n/g,'\n')});
+    stage='verifying the completed reply';
+    // Allow provider proofing/autosave normalization to run before comparing.
+    await sleep(1200);
     composer=await value.page.evaluate(readComposer,value.provider);
     if(composer.recipient!==recipient || composer.body!==request.body.replace(/\r\n/g,'\n'))throw new Error('The browser reply does not exactly match the reviewed body and recipient.');
     const finalIdentity=await status(value,request.connection);if(finalIdentity.state!=='connected')throw new Error('Mailbox identity changed before sending.');
     composer=await value.page.evaluate(readComposer,value.provider);
     if(composer.recipient!==recipient || composer.body!==request.body.replace(/\r\n/g,'\n'))throw new Error('Reply contents or recipient changed before sending.');
-    const before=await value.page.evaluate(acknowledgement);
-    // The persisted intent is flushed before dispatch. Once it exists, crashes
-    // and timeouts can never cause an automatic second Send click.
-    fs.mkdirSync(directory,{recursive:true,mode:0o700});
-    record={contract:REPLY_CONTRACT,binding,status:'unknown',created_at:new Date().toISOString()};
-    saveSubmission(file,record,true);
-    dispatched=true;
+    // The slow witness tab opens first: a Send handle resolved before it could be
+    // re-rendered meanwhile and fail to click only after the no-resend barrier.
+    sentView=await openSentWitness(value,request);
+    stage='checking the Send button';
     const send=await value.page.evaluateHandle(provider=>{
       const selector=provider==='browser_gmail'?'[contenteditable="true"][role="textbox"][aria-label="Message Body"],.Am.Al.editable[contenteditable="true"][role="textbox"]':'[contenteditable="true"][aria-label="Message body"]';
       const editor=[...document.querySelectorAll(selector)].find(e=>e.getClientRects().length);let root=editor?.parentElement;
@@ -1168,16 +1502,43 @@ async function sendReviewed(value,request) {
       return root&&root!==document.body&&candidates(root).length===1?candidates(root)[0]:null;
     },value.provider);
     if(!send.asElement())throw new Error('Send control changed after approval.');
+    // A blocked/disabled button has not dispatched anything. Check actionability
+    // before writing the durable no-resend barrier, without bypassing overlays.
+    await send.asElement().click({trial:true,timeout:8000});
     composer=await value.page.evaluate(readComposer,value.provider);
     if(composer.recipient!==recipient || composer.body!==request.body.replace(/\r\n/g,'\n'))throw new Error('Reply contents or recipient changed at dispatch.');
+    const before=await value.page.evaluate(acknowledgement);
+    if(!await send.evaluate(e=>e.isConnected))throw new Error('Send control changed after approval.');
+    if(Date.now()>dispatchDeadline)throw new Error('Mailbox preparation took too long. Nothing was sent; use Review & send reply to retry.');
+    fs.mkdirSync(directory,{recursive:true,mode:0o700});
+    record={contract:REPLY_CONTRACT,binding,status:'unknown',stage:'dispatch',created_at:new Date().toISOString()};
+    saveSubmission(file,record,true);
+    dispatched=true;
+    stage='sending the reviewed reply';
     await send.asElement().click({timeout:8000});
+    await send.dispose();
+    stage='confirming the sent reply';record.stage='confirmation';saveSubmission(file,record);
     // Timer polling like every other wait here; a hidden headed window may not deliver animation frames.
-    await value.page.waitForFunction(({before})=>[...document.querySelectorAll('[role="status"],[role="alert"]')].some(e=>e.getClientRects().length&&!e.closest('[role="document"],.a3s,[contenteditable="true"]')&&/^(Message sent\.?|Your message has been sent\.?)$/i.test(e.innerText.trim())&&!before.includes(e.innerText.trim())),{before},{timeout:8000,polling:200});
-    if((await visibleElements(value.page.locator(editorSelector(value.provider)))).length)throw new Error('The reply editor remained open after the send notice.');
+    const acknowledged=await value.page.waitForFunction(({before})=>[...document.querySelectorAll('[role="status"],[role="alert"]')].some(e=>e.getClientRects().length&&!e.closest('[role="document"],.a3s,[contenteditable="true"]')&&/^(Message sent\.?|Your message has been sent\.?)$/i.test(e.innerText.trim())&&!before.includes(e.innerText.trim())),{before},{timeout:8000,polling:200}).then(()=>true,()=>false);
+    const toastConfirmed=acknowledged&&!(await visibleElements(value.page.locator(editorSelector(value.provider)))).length;
+    const sentConfirmed=!toastConfirmed&&await confirmSentWitness(sentView,value,request);
+    if(!toastConfirmed&&!sentConfirmed)throw new Error('No new matching sent message or unambiguous send acknowledgement was found.');
+    record.evidence=sentConfirmed?'sent_folder_new_message':'ui_acknowledgement';
     record.status='sent';record.acknowledged_at=new Date().toISOString();saveSubmission(file,record);
-    return {status:'sent',submission_id:request.submission_id,evidence:'ui_acknowledgement',message:'The mailbox UI confirmed sending. Recipient delivery is not confirmed.'};
+    fs.rmSync(recoveryFile,{force:true});
+    return {status:'sent',submission_id:request.submission_id,evidence:record.evidence,message:'The mailbox UI confirmed sending. Recipient delivery is not confirmed.'};
   } catch(error) {
-    return {status:dispatched?'unknown':'not_sent',submission_id:request.submission_id,error:dispatched?'The send outcome is uncertain. Check Sent mail; Nexus will not resend this approval automatically.':publicError(error).slice(0,400)};
+    if(!dispatched&&ownedComposer&&recoveryFile) {
+      try {
+        await rememberReplyComposer(value,recoveryFile,recoveryBinding,String(request.incoming.reply_to||request.incoming.sender).toLowerCase());
+      }catch{} // Never claim ownership when the remaining composer cannot be proved.
+    }
+    const message=publicError(error);
+    if(dispatched&&record){record.failure_stage=stage;try{saveSubmission(file,record);}catch{}}
+    const detail=message.includes(NEXT_SCAN)?`The mailbox stopped responding while ${stage}. Your draft is saved; nothing was sent. Use Review & send reply to retry.`:message;
+    return {status:dispatched?'unknown':'not_sent',retryable_preparation:!dispatched&&error.code==='reply_preparation',submission_id:request.submission_id,error:dispatched?`The browser stopped while ${stage}. Check Sent mail; Nexus will not resend this approval automatically.`:detail.slice(0,400)};
+  } finally {
+    if(sentView)await sentView.page.close().catch(()=>{});
   }
 }
 async function close() { await Promise.allSettled([...sessions.values()].map(s=>s.context.close())); sessions.clear(); }
@@ -1193,4 +1554,4 @@ if (require.main === module) {
   lines.on('close',()=>close().finally(()=>process.exit(0)));
   process.on('SIGTERM',()=>close().finally(()=>process.exit(0)));
 }
-module.exports={readIdentity,readRows,scrollList,readMessage,inboxState,inboxSignals,selectedFolderKey,selectedTabName,paneView,paneShowsRow,paneProvesRow,paneNamesOther,waitForInbox,onInbox,inboxUrl,budgets,hydrationBudget,identityBudget,watchReloads,handle,close,status,operate,resolveSenderCard,session,sendReviewed,readComposer,safeRowWarning,publicError};
+module.exports={sentBodyWitness,sentPaneSnapshot,openSentWitness,readIdentity,readRows,scrollList,readMessage,inboxState,inboxSignals,selectedFolderKey,selectedTabName,paneView,paneShowsRow,paneProvesRow,paneNamesOther,waitForInbox,onInbox,inboxUrl,budgets,hydrationBudget,identityBudget,watchReloads,handle,close,status,operate,resolveSenderCard,session,sendReviewed,readComposer,insertReviewedBody,rememberReplyComposer,replyReviewTab,locateReplyRow,safeRowWarning,publicError};

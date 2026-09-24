@@ -182,18 +182,20 @@ def snapshot(goal, runtime_root, source, *, changes=None, identity=""):
 def load_snapshot(goal, runtime_root, snapshot_id):
     # IDs are looked up in task-owned durable tool receipts, never accepted as paths.
     for task in goal["tasks"]:
-        for step in task.get("context_steps", []):
-            for observation in step.get("results", []):
-                value = observation.get("result") or {}
-                if value.get("snapshot_id") == snapshot_id and value.get("path"):
-                    root = Path(value["path"])
-                    home = Path(runtime_root) / "collaboration-snapshots"
-                    if root.resolve().parent.parent.parent != home.resolve():
-                        raise HarnessError("Snapshot ownership changed")
-                    receipt = gw._verify(gw._key(home / "goal-workspaces"), json.loads((root.parent / "submission.json").read_text(encoding="utf-8")))
-                    if receipt.get("goal_id") != goal["goal_id"] or receipt.get("contract") != CONTRACT or gw._digest(aw.inventory(root)) != value["fingerprint"] or receipt["files"] != aw.inventory(root):
-                        raise HarnessError("Snapshot changed since it was captured")
-                    return root
+        # Steps trimmed from a long history keep their snapshot receipts.
+        observations = [one for step in task.get("context_steps", []) for one in step.get("results", [])]
+        observations += [one for one in task.get("trimmed_receipts", []) if isinstance(one, dict)]
+        for observation in observations:
+            value = observation.get("result") or {}
+            if value.get("snapshot_id") == snapshot_id and value.get("path"):
+                root = Path(value["path"])
+                home = Path(runtime_root) / "collaboration-snapshots"
+                if root.resolve().parent.parent.parent != home.resolve():
+                    raise HarnessError("Snapshot ownership changed")
+                receipt = gw._verify(gw._key(home / "goal-workspaces"), json.loads((root.parent / "submission.json").read_text(encoding="utf-8")))
+                if receipt.get("goal_id") != goal["goal_id"] or receipt.get("contract") != CONTRACT or gw._digest(aw.inventory(root)) != value["fingerprint"] or receipt["files"] != aw.inventory(root):
+                    raise HarnessError("Snapshot changed since it was captured")
+                return root
     raise HarnessError("Request a snapshot from this goal before verifying it")
 
 
