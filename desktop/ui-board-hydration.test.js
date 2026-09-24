@@ -269,3 +269,115 @@ test("an error on another view leaves the swarm status line as it was", () => {
   assert.equal(node("validationStatus").className, "status-fail");
   assert.equal(node("swarmSaid").textContent, "Your board is as you left it.");
 });
+
+test("a board run the server no longer has stops the watch with a clear message instead of retrying forever", async () => {
+  for (const gone of [
+    Object.assign(new Error("Not found"), {status: 404}),
+    Object.assign(new Error("Gone"), {status: 410}),
+    Object.assign(new Error("That Swarm run does not exist"), {status: 400}),
+  ]) {
+    const w = runWatchFixture();
+    const stored = [];
+    w.context.localStorage = {removeItem(key) { stored.push(key); }};
+    w.context.sayInSwarm = (words) => { w.said.swarmSaid = {textContent: words}; };
+    w.answers = [gone];
+    w.context.watchWhatTheyAreDoing();
+    await w.fire();
+    assert.equal(w.asks, 1, gone.message);
+    assert.equal(w.timers.size, 0, "a gone run is not asked about again");
+    assert.equal(w.context.swarmWatching, 0);
+    assert.equal(w.context.swarmBoardRunId, "", "later reads ask about the board's current run");
+    assert.ok(stored.includes("nexus.swarm.board-run"));
+    assert.equal(w.rendered.at(-1), null, "the board is no longer held by the gone run");
+    assert.match(w.said.swarmDoingSaid.textContent, /no longer has it/);
+    assert.match(w.said.swarmSaid.textContent, /no longer has it/);
+    assert.equal(w.refreshed, 1);
+  }
+  // Refusals that can pass - a busy server, a lost session - keep the backoff.
+  for (const transient of [
+    Object.assign(new Error("Busy"), {status: 503}),
+    Object.assign(new Error("The session expired."), {status: 403}),
+    Object.assign(new Error("Bad request"), {status: 400}),
+    new Error("Failed to fetch"),
+  ]) {
+    const w = runWatchFixture();
+    w.answers = [transient];
+    w.context.watchWhatTheyAreDoing();
+    await w.fire();
+    assert.equal(w.timers.size, 1, transient.message);
+    assert.equal(w.context.swarmBoardRunId, "run-portable");
+  }
+});
+
+function goalControlsFixture({queue = null, longGoal = null, onBoard = true} = {}) {
+  const nodes = new Map();
+  const node = (id) => {
+    if (!nodes.has(id)) nodes.set(id, {textContent: "", disabled: false, title: ""});
+    return nodes.get(id);
+  };
+  const calls = [];
+  const context = vm.createContext({
+    held: "", boardGoalPause: "", swarmGoing: false, swarmGoalWorkRunning: false,
+    swarmGoalQueue: queue, longGoal, longGoals: longGoal ? [longGoal] : [], $: node,
+    theSwarmProject(id) { return onBoard ? {id} : null; },
+    cancelRemainingBoardGoals: async () => { calls.push("legacy"); },
+    cancelLongGoal: async () => { calls.push("long"); },
+    SWARM_GOAL_QUEUE_REQUEST_KEY: "portable.queue", localStorage: {removeItem() {}},
+    setWhatCanBePressedInSwarm() {},
+  });
+  vm.runInContext(section("function legacyBoardGoalsCanBeCancelled", "// ---- changing it")
+    + section("function legacyQueueIsTheSelectedGoalWork", "async function cancelRemainingBoardGoals")
+    + section("function showBoardGoalQueue", "async function refreshBoardGoalQueue")
+    + "\nfunction pressable() {\n"
+    + section('  $("swarmCancelGoals").disabled', '  const longProjectWorkActive')
+    + "}\n", context);
+  return {context, node, calls};
+}
+
+test("Cancel remaining goals cancels what the user selected", async () => {
+  const waiting = {queue_id: "queue-portable", status: "queued", total: 2, completed: 0,
+    current: {project_id: "project-here"}};
+  const otherProject = {goal_id: "goal-elsewhere", status: "running", project: {id: "project-elsewhere"}};
+  let f = goalControlsFixture({queue: waiting, longGoal: otherProject});
+  await f.context.cancelTheSwarmGoals();
+  assert.deepEqual(f.calls, ["long"], "the selected long-horizon goal on another project is what is cancelled");
+  f = goalControlsFixture({queue: waiting, longGoal: {...otherProject, project: {id: "project-here"}}});
+  await f.context.cancelTheSwarmGoals();
+  assert.deepEqual(f.calls, ["legacy"]);
+  f = goalControlsFixture({queue: waiting});
+  await f.context.cancelTheSwarmGoals();
+  assert.deepEqual(f.calls, ["legacy"]);
+  f = goalControlsFixture({queue: waiting, longGoal: {...otherProject, status: "complete"}});
+  await f.context.cancelTheSwarmGoals();
+  assert.deepEqual(f.calls, ["legacy"], "a finished selected goal leaves the waiting queue as the work to cancel");
+  f = goalControlsFixture({queue: waiting, onBoard: false});
+  await f.context.cancelTheSwarmGoals();
+  assert.deepEqual(f.calls, [], "a queue from a board that is not open is not cancelled from here");
+  assert.match(f.node("swarmGoalWorkSaid").textContent, /board that is not open/);
+  f = goalControlsFixture({queue: waiting, longGoal: otherProject, onBoard: false});
+  await f.context.cancelTheSwarmGoals();
+  assert.deepEqual(f.calls, ["long"]);
+});
+
+test("the running-chat reason is shown only while it is why Cancel is greyed out", () => {
+  const running = {status: "running", total: 1, completed: 0, current: {project_id: "project-here"}};
+  let f = goalControlsFixture({queue: running});
+  f.context.pressable();
+  assert.equal(f.node("swarmCancelGoals").disabled, true);
+  assert.match(f.node("swarmCancelGoals").title, /Stop the exact active chat run first/);
+  f = goalControlsFixture({queue: running, longGoal: {status: "running", project: {id: "project-elsewhere"}}});
+  f.context.pressable();
+  assert.equal(f.node("swarmCancelGoals").disabled, false);
+  assert.equal(f.node("swarmCancelGoals").title, "");
+});
+
+test("finished board goals repeat the server's note, which says when agents agreed without a check", () => {
+  const f = goalControlsFixture();
+  f.context.showBoardGoalQueue({status: "complete", total: 2,
+    note: "All 2 board goals are complete. Some were agreed done by the agents without an automatic check."});
+  assert.match(f.node("swarmGoalWorkSaid").textContent, /agreed done by the agents without an automatic check/);
+  f.context.showBoardGoalQueue({status: "complete", total: 3, note: ""});
+  assert.equal(f.node("swarmGoalWorkSaid").textContent, "All 3 board goal(s) are complete.");
+  assert.doesNotMatch(section("async function cancelRemainingBoardGoals", "async function stopThemGoing"),
+    /Verified completed goals/);
+});

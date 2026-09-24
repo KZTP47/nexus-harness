@@ -765,6 +765,41 @@ class WhoWorksOnWhat(BoardTestCase):
         grown["projects"][-1]["path"] = other
         self.assertEqual(len(swarm.save(grown, self.config).projects), 3)
 
+    @unittest.skipUnless(os.name == "nt", "Windows folder names ignore letter case")
+    def test_an_import_cannot_bring_in_a_case_duplicate_folder(self) -> None:
+        where = str(self.a_project("CaseImport"))
+        document = {"name": "Crafted", "board": {
+            "agents": [], "works_on": [], "talks_to": [],
+            "projects": [{"id": "project-1", "path": where, "tasks": []},
+                         {"id": "project-2", "path": where.lower(), "tasks": []}],
+        }}
+        with self.assertRaisesRegex(swarm.SwarmError, "twice"):
+            swarm.import_kept_board(document)
+        self.assertFalse(any(swarm.where_the_kept_ones_live().glob("*.json"))
+                         if swarm.where_the_kept_ones_live().exists() else False)
+
+    @unittest.skipUnless(os.name == "nt", "Windows folder names ignore letter case")
+    def test_a_kept_board_with_an_old_case_pair_reopens_over_another_board(self) -> None:
+        where = str(self.a_project("CaseProject"))
+        swarm.where_it_lives().parent.mkdir(parents=True, exist_ok=True)
+        swarm.where_it_lives().write_text(json.dumps({
+            "agents": [], "works_on": [], "talks_to": [],
+            "projects": [{"id": "project-1", "path": where, "tasks": []},
+                         {"id": "project-2", "path": where.upper(), "tasks": []}],
+        }), encoding="utf-8")
+        swarm.keep_this_board("Legacy", self.config)
+        live = swarm.load().to_dict()
+        live["projects"] = [{"id": "project-1", "path": str(self.a_project("Other")), "tasks": []}]
+        swarm.save(live, self.config)
+        # The duplicate belongs to the kept board, not to the board it replaces.
+        opened = swarm.open_this_board("Legacy", self.config)
+        self.assertEqual(len(opened.projects), 2)
+        # A new copy on top of the reopened board is still refused.
+        grown = opened.to_dict()
+        grown["projects"].append({"id": "project-3", "path": where.swapcase(), "tasks": []})
+        with self.assertRaisesRegex(swarm.SwarmError, "twice"):
+            swarm.save(grown, self.config)
+
 
 class HowMuchFitsOnIt(BoardTestCase):
     def test_more_agents_than_fit_are_refused_not_left_off(self) -> None:
@@ -1041,6 +1076,85 @@ class SettingThemGoing(BoardTestCase):
         later = self.asked[2][2]
         self.assertIn("The writer on the board says so", later)
         self.assertIn("page", later.lower())
+
+    def test_the_first_round_never_tells_a_capable_agent_it_cannot(self) -> None:
+        self.a_working_board()
+        self.a_run()
+        first = self.asked[0][2]
+        self.assertNotIn("cannot", first.lower())
+        self.assertIn("advice round", first)
+        self.assertIn("welcome to look", first)
+
+    def test_the_second_round_does_not_repeat_page_answers_in_the_inbox(self) -> None:
+        # Every first-round answer used to arrive twice - on the page and again
+        # in the AGENT INBOX - doubling the prompt.
+        self.a_working_board()
+        self.a_run()
+        later = self.asked[2][2]
+        self.assertEqual(later.count("The writer on the board says so"), 1)
+        self.assertIn("AGENT INBOX", later)
+        self.assertIn("not repeated here", later)
+
+    def test_a_run_tells_the_mailbox_which_boards_still_exist(self) -> None:
+        self.a_working_board()
+        swarm.keep_this_board("Kept", self.config)
+        legacy_file = swarm.where_the_kept_ones_live() / "legacy-board.json"
+        legacy_board = swarm.load().to_dict()
+        legacy_board.pop("workspace_id", None)
+        legacy_file.write_text(json.dumps({"name": "Legacy", "board": legacy_board}),
+                               encoding="utf-8")
+        known = swarm._kept_board_workspaces()
+        self.assertEqual(len(known), 2)
+        kept_id = json.loads(next(
+            one for one in swarm.where_the_kept_ones_live().glob("*.json")
+            if one != legacy_file
+        ).read_text(encoding="utf-8"))["board"]["workspace_id"]
+        self.assertIn(kept_id, known)
+        # An old snapshot without an id is known under the id it opens with.
+        self.assertIn(swarm._kept_board_workspace_id(
+            legacy_file, "Legacy", swarm.read_it(legacy_board)), known)
+
+        calls = []
+        real = agent_mailbox.retire_superseded_goals
+
+        def recorded(*args, **kwargs):
+            calls.append(kwargs)
+            return real(*args, **kwargs)
+
+        with mock.patch.object(agent_mailbox, "retire_superseded_goals", side_effect=recorded):
+            self.a_run()
+        self.assertEqual(calls[-1]["workspace"], swarm.load().workspace_id)
+        self.assertCountEqual(calls[-1]["known_workspaces"], known)
+
+        # One unreadable saved board: pass no list at all, never a partial one.
+        (swarm.where_the_kept_ones_live() / "broken.json").write_text("{broken", encoding="utf-8")
+        self.assertIsNone(swarm._kept_board_workspaces())
+        calls.clear()
+        with mock.patch.object(agent_mailbox, "retire_superseded_goals", side_effect=recorded):
+            self.a_run()
+        self.assertIsNone(calls[-1]["known_workspaces"])
+
+    def test_an_unlistable_saved_board_folder_is_unknown_not_empty(self) -> None:
+        with mock.patch.object(swarm.os, "scandir", side_effect=PermissionError("denied")):
+            self.assertIsNone(swarm._kept_board_workspaces())
+        missing = self.root / "no-saved-boards-here"
+        with mock.patch.object(swarm, "where_the_kept_ones_live", return_value=missing):
+            self.assertEqual(swarm._kept_board_workspaces(), [])
+        a_file = self.root / "not-a-folder.json"
+        a_file.write_text("{}", encoding="utf-8")
+        with mock.patch.object(swarm, "where_the_kept_ones_live", return_value=a_file):
+            self.assertIsNone(swarm._kept_board_workspaces())
+
+    def test_an_inbox_message_that_is_not_on_the_page_keeps_its_words(self) -> None:
+        text = swarm._messages_for_a_prompt(
+            [("One", "on the page"), ("Two", "only in the mailbox")],
+            on_the_page={"on the page": 3},
+        )
+        self.assertIn("Message from One: the same words as Part 3", text)
+        self.assertIn("Message from Two:\nonly in the mailbox", text)
+        self.assertEqual(
+            swarm._messages_for_a_prompt([("One", "on the page")]).count("on the page"), 1,
+        )
 
     def test_an_agent_is_told_whose_words_it_is_reading(self) -> None:
         """Without this an assistant reads another assistant's words as if the
@@ -3611,7 +3725,9 @@ removeDirectLongGoalOutbox("chat-two", "request-two", "a".repeat(64))
         self.assertIn('answered.routing?.selected === "collaborate"', self.script)
         self.assertIn("said.partial_provider_failure || automaticRoundStopWords(said)", self.script)
         self.assertIn("answered.partial_provider_failure || automaticRoundStopWords(answered)", self.script)
-        self.assertIn('function appendChatText(container, text)', self.script)
+        # Since v0.2.28 the saved turn's correlation lets a long-horizon action
+        # payload be shown as a payload, not as a delivery receipt.
+        self.assertIn('function appendChatText(container, text, correlation = null)', self.script)
         self.assertIn('make("button", "chat-code-copy", "Copy code")', self.script)
         self.assertIn('navigator.clipboard?.writeText', self.script)
         self.assertIn(".chat-code-block", self.styles)
@@ -3854,12 +3970,24 @@ removeDirectLongGoalOutbox("chat-two", "request-two", "a".repeat(64))
             self.script.index("function setWhatCanBePressedInSwarm"):
             self.script.index("// ---- changing it")
         ]
+        # Team collaboration needs a connected peer, so a lone chat holds it.
         self.assertIn('waiting || lone || !agent || !agent.ready', compact)
-        self.assertIn('const workDisabled = waiting || lone', compact)
         self.assertIn('$("theBigChatCollaborate").disabled = waiting || lone', enlarged)
-        self.assertIn('waiting || lone || Boolean(recovery)', enlarged)
-        self.assertIn('["collaborate", "work"].includes(mode) && isLoneAgentChat(agentId)',
-                      self.script)
+        self.assertEqual(
+            self.script.count('if (mode === "collaborate" && isLoneAgentChat(agentId))'), 2,
+        )
+        # Project work is not team-only: since v0.2.28 a lone agent may work on
+        # the project files it was given (agents lead; restrict only when the
+        # user says so), and the button is named for one agent.
+        work_rule = compact[compact.index("const workDisabled ="):compact.index("const workTitle")]
+        self.assertIn("const workDisabled = waiting || !agent || !agent.ready", work_rule)
+        self.assertNotIn("lone", work_rule)
+        self.assertIn('setSwarmProjectWorkControl($("theBigChatWork"), '
+                      'waiting || !chatAgent || !chatAgent.ready || Boolean(recovery)', enlarged)
+        self.assertIn('lone ? "Work on project files" : "Work together on project files"', enlarged)
+        self.assertNotIn('waiting || lone || Boolean(recovery)', enlarged)
+        self.assertNotIn('["collaborate", "work"].includes(mode) && isLoneAgentChat(agentId)',
+                         self.script)
         self.assertNotIn('$("theBigChatSend").disabled = waiting || lone', enlarged)
         self.assertNotIn('$("theBigChatAttach").disabled = waiting || lone', enlarged)
         self.assertIn("const hydrating = swarmChatIsHydrating(theBigOne)", enlarged)
@@ -6061,9 +6189,16 @@ class WhatThePanelIsTold(BoardTestCase):
         old_route_binding = copy.deepcopy(
             changed_chat["binding"]["agent_routes"][lead_id]
         )
+        old_identities = copy.deepcopy(changed_chat["binding"].get("route_identities"))
         changed_chat["binding"]["agent_routes"][lead_id][
             "effective_dispatch_fingerprint_sha256"
         ] = "f" * 64
+        # A drifted dispatch digest alone is a tunable change that a chat
+        # records and continues from; the refusal below is for a chat whose
+        # saved provider identity no longer matches.
+        changed_chat["binding"]["route_identities"][lead_id][
+            "route_identity_sha256"
+        ] = "e" * 64
         swarm_chats._write(self.panel.config, changed_registry)  # noqa: SLF001
         with self.assertRaises(server.HarnessError):
             self.panel.admit_direct_long_horizon(
@@ -6082,6 +6217,7 @@ class WhatThePanelIsTold(BoardTestCase):
             "f" * 64,
         )
         changed_chat["binding"]["agent_routes"][lead_id] = old_route_binding
+        changed_chat["binding"]["route_identities"] = old_identities
         swarm_chats._write(self.panel.config, changed_registry)  # noqa: SLF001
 
         reprepared = self.panel.prepare_direct_long_horizon(supplied)
@@ -11229,7 +11365,10 @@ async function request(path, options = {}) {
         }
         assertions = r'''
 assert.equal(prepareDraft, words);
-assert.deepEqual(events.find(event => event.kind === "prepare").body.policy, {agent_access_mode:"ask",execution_mode:"facilitator"});
+// No saved access choice for this chat: since v0.2.28 the composer offers
+// Full project access (agents lead; the user restricts explicitly).
+// No mode was picked in this chat: the composer sends none (""), and the server applies its Full default.
+assert.deepEqual(events.find(event => event.kind === "prepare").body.policy, {agent_access_mode:"",execution_mode:"facilitator"});
 assert.equal(startDraft, "", "draft must clear only after exact prepare receipt");
 assert.equal(box.value, "");
 assert.deepEqual(events.map((event) => event.kind), [

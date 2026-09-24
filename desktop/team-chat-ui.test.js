@@ -936,3 +936,25 @@ test("compact: an answer that arrives after its chat card was closed is still re
   assert.deepEqual(answered, {said: []},
     "a board-goal queue waiting on this answer must see that it was answered");
 });
+
+test("finished board work says verified only when an automatic check passed", () => {
+  const context = vm.createContext({
+    normalizedParticipantOutcome() { return null; }, automaticRoundStopWords() { return ""; },
+  });
+  vm.runInContext(section("function goalAutomaticChecksPassed", "function finishLongHorizonAdmissionActivity")
+    + section("function workResponseWords", "async function resumeSwarmWork"), context);
+  const words = (answered) => context.workResponseWords(answered, "Builder", "Builder answered.");
+  const checked = words({status: "complete", goal_complete: true, verified: true, machine_verified: true,
+    verification_status: "deterministically_verified", changed: ["a.txt"]});
+  assert.match(checked, /done and the automatic checks passed/);
+  assert.match(checked, /applied 1 file change/);
+  const agreed = words({status: "complete", goal_complete: true, verified: true, machine_verified: false,
+    verification_status: "agent_verified", changed: [],
+    deterministic_verification: {status: "not_configured", requirement_contract: {planned_effect_paths: ["docs/guide.md"]},
+      requirement_evidence: {artifacts: {advisory_unmet: []}}}});
+  assert.match(agreed, /Agents agreed it is done; no automatic check was available/);
+  assert.doesNotMatch(agreed, /verified|checks passed/i);
+  assert.match(agreed, /Hint: the goal's wording mentions docs\/guide\.md/);
+  assert.equal(words({status: "incomplete"}).startsWith("The long-horizon goal is still incomplete"), true);
+  assert.equal(words({status: "", said: []}), "Builder answered.", "ordinary chat replies are unchanged");
+});

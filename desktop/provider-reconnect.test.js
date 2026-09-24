@@ -67,6 +67,26 @@ test("saved chat reconnection reviews exact setup, refreshes bindings and leaves
       assert.equal(await page.locator('#panel').evaluate(n=>n.scrollWidth<=n.clientWidth+1),true);
       await page.screenshot({path:path.join(output,'reconnect-'+width+'.png'),fullPage:true});
     }
+    // A chat whose own binding is current but whose goal's provider route
+    // changed is offered the same review; it is sent only when pressed.
+    await page.setViewportSize({width:1264,height:850});
+    await page.evaluate(()=>{
+      fail=false;calls.length=0;refreshed.length=0;
+      const current={id:'goal-drift-chat'};
+      window.renderGoalDrift=(forGoal)=>{const p=document.getElementById('panel');delete p.dataset.snapshot;
+        fillChatGoalPanel(p,'original-agent',{goal:{goal_id:'drifted-goal',revision:6,status:'paused',provider_setup_changed:true},
+          problem:'The saved provider setup changed for Builder.',reconnectChat:current,
+          ...(forGoal?{reconnectForGoal:true}:{})});};
+      renderGoalDrift(false);
+    });
+    assert.equal(await reconnect.count(),0,"a current chat without goal drift offers no reconnect");
+    await page.evaluate(()=>renderGoalDrift(true));
+    assert.equal(await reconnect.isVisible(),true);
+    assert.deepEqual(await page.evaluate(()=>calls),[],"showing the action sends nothing");
+    page.once("dialog", dialog=>dialog.accept());
+    await reconnect.click();
+    await page.getByRole('status').filter({hasText:'Use Resume team'}).waitFor();
+    assert.deepEqual(await page.evaluate(()=>calls.map(c=>c.body.chat)),['goal-drift-chat','goal-drift-chat']);
     console.log('Reconnect screenshots: '+output);
   } finally {await browser.close();}
 });

@@ -7452,10 +7452,27 @@ function chatLongGoalContext(agentId, snapshots = longGoals) {
       ? goal.collaboration_contract_status?.message
         || "This saved goal uses an older collaboration engine. Open advanced goal details to keep its history and cancel it, then start a fresh Work together goal."
       : "");
+  // The saved chat's reconnect review also carries a goal whose own provider
+  // setup drifted while the chat itself still looks current, so offer it for
+  // either. Only the user's press sends it.
+  const reconnectForGoal = matches && !conversation.binding_problem?.can_review_reconnect
+    && goalSetupCanBeReconnected(goal);
   return {goal, problem: String(problem || ""),
     ...(matches && conversation.binding_problem ? {repairChat: conversation} : {}),
-    ...(matches && conversation.binding_problem?.can_review_reconnect
-      ? {reconnectChat: conversation} : {})};
+    ...(matches && (conversation.binding_problem?.can_review_reconnect || reconnectForGoal)
+      ? {reconnectChat: conversation} : {}),
+    ...(reconnectForGoal ? {reconnectForGoal: true} : {})};
+}
+
+// A goal whose provider route changed (a new account, endpoint or program)
+// can be carried over by the chat's reconnect review, whatever the goal's own
+// status suggests; the server re-checks everything before it applies.
+function goalSetupCanBeReconnected(goal) {
+  const status = goal?.provider_setup_status || {};
+  return Boolean(goal?.provider_setup_changed === true
+    || status.code === "route_identity_changed"
+    || (Array.isArray(status.agents)
+      && status.agents.some((one) => one?.code === "route_identity_changed")));
 }
 
 function chatGoalBinding(agentId, goal) {
@@ -8225,7 +8242,10 @@ function fillChatGoalPanel(container, agentId, context) {
   panel.append(make("p", "hint", problem || (pending.length
     ? "The team needs your answers before it can continue."
     : "Send a message below to steer both agents. Their replies and progress stay in this chat.")));
-  if (context.reconnectChat) appendProviderReconnectControl(panel, agentId, context.reconnectChat);
+  if (context.reconnectChat) {
+    appendProviderReconnectControl(panel, agentId, context.reconnectChat,
+      {forGoal: Boolean(context.reconnectForGoal)});
+  }
   else if (context.repairChat) {
     const conversation = context.repairChat;
     const fresh = make("button", "primary chat-team-repair", conversation.binding_problem.action_label || "Start fresh with current setup");
@@ -8350,9 +8370,11 @@ function fillChatGoalPanel(container, agentId, context) {
   accessControls();
 }
 
+// Returns the mode the user picked for this chat, or "" when they never picked
+// one: the server then applies its own default (Full, recorded as the default).
 function chatComposerAccessPreference(conversation, mode = null) {
   const allowed = ["read_only", "ask", "full"];
-  if (!conversation?.id) return "full";
+  if (!conversation?.id) return "";
   const key = `nexus.chat-composer-access.v1:${conversation.id}`;
   const binding = JSON.stringify(directLongGoalCanonicalValue({
     contract: "chat-composer-access/v1", project: conversation.project,
@@ -8366,7 +8388,7 @@ function chatComposerAccessPreference(conversation, mode = null) {
     const saved = JSON.parse(localStorage.getItem(key) || "null");
     if (saved?.schema_version === 1 && saved.binding === binding && allowed.includes(saved.mode)) return saved.mode;
   } catch {}
-  return "full";
+  return "";
 }
 
 function fillChatComposerPermissions(host, agentId, context, inline = false) {
@@ -8375,7 +8397,7 @@ function fillChatComposerPermissions(host, agentId, context, inline = false) {
   const goal = context.goal;
   const active = goal && !["complete", "cancelled"].includes(goal.status);
   const labels = {read_only: "Read only", ask: "Ask before commands", full: "Full project access"};
-  const mode = active ? goal.agent_access?.mode || "ask" : chatComposerAccessPreference(conversation);
+  const mode = active ? goal.agent_access?.mode || "ask" : chatComposerAccessPreference(conversation) || "full";
   const needsInput = active && goal.command_request?.state === "pending";
   const signature = JSON.stringify([conversation?.id, conversation?.binding, conversation?.project,
     goal?.goal_id, goal?.status, goal?.agent_access, goal?.command_request, goal?.scheduler_live,
@@ -11227,7 +11249,13 @@ function longHorizonAdmissionWords(goal) {
     if (goal?.execution_workspace && goal.workspace_publication?.state !== "published") {
       return {stage: "Result awaiting publication", detail: `Goal ${goalId} has not published its independent result to the project. Open its goal details to inspect the saved status.`};
     }
-    return {stage: "Goal verified complete", detail: `Durable goal ${goalId} already has verified completion evidence.`};
+    // "Verified" only when an automatic check really passed. A goal may also be
+    // complete because the agents agreed it is done when no check could run
+    // (for example no project tests were configured); say that plainly.
+    if (goalAutomaticChecksPassed(goal)) {
+      return {stage: "Goal verified complete", detail: `Durable goal ${goalId} already has verified completion evidence.`};
+    }
+    return {stage: "Goal complete", detail: `Durable goal ${goalId} is done. ${agentsAgreedWords()}`};
   }
   if (status === "failed") {
     return {stage: "Goal failed", detail: `Durable goal ${goalId} failed; Mission control has the recorded reason.`};
@@ -11242,6 +11270,115 @@ function longHorizonAdmissionWords(goal) {
     return {stage: "Goal cancelled", detail: `Durable goal ${goalId} was cancelled and is not complete.`};
   }
   return {stage: "Goal status received", detail: `Durable goal ${goalId} has status “${status}” in Mission control.`};
+}
+
+// A goal can be done two ways: an automatic check passed, or - when no check
+// could run - every agent agreed it is done. Both are complete; only the first
+// is called verified. Results from board work say which in verification_status
+// (deterministically_verified or agent_verified) and machine_verified; a
+// long-horizon goal says it in its recorded verification.
+function goalAutomaticChecksPassed(result) {
+  if (!result) return false;
+  const how = String(result.verification_status || "");
+  if (how === "deterministically_verified") return true;
+  if (how === "agent_verified") return false;
+  if (result.machine_verified === true) return true;
+  if (result.machine_verified === false) return false;
+  return result.verification?.status === "passed";
+}
+
+function agentsAgreedWords() {
+  return "Agents agreed it is done; no automatic check was available.";
+}
+
+// Short, plain notes about how a goal or a board-work result went: things the
+// user may want to know, none of them a failure or a veto. Reads a
+// long-horizon goal (its workspace, tasks, access and provider status) or a
+// board-work result (its deterministic_verification), whichever it is given.
+function goalResultNotices(value, events = []) {
+  if (!value || typeof value !== "object") return [];
+  const notes = [];
+  const plural = (count, one, many) => `${count} ${count === 1 ? one : many}`;
+  const skipped = Number(value.execution_workspace?.skipped_links?.count
+    ?? value.skipped_links?.count ?? 0);
+  if (skipped > 0) {
+    notes.push(`${plural(skipped, "linked file was", "linked files were")} left out of the private copy.`);
+  }
+  const judged = [
+    ...(Array.isArray(value.evidence_notes) ? value.evidence_notes : []),
+    ...(Array.isArray(value.tasks) ? value.tasks : [])
+      .flatMap((task) => task?.closeout_outcome?.evidence_notes || []),
+  ].map((one) => String(one || "").trim()).filter(Boolean);
+  for (const one of judged.slice(0, 3)) notes.push(one.endsWith(".") ? one : `${one}.`);
+  if (judged.length > 3) notes.push(`${judged.length - 3} more judge note(s) are in the goal details.`);
+  const repeated = (Array.isArray(events) ? events : [])
+    .filter((event) => event?.type === "closeout_repeated_findings").at(-1);
+  if (repeated) {
+    const times = Number(repeated.payload?.previous_rejections || 0);
+    notes.push(`Judges asked for changes to the same submission${times ? ` ${times} times` : ""}; the agents keep working. Pause the goal if you want to step in.`);
+  }
+  if (value.provider_setup_status?.refresh_pending === true || value.refresh_pending === true) {
+    notes.push("Only provider settings such as the model or program version changed; Nexus refreshes the saved setup before the next turn.");
+  }
+  const denied = Object.values(value.agent_access?.grants || {})
+    .filter((grant) => grant?.decision === "deny");
+  // command_denials says, for each denied command, which agents' CLIs block it
+  // for real and for which the agent is only asked not to run it.
+  const denials = Array.isArray(value.command_denials) ? value.command_denials : [];
+  for (const one of denials.slice(0, 3)) notes.push(commandDenialWords(one));
+  if (denials.length > 3) notes.push(`${denials.length - 3} more denied command(s) are in the goal details.`);
+  if (!denials.length && denied.length) {
+    notes.push(`You denied ${plural(denied.length, "command request", "command requests")}; the agents were told not to run ${denied.length === 1 ? "it" : "them"}. Everything else stays available.`);
+  }
+  const checked = value.verification || value.deterministic_verification || {};
+  const evidence = checked.requirement_evidence || {};
+  const advisoryIds = [...new Set([evidence, evidence.artifacts, evidence.execution]
+    .flatMap((one) => (Array.isArray(one?.advisory_unmet) ? one.advisory_unmet : []))
+    .map(String))];
+  if (advisoryIds.length) {
+    const described = new Map((checked.requirement_contract?.requirements || [])
+      .map((one) => [String(one?.id || ""), String(one?.description || "")]));
+    const names = advisoryIds.map((id) => described.get(id) || id);
+    notes.push(`Not required, but not done: ${names.slice(0, 4).join("; ")}${names.length > 4 ? ` and ${names.length - 4} more` : ""}.`);
+  }
+  const planned = (checked.requirement_contract?.planned_effect_paths || []).map(String).filter(Boolean);
+  if (planned.length) {
+    notes.push(`Hint: the goal's wording mentions ${planned.slice(0, 4).join(", ")}${planned.length > 4 ? ` and ${planned.length - 4} more` : ""}; the agents decide what to change.`);
+  }
+  return notes;
+}
+
+function commandDenialWords(denial) {
+  const commands = (Array.isArray(denial?.commands) ? denial.commands : [])
+    .map((one) => (Array.isArray(one) ? one.map(String).join(" ") : String(one ?? "")).trim())
+    .filter(Boolean);
+  const shown = commands.length
+    ? commands.slice(0, 2).map((one) => `\`${one.length > 120 ? `${one.slice(0, 117)}...` : one}\``).join(", ")
+      + (commands.length > 2 ? ` and ${commands.length - 2} more` : "")
+    : "a command";
+  const agents = Array.isArray(denial?.agents) ? denial.agents : [];
+  const names = (enforcement) => agents.filter((one) => one?.enforcement === enforcement)
+    .map((one) => String(one?.name || one?.agent_id || "an agent"));
+  const blocked = names("cli_rule");
+  const asked = agents.filter((one) => one?.enforcement !== "cli_rule")
+    .map((one) => String(one?.name || one?.agent_id || "an agent"));
+  const list = (items) => (items.length > 1
+    ? `${items.slice(0, -1).join(", ")} and ${items.at(-1)}` : items[0]);
+  let how = "";
+  if (blocked.length && asked.length) {
+    how = ` ${list(blocked)}'s CLI blocks it; for ${list(asked)} this is a request, not a hard block.`;
+  } else if (blocked.length) {
+    const who = blocked.length > 1 ? "Every agent's CLI blocks it" : `${list(blocked)}'s CLI blocks it`;
+    how = ` ${who}.`;
+  } else if (asked.length) {
+    how = ` For ${list(asked)} this is a request, not a hard block: the CLI cannot enforce it, so the agent is told not to run it.`;
+  }
+  return `You denied ${shown}.${how}`;
+}
+
+function resultNoticesWords(value) {
+  const notes = goalResultNotices(value);
+  return notes.length ? ` ${notes.join(" ")}` : "";
 }
 
 function finishLongHorizonAdmissionActivity(agentId, goal, expectedActivity) {
@@ -12701,7 +12838,9 @@ function setWhatCanBePressedInSwarm() {
     || (swarmGoalWorkRunning ? "Goal work is starting." : ""));
   $("swarmCancelGoals").disabled = !legacyBoardGoalsCanBeCancelled() && (!longGoal
     || ["complete", "cancelled"].includes(longGoal.status));
-  $("swarmCancelGoals").title = swarmGoalQueue?.status === "running"
+  // The reason is shown only while it is the reason the button is greyed out.
+  $("swarmCancelGoals").title = $("swarmCancelGoals").disabled
+    && swarmGoalQueue?.status === "running"
     ? "Stop the exact active chat run first; then cancel the remaining board goals." : "";
   const longProjectWorkActive = longGoals.some((goal) => (
     ["waiting_for_project", "queued", "running", "paused", "waiting_for_user"]
@@ -13364,8 +13503,10 @@ async function createConversationFor(agentId, peerId, scope = "", {focus = true}
   }
 }
 
-function appendProviderReconnectControl(container, agentId, conversation) {
-  if (!conversation?.binding_problem?.can_review_reconnect) return;
+// forGoal: the chat is current but its goal's provider setup drifted; the
+// same reconnect review carries the goal over.
+function appendProviderReconnectControl(container, agentId, conversation, {forGoal = false} = {}) {
+  if (!conversation?.id || (!conversation.binding_problem?.can_review_reconnect && !forGoal)) return;
   const reconnect = make("button", "primary", "Reconnect saved chat");
   reconnect.type = "button";
   reconnect.dataset.conversationAction = "reconnect";
@@ -15888,6 +16029,17 @@ function workResponseWords(answered, agentName = "The team", ordinaryWords = "")
   if (status === "applied_unverified") {
     return "Changes were applied but are not deterministically verified. Resume the saved run before treating the work as complete." + budget;
   }
+  // Finished board work says how it was found done. "Verified" is kept for an
+  // automatic check that passed; agreement between the agents is named as such.
+  if (answered?.goal_complete === true && ["deterministically_verified", "agent_verified"]
+    .includes(String(answered?.verification_status || ""))) {
+    const changes = answered?.changed?.length
+      ? ` Nexus applied ${answered.changed.length} file change(s).` : "";
+    return (goalAutomaticChecksPassed(answered)
+      ? `${agentName}: the goal is done and the automatic checks passed.`
+      : `${agentName}: the goal is done. ${agentsAgreedWords()}`)
+      + changes + resultNoticesWords(answered) + budget;
+  }
   if (ordinaryWords) return ordinaryWords;
   return answered.partial_provider_failure || automaticRoundStopWords(answered) || (answered?.changed?.length
     ? `${agentName} answered. Nexus applied ${answered.changed.length} file change(s).`
@@ -16642,8 +16794,10 @@ function showBoardGoalQueue(queue) {
   const current = queue.current;
   if (queue.status === "complete") {
     button.textContent = "Use legacy paired workflow";
-    $("swarmGoalWorkSaid").textContent =
-      `All ${queue.total} board goal(s) reached verified completion.`;
+    // The server's note says whether any goal rested on the agents' agreement
+    // rather than an automatic check, so it goes first.
+    $("swarmGoalWorkSaid").textContent = queue.note
+      || `All ${queue.total} board goal(s) are complete.`;
     localStorage.removeItem(SWARM_GOAL_QUEUE_REQUEST_KEY);
   } else if (queue.status === "cancelled") {
     button.textContent = "Restart legacy paired workflow";
@@ -17169,10 +17323,20 @@ function renderMissionControl() {
       evidence.append(approval);
     }
   }
+  const notices = goalResultNotices(longGoal, longGoalEvents);
+  if (longGoal?.status === "complete") {
+    notices.unshift(goalAutomaticChecksPassed(longGoal)
+      ? "Done, and the automatic checks passed." : `Done. ${agentsAgreedWords()}`);
+  }
+  if (notices.length) {
+    const list = make("ul", "hint mission-goal-notes");
+    for (const one of notices) list.append(make("li", "", one));
+    evidence.append(make("h3", "", "Notes"), list);
+  }
   if (longGoal?.verification) {
     const pre = make("pre");
     pre.textContent = JSON.stringify(longGoal.verification, null, 2);
-    evidence.append(make("h3", "", "Deterministic verification"), pre);
+    evidence.append(make("h3", "", "Recorded checks"), pre);
   }
   for (const artifact of longGoal?.artifacts || []) {
     const details = make("details");
@@ -17367,6 +17531,13 @@ function longGoalComposerDraft() {
   };
 }
 
+function longGoalAccessChosen() {
+  // The HTML default option is "Full project access"; a different selection
+  // (or a restored draft that picked one) is the user's explicit choice.
+  const select = $("longGoalAccess");
+  return Boolean(select && select.selectedOptions[0] && !select.selectedOptions[0].defaultSelected);
+}
+
 function longGoalIntent(draft) {
   return JSON.stringify({
     schema_version: 1,
@@ -17376,7 +17547,9 @@ function longGoalIntent(draft) {
     agent_ids: [...draft.agent_ids].sort(),
     lead_id: draft.lead_id,
     collaboration_mode: draft.collaboration_mode,
-    policy: {agent_access_mode: draft.access_mode || "full", execution_mode: draft.execution_mode || "facilitator"},
+    // Only a mode the user picked is sent; otherwise the server's default applies.
+    policy: {...(longGoalAccessChosen() ? {agent_access_mode: draft.access_mode} : {}),
+      execution_mode: draft.execution_mode || "facilitator"},
   });
 }
 
@@ -17611,7 +17784,8 @@ async function startLongGoalFromComposer(event) {
       lead_id: draft.lead_id,
       collaboration_mode: draft.collaboration_mode,
       participant_ids: draft.agent_ids,
-      policy: {agent_access_mode: draft.access_mode || "full", execution_mode: draft.execution_mode || "facilitator"},
+      policy: {...(longGoalAccessChosen() ? {agent_access_mode: draft.access_mode} : {}),
+        execution_mode: draft.execution_mode || "facilitator"},
     };
     const said = await request("/api/long-horizon/start-board", {
       method: "POST", body: JSON.stringify({request_id: requestId, goal: goalSpec}),
@@ -17777,11 +17951,29 @@ async function cancelLongGoal() {
   await missionControl("cancel");
 }
 
-// One Cancel remaining goals button for both kinds of goal work. While a legacy
-// paired queue is waiting it is the queue that is cancelled - that queue is
-// what still holds the project - and otherwise the long-horizon goal, as ever.
+// One Cancel remaining goals button for both kinds of goal work, and it
+// cancels what the user has selected. A waiting legacy paired queue is the one
+// meant only when it belongs to this open board and no live long-horizon goal
+// on another project is the selected one; otherwise the selected long-horizon
+// goal is cancelled, as ever.
+function legacyQueueIsTheSelectedGoalWork(queue = swarmGoalQueue) {
+  if (!legacyBoardGoalsCanBeCancelled(queue)) return false;
+  const projectId = String(queue.current?.project_id || "");
+  if (!projectId || !theSwarmProject(projectId)) return false;
+  const selected = longGoal && !["complete", "cancelled"].includes(longGoal.status) ? longGoal : null;
+  const selectedProject = String(selected?.project?.id || "");
+  return !selectedProject || selectedProject === projectId;
+}
+
 async function cancelTheSwarmGoals() {
-  if (legacyBoardGoalsCanBeCancelled()) return cancelRemainingBoardGoals();
+  if (legacyQueueIsTheSelectedGoalWork()) return cancelRemainingBoardGoals();
+  if (!longGoal && legacyBoardGoalsCanBeCancelled()) {
+    // A queue saved from a board that is not open now. Cancelling it from
+    // here would reach work the user cannot see on this board.
+    $("swarmGoalWorkSaid").textContent =
+      "The waiting board goals belong to a board that is not open. Open that board to continue or cancel them.";
+    return;
+  }
   return cancelLongGoal();
 }
 
@@ -17789,7 +17981,7 @@ async function cancelRemainingBoardGoals() {
   const queue = swarmGoalQueue || await refreshBoardGoalQueue(false);
   if (!queue || !["queued", "paused"].includes(queue.status)) return;
   if (!window.confirm(
-    `Cancel ${queue.total - queue.completed} remaining board goal(s)? Verified completed goals stay recorded.`
+    `Cancel ${queue.total - queue.completed} remaining board goal(s)? Completed goals stay recorded.`
   )) return;
   try {
     const said = await request("/api/swarm/goal-queue/cancel", {
@@ -17824,6 +18016,16 @@ async function stopThemGoing() {
 const SWARM_WATCH_EVERY_MS = 1500;
 const SWARM_WATCH_LONGEST_WAIT_MS = 30000;
 
+// A refusal that asking again cannot change: the run is gone. Anything else -
+// a dropped connection, a busy or restarting server - is worth asking again.
+function swarmRunIsGone(error) {
+  const status = Number(error?.status || 0);
+  if (status === 404 || status === 410) return true;
+  return status >= 400 && status < 500
+    && /run (does not exist|was not found|not found)|no such run|unknown run/i
+      .test(String(error?.message || ""));
+}
+
 // One timer, however many times this is called. Two would ask twice as often
 // and fight over the same list. Each ask waits for the one before it to come
 // back, so a slow answer cannot have a second ask sent on top of it.
@@ -17856,6 +18058,25 @@ function watchWhatTheyAreDoing() {
         return;
       }
     } catch (error) {
+      if (swarmRunIsGone(error)) {
+        // Asking again cannot bring back a run the server no longer has. Stop
+        // asking, forget its identity so later reads ask about the board's
+        // current run instead, and let the server say whether the board is
+        // still held.
+        swarmWatching = 0;
+        swarmBoardRunId = "";
+        swarmBoardCursor = 0;
+        swarmBoardRequestId = "";
+        localStorage.removeItem("nexus.swarm.board-run");
+        localStorage.removeItem("nexus.swarm.board-request");
+        swarmDoing = null;
+        renderWhatTheyAreDoing(null);
+        const words = `Nexus stopped following this board run: the server no longer has it (${error.message}). The board is not held by it any more.`;
+        $("swarmDoingSaid").textContent = words;
+        sayInSwarm(words);
+        refreshSwarm(true);
+        return;
+      }
       missed += 1;
       $("swarmDoingSaid").textContent =
         `${error.message} Nexus will ask again in a moment.`;

@@ -168,3 +168,69 @@ test("team panel remembers collapse, expands for fresh input, preserves drafts a
     console.log('Team panel screenshots: '+output);
   } finally {await browser.close();}
 });
+
+test("Check status reads the chat's goal without pausing, resuming or restarting it", {timeout:30000}, async () => {
+  const manifest = JSON.parse(fs.readFileSync(path.join(runtime, "NEXUS_RUNTIME.json"), "utf8"));
+  const browser = await chromium.launch({executablePath:process.env.NEXUS_TEST_CHROMIUM || path.join(runtime,"playwright",manifest.playwright.chromium_executable),headless:true});
+  try {
+    const page = await browser.newPage({viewport:{width:1100,height:760}});
+    await page.route("http://nexus.test/**", route => route.fulfill({contentType:"text/html",body:
+      '<article id="card"><section class="swarm-chat-team-goal"></section><button class="swarm-chat-send">Send</button>'
+      + '<button class="swarm-chat-stop">Stop</button></article>'}));
+    await page.goto("http://nexus.test/");
+    const slice = (from, to) => {
+      const start = source.indexOf(from), end = source.indexOf(to, start);
+      assert.ok(start >= 0 && end > start, `${from} is still in app.js`);
+      return source.slice(start, end);
+    };
+    // The real goal lookup, control sync that builds the button, and the
+    // handler it calls. Only the transport and the transcript are stand-ins.
+    const script = slice("function chatLongGoalContext", "// Adapted from t3code")
+      + slice("async function checkChatGoalStatus", "async function controlChatGoal")
+      + slice("function syncChatGoalControls", "function chatRecipientWords");
+    await page.addScriptTag({content:script + `
+      function make(tag,cls='',text=''){const n=document.createElement(tag);n.className=cls;n.textContent=text;return n;}
+      const $=id=>document.getElementById(id);
+      let theBigOne=null;
+      const chatGoalRequests=new Set(),swarmConversationSwitching=new Set();
+      const swarmChatKey=agent=>'chat:'+agent,swarmChatRuntimeKey=agent=>'runtime:'+agent;
+      const swarmChatIsBusy=()=>false,swarmChatIsResetting=()=>false,swarmChatIsHydrating=()=>false;
+      const chatComposerIsPending=()=>false,swarmChatAttachmentsAreLoading=()=>false;
+      const fillChatGoalPanel=()=>{},fillChatComposerPermissions=()=>{},syncBigChatTabs=()=>{};
+      const countWhatIsTypedTo=()=>{},countWhatIsTypedInBigChat=()=>{},renderSwarmChatActivity=()=>{};
+      const chatGoalParticipants=conversation=>conversation.pair;
+      window.conversation={id:'portable-chat',project:'portable-project',pair:['agent-a','agent-b']};
+      const activeConversationFor=()=>window.conversation;
+      let longGoals=[];
+      window.setGoals=goals=>{longGoals=goals;};
+      window.calls=[];window.said=[];
+      async function request(url,options){
+        const body=JSON.parse(options.body);calls.push({url,body});
+        return {goal:{...longGoals[0],status_response:'Agent A is reviewing; 2 of 3 tasks done.'}};
+      }
+      function sayInRuntimeChat(key,words){said.push([key,words]);}
+      window.sync=()=>syncChatGoalControls('agent-a',document.getElementById('card'));
+    `});
+    const status = page.getByRole("button", {name:"Check status", exact:true});
+    await page.evaluate(()=>sync());
+    assert.equal(await status.count(), 0, "a chat without a goal has nothing to check");
+    await page.evaluate(()=>{setGoals([{goal_id:'portable-goal',revision:5,status:'running',conversation_id:'portable-chat',
+      project:{id:'portable-project'},lead_agent_id:'agent-a',requested_agent_ids:['agent-a','agent-b']}]);sync();sync();});
+    assert.equal(await status.count(), 1, "re-syncing keeps one button");
+    assert.equal(await status.isEnabled(), true);
+    await status.click();
+    await page.waitForFunction(()=>said.length===1);
+    assert.deepEqual(await page.evaluate(()=>calls), [{url:"/api/long-horizon/control", body:{goal_id:"portable-goal",
+      action:"status", payload:{chat_id:"portable-chat", project_id:"portable-project", participant_ids:["agent-a","agent-b"]}}}],
+      "Check status asks for the status only: no pause, resume or expected revision");
+    assert.deepEqual(await page.evaluate(()=>said), [["runtime:agent-a","Agent A is reviewing; 2 of 3 tasks done."]]);
+    assert.equal(await page.locator(".swarm-chat-stop").innerText(), "Pause team", "the goal kept running");
+    // A saved goal bound to another project cannot be read as this chat's.
+    await page.evaluate(()=>{longGoals[0].project={id:'another-project'};calls=[];sync();});
+    assert.equal(await status.isDisabled(), true);
+    await status.click({force:true});
+    assert.deepEqual(await page.evaluate(()=>calls), []);
+    await page.evaluate(()=>{setGoals([]);sync();});
+    assert.equal(await status.isHidden(), true, "the button leaves with the goal");
+  } finally {await browser.close();}
+});
