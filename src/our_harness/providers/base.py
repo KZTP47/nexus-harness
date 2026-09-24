@@ -50,6 +50,14 @@ _EFFECTIVE_CONFIG_FIELDS = (
 _HTTP_POST_SLOTS = threading.BoundedSemaphore(8)
 _dispatch_version_lock = threading.Lock()
 _dispatch_version_cache: dict[tuple[object, ...], dict[str, Any]] = {}
+# A version probe that timed out or failed is remembered for a while too.
+# Re-probing on every fingerprint made a slow ``--version`` cost seconds per
+# chat listing and made the digest flip between "timed out" and "observed"
+# from one call to the next. Saved chats no longer pause on either (their
+# route identity ignores executable versions), but the observation should
+# still be stable; after this long the program is asked again.
+_UNSETTLED_VERSION_SECONDS = 300.0
+_dispatch_version_unsettled: dict[tuple[object, ...], tuple[float, dict[str, Any]]] = {}
 
 
 def _strict_output_schema(schema: dict[str, Any]) -> dict[str, Any]:
@@ -348,6 +356,12 @@ class Provider(ABC):
                             version = copy.deepcopy(
                                 _dispatch_version_cache.get(signature)
                             )
+                            unsettled = _dispatch_version_unsettled.get(signature)
+                            if version is None and unsettled is not None:
+                                if time.monotonic() - unsettled[0] < _UNSETTLED_VERSION_SECONDS:
+                                    version = copy.deepcopy(unsettled[1])
+                                else:
+                                    _dispatch_version_unsettled.pop(signature, None)
                         if version is None:
                             try:
                                 version = self._effective_dispatch_version(
@@ -358,16 +372,25 @@ class Provider(ABC):
                                     "state": "probe-failed",
                                     "error_class": type(exc).__name__,
                                 }
-                            if version.get("state") not in {
-                                "probe-failed", "timed-out",
-                            }:
-                                with _dispatch_version_lock:
+                            with _dispatch_version_lock:
+                                if version.get("state") not in {
+                                    "probe-failed", "timed-out",
+                                }:
                                     if len(_dispatch_version_cache) >= 128:
                                         _dispatch_version_cache.pop(
                                             next(iter(_dispatch_version_cache)), None
                                         )
                                     _dispatch_version_cache[signature] = copy.deepcopy(
                                         version
+                                    )
+                                    _dispatch_version_unsettled.pop(signature, None)
+                                else:
+                                    if len(_dispatch_version_unsettled) >= 128:
+                                        _dispatch_version_unsettled.pop(
+                                            next(iter(_dispatch_version_unsettled)), None
+                                        )
+                                    _dispatch_version_unsettled[signature] = (
+                                        time.monotonic(), copy.deepcopy(version),
                                     )
                         executable = {
                             "state": "resolved",

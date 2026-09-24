@@ -39,10 +39,29 @@ def compatible(held: dict, current: dict) -> bool:
     )
 
 
+def chat_route_reviewable(held: dict, current: dict) -> bool:
+    """A saved chat route the person may explicitly reconnect.
+
+    Chats bind a conversation, not goal execution state, so any change on the
+    same named route - tunables, a new executable, an engine contract, or a
+    changed provider identity - may be reviewed. A renamed route stays with
+    its own transcript. Reconnection is never silent: it is only applied
+    after the person confirms the exact reviewed fingerprint.
+    """
+    return bool(held and current) and held.get("effective_dispatch_strength") == "verified" \
+        and held.get("route") is not None and held.get("route") == current.get("route") \
+        and all(re.fullmatch(r"[0-9a-f]{64}", str(value.get(_DIGEST) or "")) is not None
+                for value in (held, current))
+
+
 def _require_available(config, route: str) -> None:
+    if str(route or "").startswith("web:"):
+        return  # The browser relay reports its own sign-in state.
     routed = ProviderRegistry(config).provider_config(route) if config.get("providers") else config
     provider = create_provider(routed)
     command = provider._effective_dispatch_command()
+    if command is None:
+        return  # Network adapters have no local program to install.
     if not command or not (shutil.which(command[0]) or Path(command[0]).is_file()):
         raise HarnessError("Finish installing and signing in to the provider, then review reconnection again.")
 
@@ -92,17 +111,21 @@ def _plan(config, board: dict, agent_id: str, chat_id: str, registry: dict, runt
     if held.get("binding_schema_version") != swarm_chats.CHAT_BINDING_SCHEMA_VERSION:
         raise HarnessError("This chat has no verified provider binding to reconnect.")
     candidate = copy.deepcopy(raw)
+    identities = candidate["binding"].setdefault("route_identities", {})
     changed = []
     for member_id in raw["pair"]:
         old = held["agent_routes"].get(member_id) or {}
         current = swarm_chats._verified_chat_route_projection(
             swarm_chats._route_binding(config, agents[member_id]))
-        if old.get("effective_dispatch_strength") != "verified" or not compatible(old, current):
+        identity = swarm_chats._route_identity(config, agents[member_id])
+        if not chat_route_reviewable(old, current):
             raise HarnessError("The saved provider route, settings, or contract changed; restore that setup first.")
-        if old[_DIGEST] != current[_DIGEST]:
-            _require_available(config, current["route"])
+        if old != current or swarm_chats._held_route_identity(held, member_id) != identity:
+            if old.get(_DIGEST) != current[_DIGEST]:
+                _require_available(config, current["route"])
             changed.append(str(agents[member_id].get("name") or member_id))
         candidate["binding"]["agent_routes"][member_id] = current
+        identities[member_id] = identity
     problem = swarm_chats._binding_problem(config, board, candidate, agents)
     if problem:
         raise HarnessError(problem["message"])

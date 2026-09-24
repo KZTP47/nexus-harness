@@ -63,9 +63,20 @@ class BoardChatBindingTests(unittest.TestCase):
             listed = swarm_chats.list_for_agent(
                 self.config, board, "agent-1",
             )
-        return next(
+        made = next(
             one for one in listed["chats"] if one["id"] == listed["active"]
         )
+        # A relay-v1 chat was saved before route identities existed.
+        self.forget_route_identities(made["id"])
+        return made
+
+    def forget_route_identities(self, chat_id: str) -> None:
+        """Make one saved chat look like it was saved before route identity v1."""
+
+        registry = swarm_chats._read(self.config)
+        raw = next(one for one in registry["chats"] if one["id"] == chat_id)
+        raw["binding"].pop("route_identities", None)
+        swarm_chats._write(self.config, registry)
 
     def make_binding_schema_one(self, chat_id: str) -> None:
         registry = swarm_chats._read(self.config)
@@ -130,6 +141,9 @@ class BoardChatBindingTests(unittest.TestCase):
         listed = swarm_chats.list_for_agent(self.config, changed, "agent-1")
         protected = next(one for one in listed["chats"] if one["id"] == original["id"])
         self.assertEqual(protected["binding_problem"]["code"], "agent_binding_changed")
+        # Pointing the agent at another named route is a different provider;
+        # its old transcript stays with the old route.
+        self.assertFalse(protected["binding_problem"]["can_review_reconnect"])
         with self.assertRaisesRegex(Exception, "will not send that history"):
             swarm_chats.resolve(
                 self.config, changed, "agent-1", original["id"]
@@ -457,6 +471,9 @@ class BoardChatBindingTests(unittest.TestCase):
         registry = swarm_chats._read(self.config)
         raw = next(one for one in registry["chats"] if one["id"] == original["id"])
         registry["chats"] = [raw]
+        # The strict-schema bridge is for chats saved before route identity;
+        # with a recorded identity the refresh below would continue instead.
+        raw["binding"].pop("route_identities", None)
         swarm_chats._write(self.config, registry)
         held = copy.deepcopy(raw["binding"]["agent_routes"]["agent-2"])
         first_current = copy.deepcopy(held)
@@ -493,7 +510,7 @@ class BoardChatBindingTests(unittest.TestCase):
             persisted_raw["binding"]["agent_routes"]["agent-2"], held,
         )
 
-    def test_effective_executable_drift_fences_a_new_pair_chat(self) -> None:
+    def local_tool_routes(self) -> tuple[Path, Path]:
         first = self.root / "provider-a" / "agent-tool"
         second = self.root / "provider-b" / "agent-tool"
         first.parent.mkdir()
@@ -508,6 +525,13 @@ class BoardChatBindingTests(unittest.TestCase):
                 "kind": "local", "model": "model-b", "command": ["agent-tool"],
             },
         }
+        return first, second
+
+    def test_executable_update_continues_and_records_the_new_dispatch(self) -> None:
+        # A CLI auto-update (new file, new path, new version) is not a
+        # different provider: the chat continues and the new observation is
+        # recorded, so a later goal admission sees the current setup.
+        first, second = self.local_tool_routes()
         board = self.board("workspace-dddddddddddddddddddddddddddddddd")
         with mock.patch.object(
             provider_base.shutil, "which", return_value=str(first),
@@ -515,6 +539,91 @@ class BoardChatBindingTests(unittest.TestCase):
             conversation = swarm_chats.list_for_agent(
                 self.config, board, "agent-1"
             )["chats"][0]
+        with mock.patch.object(
+            provider_base.shutil, "which", return_value=str(second),
+        ):
+            listed = next(
+                one for one in swarm_chats.list_for_agent(
+                    self.config, board, "agent-1"
+                )["chats"] if one["id"] == conversation["id"]
+            )
+            resolved = swarm_chats.resolve(
+                self.config, board, "agent-1", conversation["id"],
+            )
+            current = swarm_chats._verified_chat_route_projection(
+                swarm_chats._route_binding(self.config, board["agents"][0])
+            )
+
+        self.assertIsNone(listed["binding_problem"])
+        self.assertIsNone(resolved["binding_problem"])
+        self.assertNotEqual(
+            conversation["binding"]["agent_routes"]["agent-1"][
+                "effective_dispatch_fingerprint_sha256"
+            ],
+            current["effective_dispatch_fingerprint_sha256"],
+        )
+        persisted = next(
+            one for one in swarm_chats._read(self.config)["chats"]
+            if one["id"] == conversation["id"]
+        )
+        self.assertEqual(persisted["binding"]["agent_routes"]["agent-1"], current)
+        # Goal admission compares these entries field for field; the
+        # identity lives beside them and never adds a field to them.
+        self.assertEqual(
+            set(persisted["binding"]["agent_routes"]["agent-1"]),
+            set(swarm_chats._VERIFIED_CHAT_ROUTE_FIELDS),
+        )
+
+    def test_cli_version_change_or_probe_timeout_never_pauses_the_chat(self) -> None:
+        from our_harness.providers.subscription_cli import SubscriptionCLIProvider
+
+        tool = self.root / "bin" / "claude.cmd"
+        tool.parent.mkdir()
+        tool.write_text("claude", encoding="utf-8")
+        board = self.board("workspace-d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2")
+        observations = iter([
+            {"state": "observed", "version_output_sha256": "1" * 64},
+            {"state": "observed", "version_output_sha256": "2" * 64},
+            {"state": "timed-out", "version_output_sha256": "3" * 64},
+        ])
+        provider_base._dispatch_version_cache.clear()
+        provider_base._dispatch_version_unsettled.clear()
+        with mock.patch.object(provider_base.shutil, "which", return_value=str(tool)):
+            with mock.patch.object(
+                SubscriptionCLIProvider, "_effective_dispatch_version",
+                side_effect=lambda _command: next(observations),
+            ):
+                conversation = swarm_chats.list_for_agent(
+                    self.config, board, "agent-1",
+                )["chats"][0]
+                for _ in range(2):
+                    # A new version (the CLI updated itself) and then a slow
+                    # --version that timed out: both are recorded, neither pauses.
+                    provider_base._dispatch_version_cache.clear()
+                    provider_base._dispatch_version_unsettled.clear()
+                    resolved = swarm_chats.resolve(
+                        self.config, board, "agent-1", conversation["id"],
+                    )
+                    self.assertIsNone(resolved["binding_problem"])
+        self.assertNotEqual(
+            resolved["binding"]["agent_routes"]["agent-1"][
+                "effective_dispatch_fingerprint_sha256"
+            ],
+            conversation["binding"]["agent_routes"]["agent-1"][
+                "effective_dispatch_fingerprint_sha256"
+            ],
+        )
+
+    def test_pre_identity_executable_drift_is_fenced_but_reviewable(self) -> None:
+        first, second = self.local_tool_routes()
+        board = self.board("workspace-d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1")
+        with mock.patch.object(
+            provider_base.shutil, "which", return_value=str(first),
+        ):
+            conversation = swarm_chats.list_for_agent(
+                self.config, board, "agent-1"
+            )["chats"][0]
+        self.forget_route_identities(conversation["id"])
         with mock.patch.object(
             provider_base.shutil, "which", return_value=str(second),
         ):
@@ -531,12 +640,17 @@ class BoardChatBindingTests(unittest.TestCase):
             protected["binding_problem"]["changed_agents"][0]["kind"],
             "effective_dispatch_changed",
         )
+        self.assertTrue(protected["binding_problem"]["can_review_reconnect"])
 
-    def test_same_route_profile_is_stable_across_restart_but_change_is_not(self) -> None:
+    def test_tunable_edits_continue_across_restart(self) -> None:
         board = self.board("workspace-44444444444444444444444444444444")
         conversation = swarm_chats.list_for_agent(
             self.config, board, "agent-1"
         )["chats"][0]
+        chat.keep_exchange(
+            self.config, "route-a", "old question", "old answer",
+            filed_as=conversation["filed_as"],
+        )
         restarted = LoadedConfig(copy.deepcopy(self.config.data), self.root, [], {})
         self.assertEqual(
             swarm_chats.resolve(
@@ -545,16 +659,439 @@ class BoardChatBindingTests(unittest.TestCase):
             conversation["id"],
         )
 
-        restarted.data["providers"]["route-a"]["model"] = "different-model"
+        edited = restarted.data["providers"]["route-a"]
+        edited.update({
+            "model": "different-model", "reasoning_effort": "high",
+            "timeout_seconds": 1200, "arguments": ["--verbose"],
+            "max_concurrency": 2, "temperature": 0.7,
+        })
         listed = swarm_chats.list_for_agent(restarted, board, "agent-1")
+        self.assertIsNone(listed["chats"][0]["binding_problem"])
         self.assertEqual(
-            listed["chats"][0]["binding_problem"]["code"],
-            "agent_binding_changed",
-        )
-        with self.assertRaisesRegex(Exception, "connection settings changed"):
             swarm_chats.resolve(
                 restarted, board, "agent-1", conversation["id"]
-            )
+            )["id"],
+            conversation["id"],
+        )
+        # A second restart reads the refreshed binding, not the old one.
+        again = LoadedConfig(copy.deepcopy(restarted.data), self.root, [], {})
+        resolved = swarm_chats.resolve(again, board, "agent-1", conversation["id"])
+        self.assertIsNone(resolved["binding_problem"])
+        self.assertEqual(chat.read_it(
+            again, "route-a", resolved["filed_as"],
+        )[-1].text, "old answer")
+        _kind, context = chat._route_failure_context(again, "route-a")
+        self.assertEqual(
+            resolved["binding"]["agent_routes"]["agent-1"]["route_fingerprint_sha256"],
+            context["route_fingerprint_sha256"],
+        )
+
+    def test_identity_change_is_reviewable_and_never_silent(self) -> None:
+        board = self.board("workspace-45454545454545454545454545454545")
+        conversation = swarm_chats.list_for_agent(
+            self.config, board, "agent-1"
+        )["chats"][0]
+        original = copy.deepcopy(self.config.data["providers"]["route-a"])
+        for change in (
+            {"kind": "copilot-cli"},
+            {"api_key_env": "ANOTHER_ACCOUNT_KEY"},
+            {"command": ["another-program"]},
+        ):
+            with self.subTest(change=change):
+                self.config.data["providers"]["route-a"] = {**original, **change}
+                listed = swarm_chats.list_for_agent(self.config, board, "agent-1")
+                problem = listed["chats"][0]["binding_problem"]
+                self.assertEqual(problem["code"], "agent_binding_changed")
+                self.assertEqual(
+                    problem["changed_agents"][0]["kind"], "route_identity_changed",
+                )
+                self.assertTrue(problem["can_review_reconnect"])
+                self.assertIn("provider identity changed", problem["message"])
+                with self.assertRaisesRegex(Exception, "will not send that history"):
+                    swarm_chats.resolve(
+                        self.config, board, "agent-1", conversation["id"]
+                    )
+        # Nothing was rebound while it was different: restoring the setup
+        # continues the same chat.
+        self.config.data["providers"]["route-a"] = original
+        self.assertIsNone(swarm_chats.resolve(
+            self.config, board, "agent-1", conversation["id"],
+        )["binding_problem"])
+
+    def test_pre_identity_chat_is_migrated_while_it_still_matches(self) -> None:
+        board = self.board("workspace-46464646464646464646464646464646")
+        conversation = swarm_chats.list_for_agent(
+            self.config, board, "agent-1"
+        )["chats"][0]
+        self.forget_route_identities(conversation["id"])
+        self.assertNotIn(
+            "route_identities",
+            next(one for one in swarm_chats._read(self.config)["chats"]
+                 if one["id"] == conversation["id"])["binding"],
+        )
+
+        swarm_chats.list_for_agent(self.config, board, "agent-1")
+        migrated = next(
+            one for one in swarm_chats._read(self.config)["chats"]
+            if one["id"] == conversation["id"]
+        )
+        self.assertEqual(
+            migrated["binding"]["route_identities"]["agent-1"],
+            chat.route_identity(self.config, "route-a"),
+        )
+        self.config.data["providers"]["route-a"]["model"] = "migrated-then-edited"
+        self.assertIsNone(swarm_chats.resolve(
+            self.config, board, "agent-1", conversation["id"],
+        )["binding_problem"])
+
+    def test_pre_identity_chat_that_already_drifted_offers_reconnect(self) -> None:
+        board = self.board("workspace-47474747474747474747474747474747")
+        conversation = swarm_chats.list_for_agent(
+            self.config, board, "agent-1"
+        )["chats"][0]
+        self.forget_route_identities(conversation["id"])
+        self.config.data["providers"]["route-a"]["model"] = "edited-before-upgrade"
+
+        listed = swarm_chats.list_for_agent(self.config, board, "agent-1")
+        problem = listed["chats"][0]["binding_problem"]
+        self.assertEqual(problem["code"], "agent_binding_changed")
+        self.assertEqual(
+            problem["changed_agents"][0]["kind"], "route_settings_changed",
+        )
+        # Not "start fresh" only: the saved chat can be reviewed and resumed.
+        self.assertTrue(problem["can_review_reconnect"])
+        # The unchanged peer is migrated; the drifted route is never blessed.
+        identities = next(
+            one for one in swarm_chats._read(self.config)["chats"]
+            if one["id"] == conversation["id"]
+        )["binding"].get("route_identities", {})
+        self.assertNotIn("agent-1", identities)
+        self.assertIn("agent-2", identities)
+
+    def test_route_identity_ignores_tunables_but_not_account_or_program(self) -> None:
+        base = {"kind": "claude-cli", "model": "a", "command": ["claude", "-x"],
+                "api_key_env": "FIRST_ACCOUNT_KEY",
+                "endpoint": "https://user:secret@api.example/v1"}
+        self.config.data["providers"] = {"route-a": dict(base)}
+        before = chat.route_identity(self.config, "route-a")
+        for key, value in (
+            ("model", "b"), ("reasoning_effort", "low"), ("timeout_seconds", 5),
+            ("arguments", ["--verbose"]), ("max_output_tokens", 10),
+            ("command", ["claude", "-x", "--model", "other", "--verbose"]),
+            ("endpoint", "https://user:rotated@api.example/v1"),
+        ):
+            self.config.data["providers"]["route-a"] = {**base, key: value}
+            self.assertEqual(chat.route_identity(self.config, "route-a"), before, key)
+        for key, value in (
+            ("kind", "codex-cli"), ("api_key_env", "OTHER"),
+            ("auth_mode", "work"), ("command", ["other-program"]),
+            ("command", ["claude", "--different-flags"]),
+            ("endpoint", "https://other.example/v1"),
+        ):
+            self.config.data["providers"]["route-a"] = {**base, key: value}
+            self.assertNotEqual(chat.route_identity(self.config, "route-a"), before, key)
+        self.assertEqual(before["route_identity_version"], chat.ROUTE_IDENTITY_VERSION)
+        self.assertRegex(before["route_identity_sha256"], r"^[0-9a-f]{64}$")
+        self.assertNotIn("claude", json.dumps(before))
+
+    def test_account_selectors_in_flags_or_environment_are_identity(self) -> None:
+        base = {"kind": "codex-cli", "model": "a", "command": ["codex"],
+                "arguments": ["--model", "a", "-c", "model_reasoning_effort=low"]}
+        self.config.data["providers"] = {"route-a": copy.deepcopy(base)}
+        before = chat.route_identity(self.config, "route-a")
+        for arguments in (
+            ["--model", "b", "-c", "model_reasoning_effort=high"],
+            ["--model=b", "--timeout", "900", "-c", 'model="o3"'],
+        ):
+            self.config.data["providers"]["route-a"] = {**base, "arguments": arguments}
+            self.assertEqual(chat.route_identity(self.config, "route-a"), before, arguments)
+        for change in (
+            {"arguments": ["--profile", "other"]},
+            {"arguments": ["-p", "other"]},
+            {"arguments": ["--account=someone-else"]},
+            {"arguments": ["-c", "profile=other"]},
+            {"arguments": ["--config", "C:/other/config.toml"]},
+            {"arguments": ["--api-key-env", "OTHER_KEY"]},
+            {"command": ["env", "CODEX_HOME=C:/other-home", "codex"]},
+            {"command": ["codex", "CLAUDE_CONFIG_DIR=C:/other"]},
+        ):
+            self.config.data["providers"]["route-a"] = {**base, **change}
+            self.assertNotEqual(chat.route_identity(self.config, "route-a"), before, change)
+        # Claude's -p is --print, not a profile selector.
+        self.config.data["providers"]["route-a"] = {"kind": "claude-cli", "arguments": ["-p"]}
+        self.assertEqual(chat.route_account_selectors(self.config, "route-a"), [])
+        self.assertEqual(before["route_identity_version"], chat.ROUTE_IDENTITY_VERSION)
+
+    def test_any_other_command_word_or_unlisted_flag_is_identity(self) -> None:
+        cases = [
+            ({"kind": "assistant-cli", "command": ["python", "bridge_openai.py"]},
+             {"kind": "assistant-cli", "command": ["python", "bridge_anthropic.py"]}),
+            ({"kind": "claude-cli", "command": ["npx", "-y", "@anthropic-ai/claude-code"]},
+             {"kind": "claude-cli", "command": ["npx", "-y", "some-other-cli"]}),
+            ({"kind": "claude-cli", "command": ["ssh", "alice@hostA", "claude"]},
+             {"kind": "claude-cli", "command": ["ssh", "bob@hostB", "claude"]}),
+            ({"kind": "codex-cli", "command": ["wsl", "-d", "Work", "codex"]},
+             {"kind": "codex-cli", "command": ["wsl", "-d", "Personal", "codex"]}),
+            ({"kind": "codex-cli", "command": ["codex"]},
+             {"kind": "codex-cli", "command": ["codex", "--oss", "--local-provider", "ollama"]}),
+            ({"kind": "assistant-cli", "command": ["ask"], "arguments": ["--vendor", "openai"]},
+             {"kind": "assistant-cli", "command": ["ask"], "arguments": ["--vendor", "anthropic"]}),
+            # For assistant-cli even a flag named --model is identity.
+            ({"kind": "assistant-cli", "command": ["ask", "--model", "a"]},
+             {"kind": "assistant-cli", "command": ["ask", "--model", "b"]}),
+        ]
+        for before, after in cases:
+            with self.subTest(after=after):
+                self.config.data["providers"] = {"route-a": before}
+                first = chat.route_identity(self.config, "route-a")
+                self.config.data["providers"] = {"route-a": after}
+                self.assertNotEqual(chat.route_identity(self.config, "route-a"), first)
+        for kind, before, after in (
+            ("claude-cli", ["claude", "-p", "--model", "a", "--output-format", "json"],
+             ["claude", "--print", "--model=b", "--output-format", "stream-json", "--verbose"]),
+            ("codex-cli", ["codex", "exec", "-m", "a"], ["codex", "exec", "-m", "b", "--json"]),
+            ("gemini-cli", ["gemini", "-m", "a"], ["gemini", "--model", "b"]),
+        ):
+            with self.subTest(kind=kind):
+                self.config.data["providers"] = {"route-a": {"kind": kind, "command": before}}
+                first = chat.route_identity(self.config, "route-a")
+                self.config.data["providers"] = {"route-a": {"kind": kind, "command": after}}
+                self.assertEqual(chat.route_identity(self.config, "route-a"), first)
+
+    def test_wrapper_flags_before_the_cli_program_are_identity(self) -> None:
+        for kind, before, after in (
+            ("codex-cli", ["python", "-m", "bridge_vendor_a"], ["python", "-m", "bridge_vendor_b"]),
+            ("gemini-cli", ["wsl", "-d", "X", "-m", "a", "gemini"], ["wsl", "-d", "X", "-m", "b", "gemini"]),
+            ("claude-cli", ["npx", "--model=pkgA"], ["npx", "--model=pkgB"]),
+            ("codex-cli", ["ssh", "-m", "hostA", "codex"], ["ssh", "-m", "hostB", "codex"]),
+            # A tunable flag never swallows the next flag as its value.
+            ("claude-cli", ["claude", "--model", "--settings", "a.json"],
+             ["claude", "--model", "--settings", "b.json"]),
+            ("codex-cli", ["codex", "--timeout", "--profile", "a"],
+             ["codex", "--timeout", "--profile", "b"]),
+            # A host, container, distro or module that is merely named like
+            # the program is not the program: the whole command is identity.
+            ("codex-cli", ["ssh", "codex", "python3", "-m", "bridge_a"],
+             ["ssh", "codex", "python3", "-m", "bridge_b"]),
+            ("codex-cli", ["docker", "exec", "codex", "python", "-m", "bridge_a"],
+             ["docker", "exec", "codex", "python", "-m", "bridge_b"]),
+            ("codex-cli", ["python", "-m", "codex", "-m", "vendor_a"],
+             ["python", "-m", "codex", "-m", "vendor_b"]),
+            ("codex-cli", ["python", "-m", "bridge", "codex", "-m", "a"],
+             ["python", "-m", "bridge", "codex", "-m", "b"]),
+        ):
+            with self.subTest(before=before):
+                self.config.data["providers"] = {"route-a": {"kind": kind, "command": before}}
+                first = chat.route_identity(self.config, "route-a")
+                self.config.data["providers"] = {"route-a": {"kind": kind, "command": after}}
+                self.assertNotEqual(chat.route_identity(self.config, "route-a"), first)
+        # Tunables after the program, and an omitted default command, still match.
+        for kind, before, after in (
+            ("codex-cli", ["npx", "-y", "@openai/codex@latest", "-m", "a"],
+             ["npx", "-y", "@openai/codex@latest", "-m", "b"]),
+            ("codex-cli", ["C:/n/codex-x86_64-pc-windows-msvc.exe", "-m", "a"],
+             ["C:/n/codex-x86_64-pc-windows-msvc.exe", "-m", "b"]),
+            ("claude-cli", ["node", "C:/npm/node_modules/@anthropic-ai/claude-code/cli.js", "--model", "a"],
+             ["node", "C:/npm/node_modules/@anthropic-ai/claude-code/cli.js", "--model", "b"]),
+            ("claude-cli", ["cmd", "/c", "claude.cmd", "--model", "a"],
+             ["cmd", "/c", "claude.cmd", "--model", "b"]),
+            ("codex-cli", ["wsl", "-d", "Work", "--", "codex", "-m", "a"],
+             ["wsl", "-d", "Work", "--", "codex", "-m", "b"]),
+            ("claude-cli", None, ["claude", "--model", "x", "--permission-mode", "plan"]),
+        ):
+            with self.subTest(after=after):
+                self.config.data["providers"] = {"route-a": {"kind": kind, **({"command": before} if before else {})}}
+                first = chat.route_identity(self.config, "route-a")
+                self.config.data["providers"] = {"route-a": {"kind": kind, "command": after}}
+                self.assertEqual(chat.route_identity(self.config, "route-a"), first)
+
+    def test_arguments_of_a_command_without_the_program_are_identity(self) -> None:
+        self.config.data["providers"] = {"route-a": {
+            "kind": "codex-cli", "command": ["python", "-m", "bridge"], "arguments": ["-m", "vendor_a"],
+        }}
+        first = chat.route_identity(self.config, "route-a")
+        self.config.data["providers"]["route-a"]["arguments"] = ["-m", "vendor_b"]
+        self.assertNotEqual(chat.route_identity(self.config, "route-a"), first)
+
+    def test_python_m_bridge_swap_pauses_a_codex_chat(self) -> None:
+        self.config.data["providers"]["route-a"] = {
+            "kind": "codex-cli", "command": ["python", "-m", "bridge_vendor_a"],
+        }
+        board = self.board("workspace-8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a")
+        conversation = swarm_chats.list_for_agent(self.config, board, "agent-1")["chats"][0]
+        self.config.data["providers"]["route-a"]["command"] = ["python", "-m", "bridge_vendor_b"]
+        problem = swarm_chats.list_for_agent(
+            self.config, board, "agent-1")["chats"][0]["binding_problem"]
+        self.assertEqual(problem["changed_agents"][0]["kind"], "route_identity_changed")
+        self.assertTrue(problem["can_review_reconnect"])
+
+    def test_endpoint_username_and_plain_query_are_identity_but_secrets_are_not(self) -> None:
+        def identity(endpoint: str) -> dict:
+            self.config.data["providers"] = {
+                "route-a": {"kind": "openai-compatible", "endpoint": endpoint, "model": "m"},
+            }
+            return chat.route_identity(self.config, "route-a")
+
+        base = identity("https://alice@h.example/v1?tenant=a&api-key=one")
+        self.assertNotEqual(identity("https://bob@h.example/v1?tenant=a&api-key=one"), base)
+        self.assertNotEqual(identity("https://alice@h.example/v1?tenant=b&api-key=one"), base)
+        # A rotated password or key is not a different provider.
+        self.assertEqual(identity("https://alice:pw@h.example/v1?tenant=a&api-key=two"), base)
+        self.assertEqual(identity("https://alice@h.example/v1?api-key=three&tenant=a"), base)
+
+    def test_local_execution_container_is_identity(self) -> None:
+        self.config.data["providers"] = {
+            "route-a": {"kind": "local", "model": "m", "command": ["tool"]},
+        }
+        self.config.data.setdefault("execution", {})
+        before = chat.route_identity(self.config, "route-a")
+        self.config.data["execution"]["docker_image"] = "other-image:latest"
+        self.assertNotEqual(chat.route_identity(self.config, "route-a"), before)
+
+    def test_bridge_or_host_swap_pauses_the_chat_for_review(self) -> None:
+        for profile, changed in (
+            ({"kind": "assistant-cli", "command": ["python", "bridge_vendor_a.py"]},
+             ["python", "bridge_vendor_b.py"]),
+            ({"kind": "claude-cli", "command": ["ssh", "alice@hostA", "claude"]},
+             ["ssh", "bob@hostB", "claude"]),
+        ):
+            with self.subTest(changed=changed):
+                self.config.data["providers"]["route-a"] = copy.deepcopy(profile)
+                board = self.board("workspace-7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a" + changed[1][-2:].encode().hex()[:2])
+                conversation = swarm_chats.list_for_agent(
+                    self.config, board, "agent-1")["chats"][0]
+                self.config.data["providers"]["route-a"]["command"] = changed
+                problem = swarm_chats.list_for_agent(
+                    self.config, board, "agent-1")["chats"][0]["binding_problem"]
+                self.assertEqual(problem["changed_agents"][0]["kind"], "route_identity_changed")
+                self.assertTrue(problem["can_review_reconnect"])
+                with self.assertRaisesRegex(Exception, "will not send that history"):
+                    swarm_chats.resolve(self.config, board, "agent-1", conversation["id"])
+
+    def downgrade_route_identities_to_v1(self, chat_id: str, version: int = 1) -> None:
+        """Make one saved chat look like it was saved under an older identity."""
+
+        registry = swarm_chats._read(self.config)
+        raw = next(one for one in registry["chats"] if one["id"] == chat_id)
+        raw["binding"]["route_identities"] = {
+            member: chat.route_identity(self.config, held["route"], version=version)
+            for member, held in raw["binding"]["agent_routes"].items()
+        }
+        swarm_chats._write(self.config, registry)
+
+    def test_model_flag_change_continues_but_profile_flag_pauses_for_review(self) -> None:
+        self.config.data["providers"]["route-a"]["arguments"] = ["--model", "a"]
+        board = self.board("workspace-48484848484848484848484848484848")
+        conversation = swarm_chats.list_for_agent(
+            self.config, board, "agent-1"
+        )["chats"][0]
+        self.config.data["providers"]["route-a"]["arguments"] = ["--model", "b"]
+        self.assertIsNone(swarm_chats.resolve(
+            self.config, board, "agent-1", conversation["id"],
+        )["binding_problem"])
+
+        self.config.data["providers"]["route-a"]["arguments"] = [
+            "--model", "b", "--profile", "other",
+        ]
+        listed = swarm_chats.list_for_agent(self.config, board, "agent-1")
+        problem = listed["chats"][0]["binding_problem"]
+        self.assertEqual(problem["changed_agents"][0]["kind"], "route_identity_changed")
+        self.assertTrue(problem["can_review_reconnect"])
+        with self.assertRaisesRegex(Exception, "will not send that history"):
+            swarm_chats.resolve(self.config, board, "agent-1", conversation["id"])
+
+    def test_route_identity_v1_records_migrate_without_pausing(self) -> None:
+        board = self.board("workspace-49494949494949494949494949494949")
+        conversation = swarm_chats.list_for_agent(
+            self.config, board, "agent-1"
+        )["chats"][0]
+
+        def saved_identities() -> dict:
+            return next(
+                one for one in swarm_chats._read(self.config)["chats"]
+                if one["id"] == conversation["id"]
+            )["binding"]["route_identities"]
+
+        for version in (1, 2, 3, 4):
+            with self.subTest(version=version):
+                # Unchanged setup: upgraded silently on the next inventory.
+                self.downgrade_route_identities_to_v1(conversation["id"], version)
+                self.assertIsNone(swarm_chats.list_for_agent(
+                    self.config, board, "agent-1")["chats"][0]["binding_problem"])
+                self.assertEqual(saved_identities()["agent-1"],
+                                 chat.route_identity(self.config, "route-a"))
+        # Restart keeps the upgraded record.
+        restarted = LoadedConfig(copy.deepcopy(self.config.data), self.root, [], {})
+        self.assertIsNone(swarm_chats.resolve(
+            restarted, board, "agent-1", conversation["id"])["binding_problem"])
+        self.assertEqual(saved_identities()["agent-1"]["route_identity_version"], chat.ROUTE_IDENTITY_VERSION)
+
+    def test_old_identity_with_a_changed_profile_is_reviewed_not_migrated(self) -> None:
+        # An old digest ignored inputs v3 covers, so a matching old digest over
+        # a changed profile proves nothing; it is reviewed, never migrated.
+        for version, change in (
+            (1, lambda profile: profile.update(model="edited-after-v1")),
+            (2, lambda profile: profile.update(command=["ssh", "bob@hostB", "claude"])),
+        ):
+            with self.subTest(version=version):
+                self.config.data["providers"]["route-a"] = {
+                    "kind": "claude-cli", "model": "claude-a",
+                    "command": ["ssh", "alice@hostA", "claude"],
+                }
+                board = self.board(f"workspace-{version}c{version}c" + "c" * 28)
+                conversation = swarm_chats.list_for_agent(
+                    self.config, board, "agent-1")["chats"][0]
+                self.downgrade_route_identities_to_v1(conversation["id"], version)
+                change(self.config.data["providers"]["route-a"])
+                problem = swarm_chats.list_for_agent(
+                    self.config, board, "agent-1")["chats"][0]["binding_problem"]
+                self.assertEqual(problem["changed_agents"][0]["kind"], "route_identity_changed")
+                self.assertTrue(problem["can_review_reconnect"])
+
+    def test_old_identity_survives_a_cli_update_without_review(self) -> None:
+        first, second = self.local_tool_routes()
+        board = self.board("workspace-4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b")
+        with mock.patch.object(provider_base.shutil, "which", return_value=str(first)):
+            conversation = swarm_chats.list_for_agent(
+                self.config, board, "agent-1")["chats"][0]
+            self.downgrade_route_identities_to_v1(conversation["id"], 2)
+        with mock.patch.object(provider_base.shutil, "which", return_value=str(second)):
+            self.assertIsNone(swarm_chats.resolve(
+                self.config, board, "agent-1", conversation["id"])["binding_problem"])
+
+    def test_route_identity_v1_with_a_changed_profile_and_a_selector_is_reviewed(self) -> None:
+        self.config.data["providers"]["route-a"]["arguments"] = ["--profile", "work"]
+        board = self.board("workspace-4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a")
+        conversation = swarm_chats.list_for_agent(
+            self.config, board, "agent-1"
+        )["chats"][0]
+        self.downgrade_route_identities_to_v1(conversation["id"])
+        # v1 ignored flags, so it cannot tell whether --profile changed too.
+        self.config.data["providers"]["route-a"]["model"] = "edited-after-v1"
+        problem = swarm_chats.list_for_agent(
+            self.config, board, "agent-1")["chats"][0]["binding_problem"]
+        self.assertEqual(problem["changed_agents"][0]["kind"], "route_identity_changed")
+        self.assertTrue(problem["can_review_reconnect"])
+        # With the saved profile unchanged the v1 record is proven and upgraded.
+        self.config.data["providers"]["route-a"]["model"] = "claude-a"
+        self.assertIsNone(swarm_chats.resolve(
+            self.config, board, "agent-1", conversation["id"])["binding_problem"])
+
+    def test_v1_record_whose_profile_selector_was_removed_is_reviewed(self) -> None:
+        self.config.data["providers"]["route-b"] = {
+            "kind": "codex-cli", "model": "codex-b", "command": ["codex", "--profile", "work"],
+        }
+        board = self.board("workspace-7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c")
+        conversation = swarm_chats.list_for_agent(
+            self.config, board, "agent-1")["chats"][0]
+        self.downgrade_route_identities_to_v1(conversation["id"])
+        # Back to the default account: never migrated silently.
+        self.config.data["providers"]["route-b"]["command"] = ["codex"]
+        problem = swarm_chats.list_for_agent(
+            self.config, board, "agent-1")["chats"][0]["binding_problem"]
+        self.assertEqual(problem["changed_agents"][0]["agent_id"], "agent-2")
+        self.assertEqual(problem["changed_agents"][0]["kind"], "route_identity_changed")
+        self.assertTrue(problem["can_review_reconnect"])
 
     def test_project_path_rebind_is_never_silent(self) -> None:
         board = self.board("workspace-55555555555555555555555555555555")

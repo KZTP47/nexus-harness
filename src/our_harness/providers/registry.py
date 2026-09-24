@@ -60,6 +60,17 @@ class AgentSpec:
     reasoning_effort: str | None
 
 
+# Command-line assistants run each request as its own process with its own
+# sign-in, so several agents on one CLI profile can work at the same time.
+# Serialising them to one slot made a second agent wait behind the first
+# agent's whole (possibly long) turn. Used only when the profile does not set
+# ``max_concurrency``; an explicit value, including 1, always wins.
+CLI_PROFILE_KINDS = frozenset({
+    "claude-cli", "codex-cli", "copilot-cli", "assistant-cli", "gemini-cli",
+})
+CLI_DEFAULT_CONCURRENCY = 4
+
+
 class ProviderRegistry:
     """Resolve trusted provider profiles without changing the legacy route."""
 
@@ -113,7 +124,11 @@ class ProviderRegistry:
             microsoft_organisation=str(value.get("microsoft_organisation") or ""),
             time_zone=str(value.get("time_zone") or ""),
             reasoning_effort=str(value["reasoning_effort"]) if value.get("reasoning_effort") else None,
-            max_concurrency=int(value.get("max_concurrency", 1)),
+            max_concurrency=int(value.get(
+                "max_concurrency",
+                CLI_DEFAULT_CONCURRENCY
+                if str(value.get("name") or "") in CLI_PROFILE_KINDS else 1,
+            )),
             pricing_ref=str(value["pricing_ref"]) if value.get("pricing_ref") else None,
             allow_project_graphs=bool(value.get("allow_project_graphs", False)),
             max_data_class=str(value.get("max_data_class", "project_private")),

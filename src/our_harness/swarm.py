@@ -801,6 +801,7 @@ def _save_while_board_authority_is_held(
     *,
     allow_command_approval_changes: bool = False,
     workspace_id_override: str | None = None,
+    duplicate_baseline: Board | None = None,
 ) -> Board:
     """Write the whole board down, if it is still the board that was read.
 
@@ -835,7 +836,13 @@ def _save_while_board_authority_is_held(
     # On Windows two spellings that differ only in letter case are one folder. A pair already written
     # down before this check existed is left as it is, so the board still
     # opens; only a newly added second copy of a folder is refused.
-    already_twice = _folders_on_the_board_twice(now)
+    # The pairs a board already had are its own: an edit of the live board is
+    # compared with the live board, and reopening a saved board is compared
+    # with that saved board - never with the unrelated board it replaces,
+    # which made a saved board with an old case-duplicate impossible to open.
+    already_twice = _folders_on_the_board_twice(
+        duplicate_baseline if duplicate_baseline is not None else now
+    )
     newly_twice = {key for key, extra in _folders_on_the_board_twice(board).items()
                    if extra > already_twice.get(key, 0)}
     if newly_twice:
@@ -1391,15 +1398,20 @@ def what_to_ask(agent: dict[str, Any], project: dict[str, Any]) -> str:
         f"which is the folder at {project['path']}."
         f"{what_it_is_for}\n\n"
         f"The jobs wanted there:\n{jobs}\n\n"
-        "Say how you would do them, shortest way first, and say what you would "
-        "need to look at before starting. You cannot read the files or run "
-        "anything from here, so say what you would do rather than doing it."
+        "This is an advice round: Nexus is asking for your plan, and it "
+        "sends only this message with the request - no project files are "
+        "attached and the folder is not opened for you. If you can read that "
+        "folder from where you run, you are welcome to look. Either way, say "
+        "how you would do the jobs, shortest way first, and name the files, "
+        "commands or checks you would look at first. The file work itself "
+        "happens when the team is started on this project."
     )
 
 
 def what_the_page_says(
     agent: dict[str, Any], project: dict[str, Any], page_text: str,
     messages: list[tuple[str, str]] | None = None,
+    on_the_page: dict[str, int] | None = None,
 ) -> str:
     """What one agent is shown of the page, second time round.
 
@@ -1409,7 +1421,7 @@ def what_the_page_says(
     order it was written, with names on it.
     """
 
-    inbox = _messages_for_a_prompt(messages or [])
+    inbox = _messages_for_a_prompt(messages or [], on_the_page=on_the_page)
     return (
         f"SHARED GOAL {shared_goal_id(project)}\n"
         f"{page_text}\n\n"
@@ -1458,10 +1470,32 @@ def shared_goal_id(project: dict[str, Any]) -> str:
     return hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
 
 
-def _messages_for_a_prompt(notes: list[tuple[str, str]]) -> str:
+def _messages_for_a_prompt(
+    notes: list[tuple[str, str]], *, on_the_page: dict[str, int] | None = None,
+) -> str:
+    """The inbox block for a prompt.
+
+    A message whose exact text is already a part of the page shown above it
+    is named, not repeated: sending every first-round answer twice (page and
+    inbox) doubled the prompt and pushed it into lossy summaries sooner. The
+    message itself is still delivered and acknowledged as before.
+    """
+
     if not notes:
         return ""
-    said = "\n\n".join(f"Message from {name}:\n{text}" for name, text in notes)
+    shown = on_the_page or {}
+
+    def one(name: str, text: str) -> str:
+        exact = str(text or "").strip()
+        part = shown.get(exact) if exact else None
+        if part:
+            return (
+                f"Message from {name}: the same words as Part {part} on the "
+                "page above (not repeated here)."
+            )
+        return f"Message from {name}:\n{text}"
+
+    said = "\n\n".join(one(name, text) for name, text in notes)
     return (
         "AGENT INBOX\n"
         "These messages were durably queued for you. They are acknowledged only "
@@ -2469,8 +2503,9 @@ class Running:
         try:
             mailbox.retire_superseded_goals(where_the_mailbox_lives(), {
                 str(one.get("id") or ""): shared_goal_id(one) for one in board["projects"]
-            })
-        except (OSError, HarnessError):
+            }, workspace=str(board.get("workspace_id") or ""),
+               known_workspaces=_kept_board_workspaces())
+        except Exception:  # noqa: BLE001 - tidying never blocks the run
             pass
         # What each agent said about each project, so the second round can be
         # shown only the notes that agent is allowed to see.
@@ -2566,6 +2601,14 @@ class Running:
                         project,
                         prompt_page,
                         notes,
+                        # Only parts this agent is actually shown above;
+                        # anything else keeps its full inbox text.
+                        on_the_page={
+                            part.text.strip(): part.number
+                            for part in page_now.parts
+                            if part.text.strip() and part.author_id
+                            and part.author_id in allowed_page_writers
+                        },
                     )
                 else:
                     # No page to share, which happens when a project box points
@@ -2755,6 +2798,7 @@ class Running:
                                     body=turn.said,
                                     expects_reply=True,
                                     thread_id=thread_id,
+                                    workspace=str(board.get("workspace_id") or ""),
                                 )
                             thread_id = queued.thread_id
                         except (OSError, HarnessError) as exc:
@@ -2935,6 +2979,58 @@ def _filed_under(name: str) -> str:
     return f"{tidy}-{marked}.json"
 
 
+def _kept_board_workspace_id(where: Path, name: str, checked: Board) -> str:
+    """The workspace id a saved board is opened under."""
+
+    if checked.workspace_id:
+        return checked.workspace_id
+    # Old local snapshots did not carry a workspace id. Bind one to the exact
+    # saved-board file/name so reopening it is stable, while remaining
+    # distinct from the legacy live board and every import.
+    opened_as = " ".join(str(name).split())
+    identity = f"{where.resolve(strict=False)}\0{opened_as.casefold()}"
+    marked = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+    return f"workspace-saved-{marked}"
+
+
+def _kept_board_workspaces() -> list[str] | None:
+    """Workspace ids of every saved board that can still be opened.
+
+    ``None`` when the saved-board folder or any file in it cannot be read
+    cleanly: a partial list would let the mailbox settle a real saved
+    board's queued mail as if that board were gone.
+    """
+
+    where = where_the_kept_ones_live()
+    # os.scandir, not Path.exists()/glob(): on Python 3.13 those swallow
+    # permission and listing errors, which made an unreadable folder look
+    # like "no saved boards" and let another board's queued mail be settled.
+    try:
+        with os.scandir(where) as listing:
+            names = sorted(
+                entry.name for entry in listing
+                if entry.name.lower().endswith(".json") and entry.is_file()
+            )
+    except FileNotFoundError:
+        return []
+    except OSError:
+        return None
+    try:
+        found: list[str] = []
+        for name in names:
+            one = where / name
+            held = json.loads(one.read_text(encoding="utf-8"))
+            if not isinstance(held, dict) or not isinstance(held.get("name"), str) \
+                    or not isinstance(held.get("board"), dict):
+                return None
+            checked = read_it(held["board"])
+            found.append(_kept_board_workspace_id(one, held["name"], checked))
+        return found
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError,
+            HarnessError, ValueError, TypeError):
+        return None
+
+
 @_requires_board_qa_access
 def kept_board_inventory() -> tuple[list[dict[str, Any]], list[str]]:
     """Return healthy saved boards and honest, non-fatal file problems.
@@ -3054,6 +3150,14 @@ def import_kept_board(document: Any, name: str = "") -> dict[str, Any]:
     wanted = " ".join(str(name or document.get("name") or "").split())
     filed = _filed_under(wanted)
     checked = read_it(board_value)
+    # Opening a saved board keeps the case-duplicate folders it already had,
+    # so an import must not bring in any: a Windows folder spelled in upper and
+    # in lower case is one folder.
+    doubled = _folders_on_the_board_twice(checked)
+    if doubled:
+        again = next(one.path for one in reversed(checked.projects)
+                     if os.path.normcase(one.path) in doubled)
+        raise SwarmError(f"{again} is on the board twice. Nothing was imported.")
     # A JSON import is authority to preserve a layout, not authority to execute
     # project-discovered commands. Even a correctly shaped imported digest is
     # cleared so opening the snapshot requires a visible local approval.
@@ -3425,14 +3529,7 @@ def open_this_board(name: str, config: Any) -> Board:
         if not isinstance(board, dict):
             raise SwarmError(f"The board saved as {name} cannot be read.")
         checked = read_it(board)
-        workspace_id = checked.workspace_id
-        if not workspace_id:
-            # Old local snapshots did not carry a workspace id. Bind one to
-            # the exact saved-board file/name so reopening it is stable, while
-            # remaining distinct from the legacy live board and every import.
-            identity = f"{where.resolve(strict=False)}\0{opened_as.casefold()}"
-            marked = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
-            workspace_id = f"workspace-saved-{marked}"
+        workspace_id = _kept_board_workspace_id(where, opened_as, checked)
         # The global authority is already held, so do the validated file write
         # directly instead of trying to acquire the non-reentrant lease twice.
         return _save_while_board_authority_is_held(dict(
@@ -3442,6 +3539,7 @@ def open_this_board(name: str, config: Any) -> Board:
         ), config,
             allow_command_approval_changes=True,
             workspace_id_override=workspace_id,
+            duplicate_baseline=checked,
         )
 
 

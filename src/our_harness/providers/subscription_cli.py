@@ -38,6 +38,7 @@ from .codex_cli import (
 )
 
 SUBSCRIPTION_KINDS = ("claude-cli", "copilot-cli", "assistant-cli")
+VERSION_PROBE_SECONDS = 10.0
 UNPRICED = "subscription-unpriced"
 
 
@@ -796,7 +797,7 @@ def _where_else_it_might_be(patterns: tuple[str, ...]) -> list[Path]:
     return sorted(found, key=lambda one: one.stat().st_mtime, reverse=True)
 
 
-def _prompt(request: ProviderRequest, *, native_images: bool = False) -> str:
+def _prompt(request: ProviderRequest, *, native_images: bool = False, denials_enforced: bool = False) -> str:
     """Build the text portion without confusing native images with file tools."""
 
     sections = [
@@ -832,7 +833,7 @@ def _prompt(request: ProviderRequest, *, native_images: bool = False) -> str:
             + json.dumps(request.response_format.schema, sort_keys=True)
         )
     if request.native_execution:
-        sections.append(native_execution.instructions(request))
+        sections.append(native_execution.instructions(request, denials_enforced=denials_enforced))
     return "\n\n".join(sections)
 
 
@@ -918,10 +919,15 @@ class SubscriptionCLIProvider(Provider):
                         material.encode("utf-8")
                     ).hexdigest(),
                 }
+        # The observation is recorded, never a gate: saved chats continue
+        # across CLI updates and slow or timed-out probes (their route
+        # identity ignores executable versions), and base.py remembers the
+        # outcome per executable. A cold Node-based CLI on Windows can need
+        # several seconds, so allow it enough time to answer once.
         result = _run_bounded(
             [*command, *self.recipe.version_arguments],
             cwd=Path.cwd(), stdin_text=None,
-            timeout_seconds=3.0, max_output_bytes=8_000,
+            timeout_seconds=VERSION_PROBE_SECONDS, max_output_bytes=8_000,
         )
         material = json.dumps({
             "exit_code": result.exit_code,
@@ -1113,6 +1119,7 @@ class SubscriptionCLIProvider(Provider):
             request.response_format.schema if request.response_format is not None else None,
         )
         argv = recipe.argv(command, str(request.model or ""))
+        denials_enforced = False
         image_attachments = [one for one in request.attachments if isinstance(one, dict)
                              and str(one.get("type") or "").startswith("image/")]
         image_paths = [
@@ -1155,6 +1162,13 @@ class SubscriptionCLIProvider(Provider):
                     # apply, and no skip-permissions or unsupported auto mode is
                     # required for older configured models.
                     argv.extend(["--allowedTools", "Bash,WebFetch,WebSearch"])
+                    # The user's explicit command denials become real Claude
+                    # permission rules; deny rules win over the allow above.
+                    rules, unenforceable = native_execution.claude_deny_rules(
+                        native_execution.denied_commands(request))
+                    if rules:
+                        argv.extend(["--disallowedTools", *rules])
+                    denials_enforced = bool(rules) and not unenforceable
             elif request.workspace_context is not None:
                 # Only static instructions enter argv. User-selected paths and
                 # multiline context stay in stdin, including for .cmd launchers.
@@ -1163,7 +1177,7 @@ class SubscriptionCLIProvider(Provider):
         # discovery disable switch. Non-interactive default mode is safer than
         # yolo, but machine/user policy can still authorize tools; consequently
         # Gemini is deliberately not marked retry-safe above.
-        prompt = self._redactor.text(_prompt(request, native_images=claude_images))
+        prompt = self._redactor.text(_prompt(request, native_images=claude_images, denials_enforced=denials_enforced))
         stdin_text: str | None = prompt
         if claude_images:
             stdin_text = claude_input.build_user_message(request, prompt)
