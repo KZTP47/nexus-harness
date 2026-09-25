@@ -11764,8 +11764,14 @@ async function refreshSwarm(quietly, {recoveryOnly = false} = {}) {
     }
     if (!recoveryOnly && said.provider_status_stale && mine === swarmNewestRefresh) {
       // Do not await this: the durable board is already interactive. This
-      // second pass only decorates it with newly discovered provider status.
-      void refreshSwarm(true);
+      // second pass only decorates it with newly discovered provider status,
+      // and discovery starts every installed AI CLI in the same local server.
+      // Started at once it slowed the chat somebody had just opened to several
+      // seconds, so it waits until that has had time to load; a newer
+      // refresh in the meantime makes it unnecessary.
+      window.setTimeout(() => {
+        if (mine === swarmNewestRefresh) void refreshSwarm(true);
+      }, 3000);
     }
   } catch (error) {
     if (mine !== swarmNewestRefresh) return;
