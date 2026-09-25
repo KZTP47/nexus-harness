@@ -7008,8 +7008,13 @@ async function boot() {
     await loadWhatCanBeDoneForYou();
     // The readiness checkup probes model routes and CLIs and can take seconds.
     // Nothing below needs its answer, so the board, chats and event polling
-    // must not wait behind it; it fills in the Start view when it arrives.
-    void refreshCheckup();
+    // must not wait behind it. It only fills in the Start view, and while it
+    // runs it competes with the board and chats for the same local server, so
+    // it waits until startup has settled and runs only if Start is still on
+    // screen; opening Start later runs it anyway.
+    window.setTimeout(() => {
+      if (document.querySelector('[data-view-panel="start"]')?.hidden === false) void refreshCheckup();
+    }, 2500);
     await refreshHowItWorks();
     await refreshChecks();
     restoreAuthorityRepairSuccess();
@@ -13577,6 +13582,10 @@ async function loadConversationsFor(agentId, refresh = true) {
     swarmConversationTranscriptRefreshes.add(agentId);
   }
   if (swarmConversationSwitching.has(agentId)) return false;
+  // A background board refresh must not restart a list read that is already
+  // on its way: restarting discarded it, and the chat's transcript then waited
+  // for the second one. A board change cancels stale reads before this runs.
+  if (!refresh && swarmConversationListControllers.get(agentId)?.size) return false;
   const controller = beginConversationRead(swarmConversationListControllers, agentId);
   const revision = nextConversationListRevision(agentId);
   try {
