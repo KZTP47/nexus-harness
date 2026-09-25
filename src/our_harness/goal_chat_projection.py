@@ -446,20 +446,45 @@ MOST_RECEIPTS_PER_TRANSCRIPT = 64
 
 
 def _engine_fingerprint() -> str:
+    """The replay code itself: its two modules and the functions that drive it.
+
+    Deliberately not whole large modules, so an unrelated change elsewhere in
+    chat.py or server.py does not force every chat to replay its history.
+    """
+
     from pathlib import Path
     import hashlib
+    import inspect
 
     digest = hashlib.sha256(RECEIPT_CONTRACT.encode("utf-8"))
     here = Path(__file__).resolve().parent
-    for name in ("goal_chat_projection.py", "chat.py", "goal_chat_progress.py", "server.py"):
+    for name in ("goal_chat_projection.py", "goal_chat_progress.py"):
         try:
             digest.update((here / name).read_bytes())
         except OSError:
             digest.update(name.encode("utf-8"))
+    from . import server
+
+    for function in (
+        chat.long_horizon_event_cursor, chat.keep_long_horizon_events,
+        chat.keep_long_horizon_status, chat._keep_it,
+        server.HarnessHTTPServer.project_long_horizon_chat_statuses,
+        server.HarnessHTTPServer._project_long_horizon_dialogue,
+    ):
+        try:
+            digest.update(inspect.getsource(function).encode("utf-8"))
+        except (OSError, TypeError):
+            digest.update(getattr(function, "__qualname__", "?").encode("utf-8"))
     return digest.hexdigest()
 
 
-_ENGINE = _engine_fingerprint()
+_ENGINE_HELD: list[str] = []
+
+
+def _engine() -> str:
+    if not _ENGINE_HELD:
+        _ENGINE_HELD.append(_engine_fingerprint())
+    return _ENGINE_HELD[0]
 
 
 def _goal_fingerprint(goal: dict[str, Any]) -> str:
@@ -499,7 +524,7 @@ def _read_receipt(where) -> dict[str, Any]:
     except (OSError, ValueError):
         return {}
     if not isinstance(held, dict) or held.get("schema_version") != RECEIPT_SCHEMA \
-            or held.get("contract") != RECEIPT_CONTRACT or held.get("engine") != _ENGINE \
+            or held.get("contract") != RECEIPT_CONTRACT or held.get("engine") != _engine() \
             or not isinstance(held.get("goals"), dict):
         return {}
     return held["goals"]
@@ -538,7 +563,7 @@ def remember_projected(config: LoadedConfig, route: str, goals: list[dict[str, A
         try:
             atomic_text(where, json.dumps({
                 "schema_version": RECEIPT_SCHEMA, "contract": RECEIPT_CONTRACT,
-                "engine": _ENGINE, "goals": kept,
+                "engine": _engine(), "goals": kept,
             }, sort_keys=True) + "\n")
         except OSError:
             # A receipt only saves work. Without it the next listing replays.

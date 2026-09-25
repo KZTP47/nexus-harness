@@ -658,6 +658,11 @@ def _a_list(said: Any) -> list[dict[str, Any]]:
 _recovering_board_qa = threading.local()
 _board_qa_access_state = threading.local()
 _board_qa_request = threading.local()
+# Ordinary board operations in this process currently holding the board-QA
+# isolation lock. Only they are waited for; anything else holding it is a check.
+_ordinary_board_holders = 0
+_ordinary_board_holders_lock = threading.Lock()
+ORDINARY_BOARD_WAIT_SECONDS = 30.0
 _recovered_board_qa_authorities: set[str] = set()
 _recovered_board_qa_authorities_lock = threading.Lock()
 
@@ -733,20 +738,42 @@ def _board_qa_access():
 
     _recover_abandoned_board_qa()
 
-    try:
-        with qa_lab._board_preservation_file_lock(  # noqa: SLF001 - shared board authority
-            where_it_lives(), timeout_seconds=0.0,
-        ):
-            _board_qa_access_state.active = True
-            try:
-                yield
-            finally:
-                _board_qa_access_state.active = False
-    except qa_lab.BoardPreservationBusy as exc:
-        raise SwarmError(
-            "A board check is in progress, so Nexus will not show or change its "
-            "temporary or displaced board as your real one. Retry when that check finishes."
-        ) from exc
+    global _ordinary_board_holders
+    # The server answers requests on several threads, and every board read
+    # holds this lock for its whole (short) operation. Two ordinary reads at
+    # once - the goal list and a chat transcript when a chat opens - used to
+    # refuse the second as "a board check is in progress", leaving the chat
+    # empty until some later refresh. Wait for an ordinary holder in this
+    # process; a real board check (no ordinary holder) is still refused at once.
+    deadline = time.monotonic() + ORDINARY_BOARD_WAIT_SECONDS
+    entered = False
+    while True:
+        try:
+            with qa_lab._board_preservation_file_lock(  # noqa: SLF001 - shared board authority
+                where_it_lives(), timeout_seconds=0.0,
+            ):
+                entered = True
+                with _ordinary_board_holders_lock:
+                    _ordinary_board_holders += 1
+                _board_qa_access_state.active = True
+                try:
+                    yield
+                finally:
+                    _board_qa_access_state.active = False
+                    with _ordinary_board_holders_lock:
+                        _ordinary_board_holders -= 1
+            return
+        except qa_lab.BoardPreservationBusy as exc:
+            if entered:
+                raise
+            with _ordinary_board_holders_lock:
+                ordinary = _ordinary_board_holders > 0
+            if not ordinary or time.monotonic() >= deadline:
+                raise SwarmError(
+                    "A board check is in progress, so Nexus will not show or change its "
+                    "temporary or displaced board as your real one. Retry when that check finishes."
+                ) from exc
+            time.sleep(0.01)
 
 
 def _requires_board_qa_access(function):

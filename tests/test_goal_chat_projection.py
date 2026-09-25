@@ -588,7 +588,7 @@ class ProjectionReceiptTests(unittest.TestCase):
 
     def test_a_receipt_from_other_engine_code_is_ignored(self):
         self.replay()
-        with mock.patch.object(goal_chat_projection, "_ENGINE", "different-code"):
+        with mock.patch.object(goal_chat_projection, "_engine", lambda: "different-code"):
             self.assertEqual(self.replay(), 1)
 
 

@@ -28,6 +28,7 @@ Its boundaries, on purpose:
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import hmac
 import base64
@@ -951,7 +952,64 @@ def _where_the_noes_are(config: LoadedConfig) -> Path:
         config.project_root, WHERE_THE_NOES_LIVE, allow_missing=True, allow_control=True)
 
 
+# One operation (an HTTP request, a startup recovery pass) asks for the same
+# few routes' identities dozens of times: every saved goal and chat binding
+# re-resolves its agents' executables, which searches the disk for CLI builds
+# each time. Inside one such operation the answer cannot meaningfully change,
+# so it is worked out once. Outside a scope nothing is remembered.
+_ROUTE_CONTEXT_MEMO: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "nexus_route_context_memo", default=None,
+)
+
+
+@contextmanager
+def remembered_route_contexts():
+    """Remember route identities for the rest of this one operation."""
+
+    if _ROUTE_CONTEXT_MEMO.get() is not None:
+        yield
+        return
+    token = _ROUTE_CONTEXT_MEMO.set({})
+    try:
+        yield
+    finally:
+        _ROUTE_CONTEXT_MEMO.reset(token)
+
+
 def _route_failure_context(
+    config: LoadedConfig, route: str, *,
+    effective_dispatch_contract_override: str = "",
+    principal_dispatch_fingerprint_override: str = "",
+) -> tuple[str, dict[str, Any]]:
+    memo = _ROUTE_CONTEXT_MEMO.get()
+    named = str(route or "").strip()
+    if memo is None or named.startswith("web:"):
+        return _route_failure_context_now(
+            config, route,
+            effective_dispatch_contract_override=effective_dispatch_contract_override,
+            principal_dispatch_fingerprint_override=principal_dispatch_fingerprint_override,
+        )
+    try:
+        key = (id(config), named, effective_dispatch_contract_override,
+               principal_dispatch_fingerprint_override,
+               json.dumps([config.get("providers"), config.get("provider")],
+                          sort_keys=True, default=str))
+    except (TypeError, ValueError):
+        key = None
+    if key is not None and key in memo:
+        kind, context = memo[key]
+        return kind, copy.deepcopy(context)
+    kind, context = _route_failure_context_now(
+        config, route,
+        effective_dispatch_contract_override=effective_dispatch_contract_override,
+        principal_dispatch_fingerprint_override=principal_dispatch_fingerprint_override,
+    )
+    if key is not None:
+        memo[key] = (kind, copy.deepcopy(context))
+    return kind, context
+
+
+def _route_failure_context_now(
     config: LoadedConfig, route: str, *,
     effective_dispatch_contract_override: str = "",
     principal_dispatch_fingerprint_override: str = "",

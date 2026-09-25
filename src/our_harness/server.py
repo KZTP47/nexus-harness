@@ -814,7 +814,8 @@ class HarnessHTTPServer(ThreadingHTTPServer):
                     # Recovery starts the scheduler watcher, which calls back
                     # into authority-protected legacy ownership. Holding that
                     # lock here deadlocks the watcher and every board/chat read.
-                    held.recover_all()
+                    with chat_lab.remembered_route_contexts():
+                        held.recover_all()
                 except BaseException:
                     # close may return while a provider is still draining. Keep
                     # ownership visible so retry/settings cannot orphan it.
@@ -3513,7 +3514,9 @@ class HarnessHandler(BaseHTTPRequestHandler):
 
         swarm_lab._set_board_qa_request_capability("")  # noqa: SLF001
         try:
-            super().handle_one_request()
+            # One request resolves the same few agent routes many times.
+            with chat_lab.remembered_route_contexts():
+                super().handle_one_request()
         finally:
             swarm_lab._set_board_qa_request_capability("")  # noqa: SLF001
 

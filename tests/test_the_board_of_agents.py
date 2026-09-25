@@ -218,6 +218,33 @@ class WhatABoardIs(BoardTestCase):
         self.assertEqual(board.agents, [])
         recovered.assert_called_once_with()
 
+    def test_two_ordinary_board_reads_at_once_both_succeed(self) -> None:
+        """Opening a chat reads the board while the goal list is reading it too."""
+        self.a_board(agents=[{"name": "Kept agent"}])
+        self.assertEqual(swarm.load().agents[0].name, "Kept agent")
+        inside = threading.Event()
+        release = threading.Event()
+        real_read = swarm.read_it
+
+        def slow_read(*args, **kwargs):
+            if threading.current_thread().name == "slow-board-read":
+                inside.set()
+                release.wait(5)
+            return real_read(*args, **kwargs)
+
+        seen: list[object] = []
+        with mock.patch.object(swarm, "read_it", slow_read):
+            first = threading.Thread(
+                target=lambda: seen.append(swarm.load().agents[0].name), name="slow-board-read",
+            )
+            first.start()
+            self.assertTrue(inside.wait(5))
+            threading.Timer(0.3, release.set).start()
+            # Waits for the ordinary holder instead of calling it a board check.
+            self.assertEqual(swarm.load().agents[0].name, "Kept agent")
+            first.join(5)
+        self.assertEqual(seen, ["Kept agent"])
+
     def test_recovery_scan_is_once_per_board_but_live_lock_is_still_checked(self) -> None:
         from our_harness import qa
 

@@ -395,7 +395,13 @@ class Provider(ABC):
                         executable = {
                             "state": "resolved",
                             "path": os.path.normcase(str(resolved)),
-                            "device": str(int(observed.st_dev)),
+                            # Python 3.12+ widened Windows st_dev to 64 bits;
+                            # keep the 32-bit volume serial older runtimes
+                            # saved so chats survive a runtime upgrade.
+                            "device": str(
+                                int(observed.st_dev) & 0xFFFFFFFF
+                                if os.name == "nt" else int(observed.st_dev)
+                            ),
                             "file_id": str(int(observed.st_ino)),
                             "size": int(observed.st_size),
                             "modified_ns": int(observed.st_mtime_ns),
