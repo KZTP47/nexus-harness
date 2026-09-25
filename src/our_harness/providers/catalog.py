@@ -65,3 +65,25 @@ def capabilities_for(provider: str) -> ProviderCapabilities:
 
 def offline_models(provider: str) -> list[ModelCatalogEntry]:
     return [entry for entry in MODEL_CATALOG if entry.provider == provider]
+
+
+# Catalog provider for each route kind, for the per-agent model picker.
+_KIND_PROVIDER = {
+    "claude-cli": "anthropic", "anthropic": "anthropic",
+    "codex-cli": "openai", "openai": "openai",
+    "gemini-cli": "gemini", "gemini": "gemini",
+}
+
+
+def model_choices(kind: str, current: str = "") -> list[dict[str, str]]:
+    """Models a board agent on a route of this kind can be set to.
+
+    Offline suggestions only: the route's current model always comes first
+    when the catalog lacks it, and users may still type any other name.
+    """
+    provider = _KIND_PROVIDER.get(str(kind or ""))
+    choices = [{"id": one.model, "label": one.display_name} for one in offline_models(provider)] if provider else []
+    current = str(current or "").strip()
+    if current and current not in {one["id"] for one in choices}:
+        choices.insert(0, {"id": current, "label": current})
+    return choices

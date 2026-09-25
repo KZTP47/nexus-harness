@@ -11,7 +11,7 @@ import json
 from typing import Any
 from . import collaboration_reply
 
-CONTRACT = "goal-interrupted-turn-recovery/v3-delivered-format"
+CONTRACT = "goal-interrupted-turn-recovery/v4-known-reply"
 
 
 def plan(document: dict[str, Any], tasks: list[dict[str, Any]], *,
@@ -21,12 +21,17 @@ def plan(document: dict[str, Any], tasks: list[dict[str, Any]], *,
         agent = next((one for one in document.get("agents", [])
                       if one["id"] == task.get("assigned_agent_id")), {})
         binding = agent.get("route_binding") or {}
-        format_reply = task.get("provider_effect_state") == "known_reply_failed" \
+        # The whole reply arrived and Nexus declined it (format, addressing or
+        # any other harness-side rule). Nothing remote is uncertain, so a fresh
+        # turn that starts from the saved files is always safe.
+        known_reply = task.get("provider_effect_state") == "known_reply_failed" \
+            and not task.get("outcome_unknown")
+        format_reply = known_reply \
             and collaboration_reply.is_format_failure(str(task.get("last_error") or ""))
         provider_only = bool(task.get("provider_effect_id")) and bool(
             task.get("outcome_unknown") or task.get("reconciliation_required")
         ) and not task.get("pending_action") and not task.get("pending_transaction") \
-            and (format_reply or task.get("provider_effect_state") in {
+            and (known_reply or task.get("provider_effect_state") in {
                 "outcome_unknown", "reply_received_reconciliation_required",
                 "dispatched", "reply_received",
             })
@@ -43,12 +48,14 @@ def plan(document: dict[str, Any], tasks: list[dict[str, Any]], *,
             "task_id": task["id"], "agent_id": agent.get("id", ""),
             "agent_name": agent.get("name") or agent.get("id") or "Agent",
             "effect_id": task.get("provider_effect_id", ""),
-            "kind": "format_reply" if format_reply and provider_only else "read_only_reply" if read_only else "provider_reply" if provider_only else "saved_work",
+            "kind": "format_reply" if format_reply and provider_only
+                    else "known_reply" if known_reply and provider_only
+                    else "read_only_reply" if read_only else "provider_reply" if provider_only else "saved_work",
             "reason": task.get("last_error", ""),
         })
     available = bool(items) and settled and not setup_changed
     can_retry = available and all(one["kind"] != "saved_work" for one in items)
-    automatic = can_retry and all(one["kind"] in {"read_only_reply", "format_reply"} for one in items)
+    automatic = can_retry and all(one["kind"] in {"read_only_reply", "format_reply", "known_reply"} for one in items)
     material = {"contract": CONTRACT, "goal_id": document["goal_id"],
                 "revision": document["revision"], "agents": document.get("agents"),
                 "project": document.get("project"), "execution_contract": document.get("execution_contract"),
@@ -57,6 +64,9 @@ def plan(document: dict[str, Any], tasks: list[dict[str, Any]], *,
     fingerprint = hashlib.sha256(json.dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     return {"schema_version": 1, "contract": CONTRACT, "fingerprint": fingerprint,
             "items": items, "can_retry": can_retry, "resume_safe": automatic,
+            # While the worker is still stopping there is nothing for the user
+            # to answer or press yet; the UI must not claim input is needed.
+            "needs_user": bool(items) and (settled or setup_changed),
             "message": (
                 "Continue from the saved work. The team will inspect its current files, repair the handoff and keep working with the saved permissions."
                 if automatic else

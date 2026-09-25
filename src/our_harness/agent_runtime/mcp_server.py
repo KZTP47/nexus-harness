@@ -3,7 +3,8 @@
 Started by each agent's own CLI as a stdio MCP server, with the command line
 TeamRun.start builds (this module, plus --db, --team, --agent and --roster).
 
-It only reads and writes the team's mailbox. The Nexus server watches the
+It reads and writes the team's mailbox, and check_page lets an agent see its
+page in a hidden browser (web_preview). The Nexus server watches the
 mailbox and pushes new messages into the recipients' running sessions, so an
 agent never has to poll. Everything here is advisory to the agents: nothing in
 it can grant permissions, and a teammate's message is labelled as such.
@@ -12,15 +13,19 @@ it can grant permissions, and a teammate's message is labelled as such.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import sys
 import time
+from pathlib import Path
 from typing import Any
 
 from .mailbox import CLOSURE_REASONS, TASK_STATES, Mailbox, dumps
 
 PROTOCOL = "2025-06-18"
 ASK_TIMEOUT_SECONDS = 30 * 60
+# Screenshots larger than this are left as a path to open instead of an image.
+IMAGE_LIMIT = 4_000_000
 
 TOOLS: list[dict[str, Any]] = [
     {"name": "send_message", "description": "Send a message to a teammate (by id or name) or to everyone with to='*'. "
@@ -55,6 +60,14 @@ TOOLS: list[dict[str, Any]] = [
      "with a short summary of what you did and where the results are.",
      "inputSchema": {"type": "object", "properties": {"status": {"type": "string", "enum": ["done", "blocked", "needs_input"]},
                                                       "summary": {"type": "string"}}, "required": ["status", "summary"]}},
+    {"name": "check_page", "description": "Look at a web page or browser game the way the user will, without "
+     "opening anything on their screen (the browser stays hidden unless the user chose visible browser checks). "
+     "It opens the page straight from disk (double-clicking index.html) and from a local server, waits, and "
+     "returns both screenshots for you to look at, script errors, files that failed to load and a one-line "
+     "verdict. Use it after every change to a page, and before telling anyone that it works or looks right.",
+     "inputSchema": {"type": "object", "properties": {
+         "page": {"type": "string", "description": "The .html file, relative to your working folder (default index.html)."},
+         "wait_ms": {"type": "integer", "description": "How long to let the page run before the screenshot (default 2500)."}}}},
     {"name": "approve_action", "description": "Internal: Nexus asks the user to approve a tool use.",
      "inputSchema": {"type": "object", "properties": {"tool_name": {"type": "string"}, "input": {"type": "object"}},
                      "required": ["tool_name"]}},
@@ -62,11 +75,52 @@ TOOLS: list[dict[str, Any]] = [
 
 
 class Server:
-    def __init__(self, mailbox: Mailbox, team: str, agent: str, roster: list[dict[str, Any]]):
+    def __init__(self, mailbox: Mailbox, team: str, agent: str, roster: list[dict[str, Any]],
+                 cwd: str = "", settings: str = ""):
         self.mailbox = mailbox
         self.team = team
         self.agent = agent
         self.roster = roster
+        self.cwd = cwd
+        self.settings = settings
+
+    def check_page(self, args: dict[str, Any]) -> dict[str, Any]:
+        """The page as the user will see it, with the screenshots attached as images."""
+        from .. import web_preview
+        from .browser_guard import read_mode
+
+        root = Path(self.cwd or ".").resolve()
+        page = Path(str(args.get("page") or "index.html").strip() or "index.html")
+        if page.is_absolute():
+            page = page.resolve()
+            try:
+                page = page.relative_to(root)
+            except ValueError:
+                root, page = page.parent, Path(page.name)
+        try:
+            wait_ms = int(args.get("wait_ms") or web_preview.DEFAULT_WAIT_MS)
+        except (TypeError, ValueError):
+            wait_ms = web_preview.DEFAULT_WAIT_MS
+        mode = read_mode(self.settings)
+        result = web_preview.preview(root, page.as_posix(), wait_ms=wait_ms, headless=mode != "visible")
+        content: list[dict[str, Any]] = []
+        for one in result.get("pages") or []:
+            shot = one.get("screenshot")
+            if not shot:
+                continue
+            path = root / shot
+            one["screenshot"] = str(path)
+            try:
+                data = path.read_bytes()
+            except OSError:
+                continue
+            if len(data) <= IMAGE_LIMIT:
+                content.append({"type": "text", "text": f"Screenshot, opened {'from disk' if one.get('mode') == 'file' else 'from a local server'}:"})
+                content.append({"type": "image", "data": base64.b64encode(data).decode("ascii"), "mimeType": "image/png"})
+        result["browser"] = f"{mode} (the user's choice)"
+        result["how_to_look"] = ("The screenshots are attached. If you cannot see them, open the screenshot paths "
+                                 "with your image-reading tool.")
+        return {"_content": [{"type": "text", "text": dumps(result)}, *content]}
 
     def _resolve(self, who: str) -> str:
         wanted = str(who or "").strip()
@@ -116,6 +170,8 @@ class Server:
         if name == "report_result":
             box.report(team, me, str(args.get("status") or "done"), str(args.get("summary") or ""))
             return {"reported": True}
+        if name == "check_page":
+            return self.check_page(args)
         if name == "approve_action":
             text = json.dumps({"tool": args.get("tool_name"), "input": args.get("input")}, ensure_ascii=False)[:4000]
             question = box.ask(team, me, "approval", text)
@@ -139,8 +195,11 @@ class Server:
             params = message.get("params") or {}
             try:
                 value = self.call(str(params.get("name") or ""), dict(params.get("arguments") or {}))
-                text = value if isinstance(value, str) else dumps(value)
-                result = {"content": [{"type": "text", "text": text}], "isError": False}
+                if isinstance(value, dict) and isinstance(value.get("_content"), list):
+                    result = {"content": value["_content"], "isError": False}
+                else:
+                    text = value if isinstance(value, str) else dumps(value)
+                    result = {"content": [{"type": "text", "text": text}], "isError": False}
             except Exception as exc:
                 result = {"content": [{"type": "text", "text": str(exc)}], "isError": True}
         elif method == "ping":
@@ -156,6 +215,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--team", required=True)
     parser.add_argument("--agent", required=True)
     parser.add_argument("--roster", default="")
+    parser.add_argument("--cwd", default="")
+    parser.add_argument("--settings", default="")
     options = parser.parse_args(argv)
     roster = []
     if options.roster:
@@ -164,7 +225,8 @@ def main(argv: list[str] | None = None) -> None:
                 roster = json.load(stream)
         except (OSError, ValueError):
             roster = []
-    server = Server(Mailbox(options.db), options.team, options.agent, roster)
+    server = Server(Mailbox(options.db), options.team, options.agent, roster, cwd=options.cwd,
+                    settings=options.settings)
     stdin = sys.stdin.buffer
     stdout = sys.stdout.buffer
     for raw in stdin:

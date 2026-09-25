@@ -594,7 +594,8 @@ class BoardsKeptUnderANameTests(unittest.TestCase):
             sorted(one["name"] for one in swarm.every_kept_board()),
             ["Friday work", "Friday work copy"],
         )
-        self.assertEqual(swarm.load().active_saved_board, "")
+        # Saving made the live board "Friday work"; importing opens nothing.
+        self.assertEqual(swarm.load().active_saved_board, "Friday work")
 
     def test_import_refuses_wrong_json_duplicate_names_and_invalid_boards(self) -> None:
         valid = {

@@ -9,7 +9,7 @@ import unicodedata
 import weakref
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 
 from .models import HarnessError
 from .filesystem_paths import filesystem_path
@@ -40,6 +40,23 @@ def filesystem_case_key(value: str) -> str:
     return value.casefold() if os.name == "nt" else value
 
 
+SHOWN_PATH_CHARACTERS = 160
+
+
+def _shown(relative: Any) -> str:
+    """A rejected path as it goes back into an error, and so into an agent's prompt.
+
+    Bounded because a confused agent can put paragraphs of its own thinking into
+    a path argument. Echoing that back whole fed it into the next prompt, and
+    OpenAI refuses prompts that read like hidden model reasoning.
+    """
+
+    text = os.fspath(relative) if isinstance(relative, (str, os.PathLike)) else str(relative)
+    if len(text) <= SHOWN_PATH_CHARACTERS:
+        return text
+    return f"{text[:SHOWN_PATH_CHARACTERS]}... ({len(text) - SHOWN_PATH_CHARACTERS} more characters)"
+
+
 def portable_relative_path_key(relative: str | Path, *, allow_control: bool = False) -> str:
     """Return one separator- and Windows-alias-stable key for a relative path."""
     validate_portable_relative_path(relative, allow_control=allow_control)
@@ -51,32 +68,32 @@ def validate_portable_relative_path(relative: str | Path, *, allow_control: bool
     """Reject path spellings that alias on Windows or cross harness control state."""
     text = os.fspath(relative)
     if not isinstance(text, str) or not text or "\0" in text:
-        raise HarnessError(f"Path must be a non-empty project-relative string: {relative}")
+        raise HarnessError(f"Path must be a non-empty project-relative string: {_shown(relative)}")
     if text == ".":
         return
     components = re.split(r"[\\/]", text)
     if any(component == "" for component in components):
-        raise HarnessError(f"Path contains an empty component: {relative}")
+        raise HarnessError(f"Path contains an empty component: {_shown(relative)}")
     for component in components:
         if component in {".", ".."}:
             if component == "..":
-                raise HarnessError(f"Path escapes the project: {relative}")
+                raise HarnessError(f"Path escapes the project: {_shown(relative)}")
             continue
         if component.endswith((" ", ".")):
-            raise HarnessError(f"Path components must not end with a space or dot: {relative}")
+            raise HarnessError(f"Path components must not end with a space or dot: {_shown(relative)}")
         if ":" in component:
-            raise HarnessError(f"Path components must not contain a colon or alternate data stream: {relative}")
+            raise HarnessError(f"Path components must not contain a colon or alternate data stream: {_shown(relative)}")
         key = portable_component_key(component)
         device_stem = key.split(".", 1)[0].rstrip(" .")
         if device_stem in _DOS_DEVICES or key in _DOS_DEVICES:
-            raise HarnessError(f"Reserved Windows device path is not accepted: {relative}")
+            raise HarnessError(f"Reserved Windows device path is not accepted: {_shown(relative)}")
         if _SHORT_NAME.match(key):
             raise HarnessError(
                 f"Windows short names such as GIT~1 are not accepted, because they open the "
-                f"same folder under another spelling: {relative}"
+                f"same folder under another spelling: {_shown(relative)}"
             )
         if not allow_control and key in CONTROL_COMPONENTS:
-            raise HarnessError(f"Git and harness control paths are not accepted: {relative}")
+            raise HarnessError(f"Git and harness control paths are not accepted: {_shown(relative)}")
 
 
 class _ProjectTransactionState:
@@ -222,12 +239,12 @@ def confined_path(
     raw = Path(*re.split(r"[\\/]", os.fspath(relative)))
     if raw == Path("."):
         if not allow_missing and not root.exists():
-            raise HarnessError(f"Path does not exist: {relative}")
+            raise HarnessError(f"Path does not exist: {_shown(relative)}")
         return root
     if raw.is_absolute() or raw.drive or str(raw).startswith(("\\\\", "//")):
-        raise HarnessError(f"Path must be project-relative: {relative}")
+        raise HarnessError(f"Path must be project-relative: {_shown(relative)}")
     if any(part in {"..", ""} for part in raw.parts):
-        raise HarnessError(f"Path escapes the project: {relative}")
+        raise HarnessError(f"Path escapes the project: {_shown(relative)}")
     candidate = root.joinpath(raw)
     cursor = root
     for part in raw.parts:
@@ -235,14 +252,14 @@ def confined_path(
         native_cursor = filesystem_path(cursor)
         if native_cursor.exists() or native_cursor.is_symlink():
             if native_cursor.is_symlink() or _is_reparse(cursor):
-                raise HarnessError(f"Linked path components are not accepted: {relative}")
+                raise HarnessError(f"Linked path components are not accepted: {_shown(relative)}")
     resolved_parent = filesystem_path(candidate.parent).resolve(strict=False)
     try:
         resolved_parent.relative_to(filesystem_path(root))
     except ValueError as exc:
-        raise HarnessError(f"Path escapes the project: {relative}") from exc
+        raise HarnessError(f"Path escapes the project: {_shown(relative)}") from exc
     if not allow_missing and not filesystem_path(candidate).exists():
-        raise HarnessError(f"Path does not exist: {relative}")
+        raise HarnessError(f"Path does not exist: {_shown(relative)}")
     return candidate
 
 

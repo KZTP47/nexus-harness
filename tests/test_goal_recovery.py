@@ -136,6 +136,15 @@ class GoalRecoveryTests(unittest.TestCase):
         with mock.patch.object(self.runtime.store, '_scheduler_live', return_value=True):
             projection = self.runtime.store.resume_recovery(self.runtime.store.get(goal['goal_id']))
         self.assertFalse(projection['can_retry'])
+        # Nothing to answer while the worker is still stopping: no "Input needed".
+        self.assertFalse(projection['needs_user'])
+        self.assertTrue(projection['items'])
+
+    def test_settled_interruption_needs_the_user(self):
+        goal, _ = self.interrupted(codex=True)
+        projection = self.runtime.store.resume_recovery(self.runtime.store.get(goal['goal_id']))
+        self.assertTrue(projection['needs_user'])
+        self.assertTrue(projection['can_retry'])
 
     def test_failed_resume_rolls_back_recovery_and_completed_peer_is_preserved(self):
         goal, _ = self.interrupted(codex=True)
@@ -187,6 +196,66 @@ class GoalRecoveryTests(unittest.TestCase):
         self.assertEqual(status, 200, response)
         self.assertEqual(len(seen), 2)
         self.assertEqual(self.runtime.store.get(goal['goal_id'])['status'], 'complete')
+
+    def declined(self, error='Address a selected teammate, the team, or the user.'):
+        """A reply that fully arrived and was then declined by a harness rule."""
+        goal = self.create('declined-reply', policy={'agent_access_mode': 'full'})
+        store = self.runtime.store
+        claimed = store.claim_ready(goal['goal_id'], 'worker')[0]
+        store.record_dispatch(goal['goal_id'], claimed, 'exact-prompt')
+        current = lambda: next(t for t in store.get(goal['goal_id'])['tasks'] if t['id'] == claimed['id'])
+        store.record_provider_reply(goal['goal_id'], current(), phase='initial')
+        store.fail_task(goal['goal_id'], current(), error)
+        store.release_scheduler(goal['goal_id'], 'worker')
+        document = store.get(goal['goal_id'])
+        self.assertEqual(document['status'], 'paused')
+        self.assertEqual(current()['provider_effect_state'], 'known_reply_failed')
+        return store.public(document), claimed
+
+    def test_declined_reply_offers_one_click_continue_instead_of_a_dead_end(self):
+        goal, _ = self.declined()
+        recovery = goal['resume_recovery']
+        self.assertEqual([one['kind'] for one in recovery['items']], ['known_reply'])
+        self.assertTrue(recovery['can_retry'])
+        self.assertTrue(recovery['resume_safe'])
+        self.assertTrue(recovery['needs_user'])
+        self.assertIn('Continue from the saved work', recovery['message'])
+        resumed = self.runtime.store.control(goal['goal_id'], 'resume', {'expected_revision': goal['revision']})
+        self.assertEqual(resumed['status'], 'queued')
+        self.assertFalse(resumed['resume_recovery']['items'])
+        result, seen = self.run_replies(resumed, [fixtures.reply(), fixtures.reply()])
+        self.assertEqual(result['status'], 'complete', result['note'])
+        self.assertTrue(seen)
+        events = self.runtime.store.events(goal['goal_id'])['events']
+        self.assertEqual(sum(e['type'] == 'interrupted_turn_superseded' for e in events), 1)
+
+    def test_force_proceed_continues_a_declined_reply(self):
+        goal, _ = self.declined('Some later harness rule declined this reply.')
+        resumed = self.runtime.store.control(goal['goal_id'], 'resume', {
+            'expected_revision': goal['revision'], 'force_proceed': True})
+        self.assertEqual(resumed['status'], 'queued')
+        self.assertFalse(resumed['resume_recovery']['items'])
+
+    def test_declined_reply_stays_resumable_after_restart(self):
+        goal, _ = self.declined()
+        self.runtime.close()
+        self.runtime = long_horizon.LongHorizonRuntime(self.config)
+        self.addCleanup(self.runtime.close)
+        projected = self.runtime.store.public(self.runtime.store.get(goal['goal_id']))
+        self.assertTrue(projected['resume_recovery']['resume_safe'])
+        resumed = self.runtime.store.control(goal['goal_id'], 'resume', {'expected_revision': projected['revision']})
+        self.assertEqual(resumed['status'], 'queued')
+
+    def test_declined_reply_with_saved_action_is_never_discarded(self):
+        goal, _ = self.declined()
+        document = self.runtime.store.get(goal['goal_id'])
+        document['tasks'][0]['pending_action'] = {'changes': [{'path': 'kept.txt'}]}
+        projection = self.runtime.store.resume_recovery(document)
+        self.assertEqual(projection['items'][0]['kind'], 'saved_work')
+        self.assertFalse(projection['can_retry'])
+        uncertain = self.runtime.store.get(goal['goal_id'])
+        uncertain['tasks'][0]['outcome_unknown'] = True
+        self.assertFalse(self.runtime.store.resume_recovery(uncertain)['resume_safe'])
 
 
 if __name__ == '__main__':

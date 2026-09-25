@@ -109,7 +109,8 @@ test("actual chat activity and decision controls fit wide and narrow windows and
           {label:'Continue with the current team',description:'Keep both agents and let them finish their shared work.',recommended:true},
           {label:'Review the saved work first',description:'Inspect the existing result before continuing. '+ 'portable-evidence-'.repeat(8)}]}]}]}));
       assert.equal(await page.locator("#theBigChatActivity .chat-activity-stage").textContent(), "Waiting for your answer");
-      await page.getByRole('tab',{name:'collaboration settings',exact:true}).click();
+      await page.getByRole('tab',{name:'CHAT',exact:true}).click(); // questions live where the user types
+      assert.equal(await page.locator('#theBigChatChatPanel #theBigChatTeamGoal').count(),1);
       const options = await page.locator("#theBigChatTeamGoal .agent-question-option").evaluateAll(rows=>rows.map(row=>{
         const box=row.getBoundingClientRect(),radio=row.querySelector('input').getBoundingClientRect(),words=row.querySelector('.agent-question-option-words'),text=words.getBoundingClientRect();
         return {radioWidth:radio.width,radioHeight:radio.height,font:parseFloat(getComputedStyle(words).fontSize),
@@ -149,7 +150,8 @@ test("actual chat activity and decision controls fit wide and narrow windows and
     // reset it, and submitting must retain the exact pending decision identity.
     await page.evaluate(()=>setGoal({status:'waiting_for_user',pending_interrupts:[{id:'decision-b',reason:'Choose controls',questions:[{
       id:'controls',prompt:'Keyboard or mouse?',allow_other:false,options:[{label:'Keyboard',description:'Use arrow keys.'},{label:'Mouse',description:'Use clicks.'}]}]}]}));
-    await page.getByRole('tab',{name:'collaboration settings',exact:true}).click();
+    await page.getByRole('tab',{name:'CHAT',exact:true}).click(); // questions live where the user types
+      assert.equal(await page.locator('#theBigChatChatPanel #theBigChatTeamGoal').count(),1);
     await page.locator('#theBigChatTeamGoal').getByText('Keyboard',{exact:true}).click();
     await page.evaluate(()=>renderFeedback());
     assert.equal(await page.locator('#theBigChatTeamGoal input[value="Keyboard"]').isChecked(),true);
@@ -181,7 +183,8 @@ test("actual chat activity and decision controls fit wide and narrow windows and
     for (const width of [1264,390]) {
       await page.setViewportSize({width,height:850});
       await page.evaluate(()=>setGoal({status:'paused',pending_interrupts:[],command_request:{state:'pending'},scheduler_live:false,agent_access:{mode:'ask'}}));
-      await page.getByRole('tab',{name:'collaboration settings',exact:true}).click();
+      await page.getByRole('tab',{name:'CHAT',exact:true}).click(); // questions live where the user types
+      assert.equal(await page.locator('#theBigChatChatPanel #theBigChatTeamGoal').count(),1);
       await page.getByRole('button',{name:'Run once',exact:true}).waitFor();
       await page.getByRole('button',{name:'Run once',exact:true}).scrollIntoViewIfNeeded();
       const visible=await page.getByRole('button',{name:'Run once',exact:true}).evaluate(button=>{

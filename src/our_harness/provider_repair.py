@@ -16,6 +16,7 @@ from typing import Any
 
 from . import action_protocol, chat
 from .config import LoadedConfig
+from .prompt_refusal import prompt_was_refused
 from .providers.connection import connection_status
 from .providers.subscription_cli import recipe_for, responding_command
 from .seats import ROUTE_NAMES
@@ -190,7 +191,11 @@ def classify_prior_failure(value: Any) -> dict[str, Any]:
     text = summary.casefold()
     category = "unknown"
 
-    if any(marker in text for marker in (
+    if prompt_was_refused(summary):
+        # Before the broad markers: "invalid prompt" is not a protocol error,
+        # and a usage-policy refusal is not an account or sign-in problem.
+        category = "prompt-refused"
+    elif any(marker in text for marker in (
         "outcome is unknown", "outcome unknown", "unknown outcome",
         "unreconciled provider turn", "may have submitted", "may have been sent",
         "cannot prove whether", "cannot tell whether the provider",
@@ -272,6 +277,8 @@ def classify_prior_failure(value: Any) -> dict[str, Any]:
         "network": True,
         "timeout": True,
         "protocol": False,
+        # Retryable with a different prompt; the route itself is fine.
+        "prompt-refused": True,
         "outcome-unknown": False,
         "unknown": None,
     }[category]
@@ -613,6 +620,16 @@ def repair_plan(
                 "Press Check again after correcting the compatibility mismatch.",
             ]
             actions = [SETTINGS, CHECK]
+        elif category == "prompt-refused":
+            plan_state = "prompt-refused"
+            tone = "attention"
+            title = "The provider refused one prompt, not the connection"
+            steps = [
+                "The sign-in, route and model are fine. The provider's safety filter refused that one prompt.",
+                "Nexus retries a refused goal turn by itself with the looping tool history left out.",
+                "If it keeps happening, rephrase the request or start a fresh chat.",
+            ]
+            actions = [CHECK]
         elif category == "outcome-unknown":
             plan_state = "outcome-unknown"
             title = "Nexus cannot safely tell whether the provider acted"

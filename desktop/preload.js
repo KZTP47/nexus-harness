@@ -37,6 +37,8 @@ contextBridge.exposeInMainWorld("harnessDesktop", {
     String(contents || "")),
   saveEmailFile: (suggestedName, contents) => ipcRenderer.invoke(
     "harness:saveEmailFile", String(suggestedName || "reply.eml"), String(contents || "")),
+  saveMailAttachment: (suggestedName, base64) => ipcRenderer.invoke(
+    "harness:saveMailAttachment", String(suggestedName || "attachment"), String(base64 || "")),
   saveLargeJsonFile: async (suggestedName, contents) => {
     const written = String(contents || "");
     const begun = await ipcRenderer.invoke(

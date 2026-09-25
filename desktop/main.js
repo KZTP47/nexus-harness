@@ -656,11 +656,38 @@ ipcMain.handle("harness:saveJsonFile", (event, suggestedName, contents) => {
   return {saved: true, filename: path.basename(chosen)};
 });
 
+// A picture or file from an email, saved where the user chooses. The bytes come
+// from the mail store as base64; the name keeps its own extension.
+ipcMain.handle("harness:saveMailAttachment", (event, suggestedName, encoded) => {
+  if (!fromHarnessWindow(event)) throw new Error("Only the Nexus Harness window may save an attachment.");
+  const text = String(encoded || "");
+  if (!text || text.length > 21_000_000 || !/^[A-Za-z0-9+/]+={0,2}$/.test(text)) {
+    throw new Error("An attachment must contain 1 to 15000000 bytes.");
+  }
+  const raw = Buffer.from(text, "base64");
+  let safe = path.basename(String(suggestedName || "attachment")).replace(/[^A-Za-z0-9._ ()-]/g, "-").replace(/^\.+/, "") || "attachment";
+  const selected = dialog.showSaveDialogSync(window || undefined, {
+    title: "Save email attachment",
+    defaultPath: path.join(app.getPath("downloads"), safe),
+    buttonLabel: "Save",
+    properties: ["showOverwriteConfirmation", "createDirectory"],
+  });
+  if (!selected) return {saved: false};
+  const beside = `${selected}.${process.pid}-${Date.now()}.part`;
+  try {
+    fs.writeFileSync(beside, raw, {flag: "wx"});
+    fs.renameSync(beside, selected);
+  } finally {
+    try { fs.unlinkSync(beside); } catch (error) { if (error?.code !== "ENOENT") throw error; }
+  }
+  return {saved: true, path: selected};
+});
 ipcMain.handle("harness:saveEmailFile", (event, suggestedName, contents) => {
   if (!fromHarnessWindow(event)) throw new Error("Only the Nexus Harness window may save an email.");
   const written = String(contents || "");
-  if (!written || Buffer.byteLength(written, "utf8") > 2_000_000) {
-    throw new Error("An email export must contain 1 to 2000000 UTF-8 bytes.");
+  // A reply with attachments carries them base64-encoded inside the .eml.
+  if (!written || Buffer.byteLength(written, "utf8") > 30_000_000) {
+    throw new Error("An email export must contain 1 to 30000000 UTF-8 bytes.");
   }
   let safe = path.basename(String(suggestedName || "reply.eml")).replace(/[^A-Za-z0-9._ -]/g, "-");
   if (!safe.toLowerCase().endsWith(".eml")) safe += ".eml";

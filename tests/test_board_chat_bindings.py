@@ -1640,6 +1640,28 @@ class BoardChatBindingTests(unittest.TestCase):
                     json.loads(live.read_text(encoding="utf-8"))[field], version,
                 )
 
+    def test_folder_identity_survives_a_python_runtime_upgrade_on_windows(self) -> None:
+        """3.12+ widened Windows st_dev; the same folder must keep its identity."""
+        real = Path.stat
+        seen = real(self.first)
+
+        def widened(path, *args, **kwargs):
+            found = real(path, *args, **kwargs)
+            if Path(path) != self.first:
+                return found
+            values = list(os.stat_result(found))
+            values[2] = (0x04B6F904 << 32) | (found.st_dev & 0xFFFFFFFF)
+            return os.stat_result(values)
+
+        project = {"path": str(self.first)}
+        with mock.patch.object(swarm_chats.os, "name", "nt"):
+            before = swarm_chats._project_binding(project, "project-a")
+            with mock.patch.object(Path, "stat", widened):
+                after = swarm_chats._project_binding(project, "project-a")
+        self.assertEqual(before, after)
+        self.assertEqual(before["identity_strength"], "filesystem")
+        self.assertEqual(seen.st_ino, real(self.first).st_ino)
+
     def test_invalid_nonempty_workspace_identity_is_never_treated_as_legacy(self) -> None:
         malformed = self.board("workspace-not-a-valid-identity")
         with self.assertRaisesRegex(Exception, "invalid workspace identity"):
@@ -1647,7 +1669,7 @@ class BoardChatBindingTests(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "invalid workspace identity"):
             swarm_chats.list_for_agent(self.config, malformed, "agent-1")
 
-    def test_save_as_forks_chat_identity_but_resaving_the_open_board_keeps_it(self) -> None:
+    def test_save_as_carries_the_chats_and_named_boards_never_share_identity(self) -> None:
         live = self.root / "live-board.json"
         library = self.root / "saved-boards"
         starting = self.board("workspace-99999999999999999999999999999999")
@@ -1657,18 +1679,26 @@ class BoardChatBindingTests(unittest.TestCase):
                 (library / swarm._filed_under(name)).read_text(encoding="utf-8")
             )["board"]
 
+        def identities() -> list[str]:
+            return [
+                swarm._kept_board_workspace_id(
+                    one, json.loads(one.read_text(encoding="utf-8"))["name"],
+                    swarm.read_it(json.loads(one.read_text(encoding="utf-8"))["board"]),
+                )
+                for one in sorted(library.glob("*.json"))
+            ]
+
         with (
             mock.patch.object(swarm, "where_it_lives", return_value=live),
             mock.patch.object(swarm, "where_the_kept_ones_live", return_value=library),
         ):
             # A portable/client-supplied identity is not authoritative. The
-            # engine owns the live board identity and each Save As fork.
+            # engine owns the live board identity.
             swarm.save(starting, self.config)
             swarm.keep_this_board("Board A", self.config)
             swarm.keep_this_board("Board B", self.config)
-            board_a = saved("Board A")
-            board_b = saved("Board B")
-            self.assertNotEqual(board_a["workspace_id"], board_b["workspace_id"])
+            self.assertNotEqual(saved("Board A")["workspace_id"], saved("Board B")["workspace_id"])
+            self.assertEqual(swarm.load().active_saved_board, "Board B")
 
             opened_a = swarm.open_this_board("Board A", self.config)
             chat_a = swarm_chats.list_for_agent(
@@ -1677,12 +1707,20 @@ class BoardChatBindingTests(unittest.TestCase):
             swarm.keep_this_board("Board A", self.config)
             self.assertEqual(saved("Board A")["workspace_id"], opened_a.workspace_id)
 
-            # Saving the currently open A under a different name is a fork,
-            # even though every visible agent and project id is identical.
+            # Save As continues the open board under the new name: its chats
+            # follow, and the live board is now that board.
             swarm.keep_this_board("Board C", self.config)
-            self.assertNotEqual(saved("Board C")["workspace_id"], opened_a.workspace_id)
+            self.assertEqual(saved("Board C")["workspace_id"], opened_a.workspace_id)
+            self.assertEqual(swarm.load().active_saved_board, "Board C")
+            self.assertEqual(swarm.load().workspace_id, opened_a.workspace_id)
+            # ...and the earlier save point is never an alias of it.
+            self.assertNotEqual(saved("Board A")["workspace_id"], opened_a.workspace_id)
             swarm.keep_this_board("board a", self.config)
-            self.assertNotEqual(saved("board a")["workspace_id"], opened_a.workspace_id)
+            self.assertEqual(len(set(identities())), len(identities()))
+
+            opened_c = swarm.open_this_board("board a", self.config)
+            listed_c = swarm_chats.list_for_agent(self.config, opened_c.to_dict(), "agent-1")
+            self.assertEqual(listed_c["active"], chat_a["id"])
 
             opened_b = swarm.open_this_board("Board B", self.config)
             chat_b = swarm_chats.list_for_agent(
@@ -1691,11 +1729,36 @@ class BoardChatBindingTests(unittest.TestCase):
             self.assertNotEqual(chat_a["id"], chat_b["id"])
             self.assertNotEqual(chat_a["filed_as"], chat_b["filed_as"])
 
-            reopened_a = swarm.open_this_board("Board A", self.config)
-            listed_a = swarm_chats.list_for_agent(
-                self.config, reopened_a.to_dict(), "agent-1"
-            )
-            self.assertEqual(listed_a["active"], chat_a["id"])
+    def test_chats_made_after_save_as_are_there_when_that_board_is_reopened(self) -> None:
+        """Open a saved board, chat, Save As, chat again, reopen the new name."""
+        live = self.root / "live-board.json"
+        library = self.root / "saved-boards"
+        library.mkdir()
+        # An older saved board without an identity of its own, as on disk
+        # from earlier versions.
+        older = self.board("workspace-99999999999999999999999999999999")
+        older.pop("workspace_id")
+        (library / swarm._filed_under("Earlier")).write_text(json.dumps(
+            {"name": "Earlier", "saved_at": "2026-01-01T00:00:00Z", "board": older}), encoding="utf-8")
+        with (
+            mock.patch.object(swarm, "where_it_lives", return_value=live),
+            mock.patch.object(swarm, "where_the_kept_ones_live", return_value=library),
+        ):
+            opened = swarm.open_this_board("Earlier", self.config)
+            first = swarm_chats.list_for_agent(self.config, opened.to_dict(), "agent-1")["chats"][0]
+            swarm.keep_this_board("Later", self.config)
+            second_id = swarm_chats.create(
+                self.config, swarm.load().to_dict(), "agent-1", "", scope="single")["active"]
+            # Another session: the renamed board is opened again.
+            reopened = swarm.open_this_board("Later", self.config)
+            ids = {one["id"] for one in swarm_chats.list_for_agent(
+                self.config, reopened.to_dict(), "agent-1")["chats"]}
+            self.assertLessEqual({first["id"], second_id}, ids)
+            # The earlier save point opens as its own board, not an alias.
+            earlier = swarm.open_this_board("Earlier", self.config)
+            self.assertNotEqual(earlier.workspace_id, reopened.workspace_id)
+            self.assertNotIn(first["id"], {one["id"] for one in swarm_chats.list_for_agent(
+                self.config, earlier.to_dict(), "agent-1")["chats"]})
 
     def test_chat_presentation_includes_scoped_collaboration_problem(self) -> None:
         board = self.board("workspace-12121212121212121212121212121212")

@@ -263,10 +263,10 @@ class ClaudeSessionTests(Fixture):
         session.send("second")
         self.assertTrue(wait_for(lambda: session.turns_completed == 2))
         argv = json.loads(record.read_text())
-        for flag in ("--input-format", "stream-json", "--include-partial-messages", "--append-system-prompt",
+        for flag in ("--input-format", "stream-json", "--include-partial-messages", "--append-system-prompt-file",
                      "--mcp-config", "acceptEdits"):
             self.assertIn(flag, argv)
-        mcp = json.loads(argv[argv.index("--mcp-config") + 1])
+        mcp = json.loads(Path(argv[argv.index("--mcp-config") + 1]).read_text(encoding="utf-8"))
         self.assertEqual(mcp["mcpServers"]["nexus"]["args"], ["-m", "srv"])
         self.assertEqual(session.session_id, "claude-session-1")
         tools = [e for e in self.events if e["kind"] == "tool"]
@@ -535,6 +535,44 @@ class ManagerTests(Fixture):
         self.assertTrue(wait_for(lambda: manager.team(snapshot["team_id"]).state == "running"))
         self.assertEqual(created["codex"].spec.resume_id, "s-codex")
         self.assertEqual(created["codex"].resume_outcome, "resumed")
+        # A board chat's next message reopens a saved team and is delivered once it is up.
+        manager.close(snapshot["team_id"])
+        manager.reopen(snapshot["team_id"], "Carry on please", "claude")
+        self.assertTrue(wait_for(lambda: "Carry on please" in created["claude"].received))
+        self.assertNotIn("Carry on please", created["codex"].received)
+
+    def test_board_chats_remember_their_orchestrator_and_team_across_restarts(self):
+        manager, created = self.manager()
+        self.assertEqual(manager.chat("chat-a"), {"schema_version": 1, "chat": "chat-a", "mode": "nexus",
+                                                  "team_id": "", "team": None})
+        self.assertEqual(manager.set_chat_mode("chat-a", "live_team")["mode"], "live_team")
+        with self.assertRaisesRegex(HarnessError, "Choose the Nexus"):
+            manager.set_chat_mode("chat-a", "robots")
+        with self.assertRaisesRegex(HarnessError, "saved chat"):
+            manager.chat(" ")
+        # Two chats drive two teams at the same time.
+        first = manager.create({"agents": ["codex", "claude"], "goal": "Build A", "chat": "chat-a"})
+        second = manager.create({"agents": ["codex"], "goal": "Build B", "chat": "chat-b"})
+        self.assertEqual(manager.chat("chat-a")["team_id"], first["team_id"])
+        self.assertEqual(manager.chat("chat-b")["team_id"], second["team_id"])
+        self.assertEqual(manager.chat("chat-b")["mode"], "live_team")
+        self.assertEqual(manager.chat_modes()["chat-a"]["team_id"], first["team_id"])
+        self.assertEqual({one["team_id"]: one["chat"] for one in manager.saved()}[second["team_id"]], "chat-b")
+        self.assertTrue(wait_for(lambda: all(manager.team(t["team_id"]).state == "running" for t in (first, second))))
+        # A fresh manager (Nexus restarted) still knows the link; the team is saved, not running.
+        manager.close_all()
+        restarted = RuntimeManager(root=self.root / "v3", board=manager.board, config=manager.config,
+                                   project_root=lambda: self.root, session_factory=manager.session_factory)
+        again = restarted.chat("chat-a")
+        self.assertEqual((again["mode"], again["team_id"], again["team"]["state"]), ("live_team", first["team_id"], "saved"))
+        self.assertEqual([one["name"] for one in again["team"]["agents"]], ["GPT Codex", "Claude"])
+        # Starting over keeps the mode and the saved team, only unlinks it.
+        fresh = restarted.forget_chat_team("chat-a")
+        self.assertEqual((fresh["mode"], fresh["team_id"]), ("live_team", ""))
+        self.assertTrue((self.root / "v3" / first["team_id"] / "team.json").is_file())
+        # An unknown schema is ignored rather than trusted.
+        (self.root / "v3" / "chat-links.json").write_text('{"schema_version": 99, "chats": {"chat-b": {"mode": "live_team"}}}', encoding="utf-8")
+        self.assertEqual(restarted.chat("chat-b")["mode"], "nexus")
 
     def test_an_unset_route_uses_the_installed_cli_and_only_that(self):
         # The board is shared by every project; a new project has no routes yet.
@@ -612,6 +650,21 @@ class EndpointTests(unittest.TestCase):
         self.assertEqual(self.panel.ask("/api/live-team", {"action": "nope"})[0], 400)
         self.assertEqual(self.panel.ask("/api/live-team", {"action": "close", "team": team})[0], 200)
         self.assertEqual(self.panel.ask("/api/live-team/team?team=missing")[0], 400)
+
+    def test_board_chat_orchestrator_endpoints(self):
+        status, chat = self.panel.ask("/api/live-team/chat?chat=pair-chat-1")
+        self.assertEqual((status, chat["mode"], chat["team"]), (200, "nexus", None))
+        self.assertEqual(self.panel.ask("/api/live-team")[1]["chats"], {})
+        status, changed = self.panel.ask("/api/live-team", {"action": "chat_mode", "chat": "pair-chat-1", "mode": "live_team"})
+        self.assertEqual((status, changed["chat"]["mode"]), (200, "live_team"))
+        self.assertEqual(self.panel.ask("/api/live-team", {"action": "chat_mode", "chat": "pair-chat-1", "mode": "x"})[0], 400)
+        status, created = self.panel.ask("/api/live-team", {"action": "create", "agents": ["codex"], "goal": "Say hi", "chat": "pair-chat-1"})
+        self.assertEqual(status, 200, created)
+        status, chat = self.panel.ask("/api/live-team/chat?chat=pair-chat-1")
+        self.assertEqual(chat["team_id"], created["team"]["team_id"])
+        status, fresh = self.panel.ask("/api/live-team", {"action": "chat_new_team", "chat": "pair-chat-1"})
+        self.assertEqual((status, fresh["chat"]["team_id"]), (200, ""))
+        self.panel.ask("/api/live-team", {"action": "close", "team": created["team"]["team_id"]})
 
 
 if __name__ == "__main__":

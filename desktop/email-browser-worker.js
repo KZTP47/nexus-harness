@@ -42,6 +42,17 @@ const SCROLL_SETTLE_MS = 150;
 const REVEAL_MS = 6000;
 // Latest Send click after the request started; the bridge stops waiting at 150 s.
 const DISPATCH_BY_MS = 100000;
+// Pictures and files read with a message: bounded like the Python mail store
+// (email_attachments.py), and in time so a picture-heavy mail cannot starve the scan.
+const ATTACH_FILES = 20;
+const ATTACH_BYTES = 15000000;
+const ATTACH_TOTAL = 40000000;
+const ATTACH_MS = 15000;
+const ATTACH_IMAGE_SIDE = 48;
+const DOWNLOAD_ITEM = /^(Download|Ladda ned|Ladda ner|Hämta|Herunterladen|Télécharger|Descargar|Scarica|Downloaden|Baixar|Pobierz|Lataa|Last ned|Download all)$/i;
+const MORE_ACTIONS = /more (actions|options)|fler (åtgärder|alternativ)|weitere aktionen|plus d.actions|más acciones|^more$/i;
+const ATTACH_CONTROL = /^(Attach|Attach file|Attach files|Attach a file|Add attachment|Insert files using Drive|Bifoga|Bifoga fil|Bifoga filer|Anhängen|Datei anfügen|Joindre|Adjuntar|Allega)$/i;
+const BROWSE_ITEM = /browse this computer|upload from this (device|computer)|this (device|computer)|bläddra på den här datorn|den här (enheten|datorn)|diesen computer durchsuchen|parcourir cet ordinateur|examinar este equipo|sfoglia questo computer/i;
 // A missing, malformed or future request start never stretches a deadline.
 const requestStart = value => Number.isFinite(value)&&value<=Date.now() ? value : Date.now();
 // outlook.cloud.microsoft rewrites /mail/inbox to /mail/, outlook.live.com uses /mail/0/inbox and an opened conversation appends /id/<item>.
@@ -167,6 +178,42 @@ function readMessage(options) {
     .find(value=>value&&Number.isFinite(Date.parse(value)))||'';
   const received_at=stamp?new Date(Date.parse(stamp)).toISOString():'';
   const message={sender,subject,body,received_at,message_id:message_id || ''};
+  if(options.attachmentToken&&!options.replyControl) {
+    // Mark this one message's pictures and file cards so the worker can read their
+    // bytes. Only attributes are added; nothing is clicked or changed here.
+    const shown=node=>node.getClientRects().length&&getComputedStyle(node).visibility!=='hidden';
+    const targets=[];let count=0;
+    const mark=(node,entry)=>{const id=options.attachmentToken+'-'+(count++);node.setAttribute('data-nexus-attachment',id);targets.push({id,...entry});};
+    // Outlook shows a hidden 1 x 1 placeholder until it has fetched a picture that came with the mail.
+    const waiting=[...element.querySelectorAll('img[data-loadstatus="pending"]')];
+    for(const image of waiting.slice(0,20))mark(image,{kind:'pending',name:(image.getAttribute('alt')||'').slice(0,200)});
+    for(const image of [...element.querySelectorAll('img')].filter(shown).filter(image=>!waiting.includes(image)).slice(0,24)) {
+      const width=Math.max(image.naturalWidth||0,image.width||0),height=Math.max(image.naturalHeight||0,image.height||0);
+      // Tracking pixels, spacers and icons are not content.
+      if(width<options.minimumSide||height<options.minimumSide)continue;
+      mark(image,{kind:'image',src:image.currentSrc||image.src||'',name:(image.getAttribute('alt')||image.getAttribute('title')||'').slice(0,200),width,height});
+    }
+    const named=node=>{
+      const text=[node.getAttribute('title'),node.getAttribute('aria-label'),(node.innerText||'').split('\n')[0]].filter(Boolean).join(' ');
+      return (text.match(/[^\\/:*?"<>|\r\n,]+\.[A-Za-z0-9]{1,8}(?=\s|$|,)/)||[''])[0].trim().slice(0,200);
+    };
+    if(gmail) {
+      // Gmail names each attachment's type, name and download address on its card.
+      for(const card of [...envelope.querySelectorAll('[download_url]')].slice(0,40)) {
+        const [type,name,...rest]=String(card.getAttribute('download_url')||'').split(':');
+        const url=rest.join(':');
+        if(name&&/^https:/.test(url))mark(card,{kind:'file',name:name.slice(0,200),type:type.slice(0,100),url});
+      }
+    } else {
+      const cards=[...envelope.querySelectorAll('[role="listbox"] [role="option"], [data-testid*="ttachment"], [aria-label*="ttachment"] [role="option"]')]
+        .filter(node=>!element.contains(node)&&shown(node)&&!node.closest('[contenteditable="true"]'));
+      for(const card of cards.filter(node=>!cards.some(other=>other!==node&&other.contains(node))).slice(0,40)) {
+        const name=named(card);
+        if(name)mark(card,{kind:'file',name});
+      }
+    }
+    return {...message,attachment_targets:targets};
+  }
   if(options.replyControl) {
     const expected=options.approvedOriginal;
     if(!expected || sender!==expected.sender || subject!==expected.subject || body!==expected.body)return null;
@@ -490,7 +537,10 @@ async function session(request) {
   if (!value) {
     const browser = findInstalledBrowser(['edge','chrome']);
     if (!browser) throw new Error('Install Microsoft Edge or Google Chrome to connect browser mail.');
-    const context = await chromium.launchPersistentContext(profile, {executablePath:browser.executable, chromiumSandbox:true, headless:mode==='headless', viewport:mode==='headless'?{width:1440,height:1000}:null, acceptDownloads:false, timeout:30000});
+    const context = await chromium.launchPersistentContext(profile, {executablePath:browser.executable, chromiumSandbox:true, headless:mode==='headless', viewport:mode==='headless'?{width:1440,height:1000}:null,
+      // Only the worker's own clicks on an attachment's Download download anything;
+      // Playwright keeps it in a temporary folder that closes with the browser.
+      acceptDownloads:true, timeout:30000});
     const page = context.pages()[0] || await context.newPage();
     page.setDefaultTimeout(8000);
     value = {context,page,provider:c.provider,profile:path.resolve(profile),mode,explicitSignIn:request.command==='open'};
@@ -535,7 +585,7 @@ async function status(value, connection, identityTimeout=policy(value.provider).
   return {...identity,actual_browser_mode:value.mode || 'headed',state:identity.email ? 'connected' : 'sign_in_required',message:identity.email ? 'Browser connected. Keep Nexus running to check new mail.' : 'Sign in in the Nexus mail browser. If already signed in, open the account menu so Nexus can identify your mailbox.'};
 }
 async function handle(request) {
-  if (!['open','status','sync','send','prepare'].includes(request.command)) throw new Error('Unknown browser mail command.');
+  if (!['open','status','sync','send','prepare','attachments'].includes(request.command)) throw new Error('Unknown browser mail command.');
   const key=request.connection?.id;
   const previous=operations.get(key) || Promise.resolve();
   const operation=previous.catch(()=>{}).then(async()=>{
@@ -549,6 +599,7 @@ async function handle(request) {
 }
 async function operate(value,request) {
   // A send stamps the conversation it re-opens itself; an Outlook self-reload during it must not erase that row.
+  if (request.command==='attachments') return fetchAttachments(value,{...request,_startedAt:requestStart(request._startedAt)});
   if (['send','prepare'].includes(request.command)) {
     request={...request,_startedAt:requestStart(request._startedAt)}; // The preparation retry shares one dispatch deadline.
     value.replying=true;
@@ -957,11 +1008,12 @@ async function operate(value,request) {
     // Outlook inserts the body, sender and subject in separate render passes.
     // Wait for the complete bounded extraction after the selected pane changes.
     let message,lastReadError,senderOverride;
+    const attachmentOptions=request.attachments_dir?{attachmentToken:randomUUID(),minimumSide:ATTACH_IMAGE_SIDE}:{};
     const readStarted=Date.now();
     const readDeadline=readStarted+10000;
     while (Date.now()<readDeadline) {
       try {
-        message=await value.page.evaluate(readMessage,{provider:value.provider,expectedMessageId,...senderOverride});
+        message=await value.page.evaluate(readMessage,{provider:value.provider,expectedMessageId,...senderOverride,...attachmentOptions});
         // An existing empty heading is valid mail, but give staged hydration a
         // short opportunity to populate it before accepting a blank subject.
         if(message.subject===''&&Date.now()-readStarted<600){message=null;await new Promise(resolve=>setTimeout(resolve,150));continue;}
@@ -976,7 +1028,7 @@ async function operate(value,request) {
         if (value.provider==='browser_outlook' && !senderOverride && Date.now()-readStarted>=3000 && /message sender is not ready/.test(error.message)) {
           senderOverride=await resolveSenderCard(value.page,expectedMessageId);
           // Card discovery may outlast the normal body hydration deadline.
-          message=await value.page.evaluate(readMessage,{provider:value.provider,expectedMessageId,...senderOverride});
+          message=await value.page.evaluate(readMessage,{provider:value.provider,expectedMessageId,...senderOverride,...attachmentOptions});
           break;
         } else await new Promise(resolve=>setTimeout(resolve,200));
       }
@@ -995,7 +1047,15 @@ async function operate(value,request) {
       if(after.bodies.some(([id])=>id&&!view.bodies.some(([beforeId])=>beforeId===id)))noteArrival();
     }
     parsedCount++;
+    const targets=message.attachment_targets||[];delete message.attachment_targets;
     const source_id=sourceHash(value.provider,row,message);
+    // Only mail this scan has not stored yet is worth reading pictures and files for.
+    if(request.attachments_dir&&targets.length&&!seen.includes(source_id)){
+      const until=Math.min(Date.now()+ATTACH_MS,workDeadline-RESERVE_MS);
+      const settled=await settledTargets(value,{provider:value.provider,expectedMessageId,...senderOverride},message,until);
+      const files=await collectAttachments(value,settled,request.attachments_dir,until);
+      if(files.length)message.attachments=files;
+    }
     const browser_reference={contract:REPLY_CONTRACT,provider:value.provider,row_attr:row.attr,row_id:row.id,message_id:message.message_id,source_hash:source_id,content_hash:contentHash(message),...(splitInbox?{inbox_tab:tabName}:{})};
     const first=firstSeen[firstKey(row)]?.[0];
     if (!seen.includes(source_id)) { if(message.sender.toLowerCase()!==refreshed.email.toLowerCase()) messages.push({source_id,...message,first_seen_at:first?new Date(first).toISOString():null,browser_reference}); seen.push(source_id); }
@@ -1058,6 +1118,192 @@ async function operate(value,request) {
   return {messages,failed_messages:[...failures.values()],resolved_failures:[...resolved],has_more,
     cursor:JSON.stringify({contract:SYNC_CONTRACT,seen:seen.slice(-5000),offset:nextOffset,...cacheFields()}),
     warnings:[...rowWarnings,...notes,'Browser mail walks up to '+ROW_LIMIT+' inbox conversations per tab per scan and reconciles at most one unchanged conversation per tab per scan. Opening mail may mark it read. Website layout changes can interrupt checking.']};
+}
+// Bytes of a URL fetched by the mailbox page itself: same-origin mail files and
+// blob pictures work there with the page's own sign-in, exactly as the mailbox reads them.
+function pageFetch({id,url,limit}) {
+  const node=id?document.querySelector(`[data-nexus-attachment="${CSS.escape(id)}"]`):null;
+  const address=url||node?.currentSrc||node?.src;
+  if(!address)return null;
+  return fetch(address,{credentials:'include'}).then(async response=>{
+    if(!response.ok)return null;
+    const bytes=new Uint8Array(await response.arrayBuffer());
+    if(!bytes.length||bytes.length>limit)return null;
+    let text='';for(let i=0;i<bytes.length;i+=32768)text+=String.fromCharCode(...bytes.subarray(i,i+32768));
+    return {data:btoa(text),type:response.headers.get('content-type')||''};
+  }).catch(()=>null);
+}
+// A URL's bytes: first as the page reads it, then through the signed-in browser's
+// own request context (for another origin that refuses the page's fetch).
+async function urlBytes(value,{id,url}) {
+  const inPage=await value.page.evaluate(pageFetch,{id,url,limit:ATTACH_BYTES}).catch(()=>null);
+  if(inPage)return {buffer:Buffer.from(inPage.data,'base64'),type:inPage.type};
+  const address=url||(await value.page.locator(`[data-nexus-attachment="${id}"]`).first().evaluate(node=>node.currentSrc||node.src).catch(()=>''));
+  if(/^https:/i.test(address||'')) {
+    try {
+      const response=await value.page.context().request.get(address,{timeout:6000,maxRedirects:3});
+      const body=response.ok()?await response.body():null;
+      if(body&&body.length)return {buffer:body,type:String(response.headers()['content-type']||'')};
+    } catch {}
+  }
+  return null;
+}
+// A picture's original bytes: its data URL, the page or browser request, or at worst the picture as displayed.
+async function imageBytes(value,target) {
+  const src=String(target.src||'');
+  const data=src.match(/^data:([^;,]*)((?:;[^;,]*)*?)(;base64)?,(.*)$/is);
+  if(data)return {buffer:Buffer.from(data[3]?data[4]:decodeURIComponent(data[4]),data[3]?'base64':'utf8'),type:data[1]||''};
+  const fetched=await urlBytes(value,{id:target.id});
+  if(fetched)return fetched;
+  const shot=await value.page.locator(`[data-nexus-attachment="${target.id}"]`).first().screenshot({type:'png',timeout:3000});
+  return {buffer:shot,type:'image/png'};
+}
+// Outlook serves a file only through its own Download command on the card.
+async function outlookDownload(value,target,deadline) {
+  const card=value.page.locator(`[data-nexus-attachment="${target.id}"]`).first();
+  const timeout=Math.max(1000,Math.min(10000,deadline-Date.now()));
+  const waiting=value.page.waitForEvent('download',{timeout});waiting.catch(()=>{});
+  try {
+    await card.hover({timeout:2000}).catch(()=>{});
+    let opened=false;
+    for(const control of await visibleElements(card.locator('button,[role="button"]'))) {
+      const label=(await control.getAttribute('aria-label'))||(await control.getAttribute('title'))||'';
+      if(MORE_ACTIONS.test(label)){await control.click({timeout:2000});opened=true;break;}
+    }
+    if(!opened)await card.click({button:'right',timeout:2000});
+    const item=value.page.getByRole('menuitem',{name:DOWNLOAD_ITEM}).first();
+    await item.click({timeout:3000});
+    const download=await waiting;
+    const file=await download.path();
+    const buffer=file?fs.readFileSync(file):null;
+    // The card shows the file's own name; the download may only know its address.
+    const name=/\.[A-Za-z0-9]{1,8}$/.test(target.name||'')?target.name:(download.suggestedFilename()||target.name);
+    await download.delete().catch(()=>{});
+    return {buffer,name};
+  } finally {
+    await value.page.keyboard.press('Escape').catch(()=>{});
+  }
+}
+// Mailbox pages fetch a message's own pictures after painting its text. Wait (bounded) until none is pending.
+async function settleImages(value,deadline) {
+  const until=Math.min(deadline,Date.now()+10000);
+  while(Date.now()<until) {
+    const pending=await value.page.evaluate(()=>document.querySelectorAll('[role="document"] img[data-loadstatus="pending"], [aria-label="Message body"] img[data-loadstatus="pending"], .a3s img[data-loadstatus="pending"]').length).catch(()=>0);
+    if(!pending)return;
+    await sleep(250);
+  }
+}
+// Read the proven message again after its pictures loaded, so the marks point at loaded pictures.
+async function settledTargets(value,options,message,deadline) {
+  await settleImages(value,deadline);
+  try {
+    const again=await value.page.evaluate(readMessage,{...options,attachmentToken:randomUUID(),minimumSide:ATTACH_IMAGE_SIDE});
+    if(again&&again.sender===message.sender&&again.subject===message.subject&&again.body===message.body)return again.attachment_targets||[];
+  } catch {}
+  return message.attachment_targets||[];
+}
+// Save what could be read into the mail store's incoming folder, named by checksum;
+// list what could not be read, so the assistant and the user still know it exists.
+async function collectAttachments(value,targets,directory,deadline) {
+  if(!path.isAbsolute(String(directory||'')))return [];
+  fs.mkdirSync(directory,{recursive:true});
+  const files=[],seen=new Set();let total=0;
+  const keep=(buffer,name,type,inline)=>{
+    if(!buffer||!buffer.length)throw new Error('empty');
+    if(buffer.length>ATTACH_BYTES){files.push({name,type,size:buffer.length,omitted:'Larger than the attachment size limit; open it in the mailbox.'});return;}
+    if(total+buffer.length>ATTACH_TOTAL){files.push({name,type,size:buffer.length,omitted:'The attachments of one email are limited to 40 MB; open it in the mailbox.'});return;}
+    const sha256=createHash('sha256').update(buffer).digest('hex');
+    if(seen.has(sha256))return;
+    seen.add(sha256);total+=buffer.length;
+    const target=path.join(directory,sha256);
+    if(!fs.existsSync(target)){const temporary=target+'.'+randomUUID()+'.tmp';fs.writeFileSync(temporary,buffer,{mode:0o600});fs.renameSync(temporary,target);}
+    files.push({name,type:String(type||'').split(';')[0].trim().slice(0,100),sha256,inline,size:buffer.length});
+  };
+  for(const target of targets) {
+    if(files.length>=ATTACH_FILES)break;
+    const fallback=target.name||(target.kind==='image'?'picture-'+(files.length+1):'attachment');
+    if(Date.now()>=deadline){files.push({name:fallback,omitted:'Not read in time; open it in the mailbox.'});continue;}
+    if(target.kind==='pending'){files.push({name:target.name||'picture-'+(files.length+1),omitted:'The mailbox did not finish loading this picture; open it in the mailbox.'});continue;}
+    try {
+      if(target.kind==='image') {
+        const got=await imageBytes(value,target);
+        let name=target.name&&/\.[a-z0-9]{2,5}$/i.test(target.name)?target.name:'';
+        if(!name){try{name=decodeURIComponent(new URL(target.src).pathname.split('/').pop()||'');}catch{} if(!/\.[a-z0-9]{2,5}$/i.test(name))name='picture-'+(files.length+1)+'.'+(/png/.test(got.type)?'png':/gif/.test(got.type)?'gif':/webp/.test(got.type)?'webp':'jpg');}
+        keep(got.buffer,name.slice(0,200),got.type,true);
+      } else if(target.url) {
+        const url=new URL(target.url);
+        if(!trustedOrigin(value.provider,url))throw new Error('untrusted');
+        const got=await urlBytes(value,{url:url.href});
+        if(!got)throw new Error('download failed');
+        keep(got.buffer,target.name,target.type||got.type,false);
+      } else {
+        const got=await outlookDownload(value,target,deadline);
+        keep(got.buffer,got.name||target.name,'',false);
+      }
+    } catch {
+      files.push({name:fallback,omitted:'The file could not be read from the mailbox page; open it there.'});
+    }
+  }
+  return files;
+}
+// Names of the files a composer already shows, outside its text editor.
+function composerFiles({provider,names}) {
+  const selector=provider==='browser_gmail'
+    ? '[contenteditable="true"][role="textbox"][aria-label="Message Body"], .Am.Al.editable[contenteditable="true"][role="textbox"]'
+    : '[contenteditable="true"][aria-label="Message body"][role="textbox"], [contenteditable="true"][aria-label="Message body"][role="document"]';
+  const editor=[...document.querySelectorAll(selector)].find(e=>e.getClientRects().length);
+  let root=editor?.parentElement;
+  const isSend=node=>/^(Send|Send \(Ctrl\+Enter\)|Send \(⌘Enter\))$/.test(node.getAttribute('aria-label')||node.innerText.trim());
+  while(root&&root!==document.body&&![...root.querySelectorAll('button,[role="button"]')].some(node=>node.getClientRects().length&&isSend(node)&&!editor.contains(node)))root=root.parentElement;
+  if(!root||root===document.body)return {shown:names.map(()=>false),busy:true};
+  const words=[];
+  for(const node of root.querySelectorAll('*')){
+    if(editor.contains(node))continue;
+    for(const attribute of ['title','aria-label','download'])if(node.getAttribute(attribute))words.push(node.getAttribute(attribute));
+    if(!node.children.length&&node.textContent)words.push(node.textContent);
+  }
+  const text=words.join('\n').toLowerCase();
+  const busy=[...root.querySelectorAll('[role="progressbar"],[aria-busy="true"]')].some(node=>node.getClientRects().length&&!editor.contains(node));
+  return {shown:names.map(name=>text.includes(name.toLowerCase())),busy};
+}
+// Hand the approved files to the composer's own file picker, then wait until it
+// shows every one of them. Anything short of that stops before Send.
+async function attachReplyFiles(value,files,deadline) {
+  const names=files.map(file=>file.name);
+  const state=()=>value.page.evaluate(composerFiles,{provider:value.provider,names});
+  const missing=(await state()).shown.map((shown,index)=>shown?null:files[index]).filter(Boolean);
+  if(missing.length) {
+    const paths=missing.map(file=>file.path);
+    const input=await value.page.evaluateHandle(provider=>{
+      const selector=provider==='browser_gmail'?'[contenteditable="true"][role="textbox"][aria-label="Message Body"], .Am.Al.editable[contenteditable="true"][role="textbox"]':'[contenteditable="true"][aria-label="Message body"]';
+      const editor=[...document.querySelectorAll(selector)].find(e=>e.getClientRects().length);
+      const usable=node=>!/^image\//.test(node.getAttribute('accept')||'')&&!node.disabled;
+      let root=editor?.parentElement;
+      while(root&&root!==document.body){const found=[...root.querySelectorAll('input[type="file"]')].filter(usable);if(found.length===1)return found[0];if(found.length>1)return null;root=root.parentElement;}
+      return null;
+    },value.provider);
+    if(input.asElement()) await input.asElement().setInputFiles(paths);
+    else {
+      const chooser=value.page.waitForEvent('filechooser',{timeout:8000});chooser.catch(()=>{});
+      let clicked=false;
+      for(const node of await visibleElements(value.page.locator('button,[role="button"],[role="menuitem"]'))){
+        const label=((await node.getAttribute('aria-label'))||(await node.getAttribute('title'))||(await node.innerText().catch(()=>''))||'').trim();
+        if(ATTACH_CONTROL.test(label)){await node.click({timeout:3000});clicked=true;break;}
+      }
+      if(!clicked)throw new Error('The mailbox page shows no way to attach files. Nothing was sent.');
+      const browse=value.page.getByRole('menuitem',{name:BROWSE_ITEM}).first();
+      if(await browse.count())await browse.click({timeout:3000}).catch(()=>{});
+      await (await chooser).setFiles(paths);
+    }
+    await input.dispose();
+  }
+  const until=Math.min(deadline,Date.now()+60000);
+  for(;;) {
+    const now=await state();
+    if(now.shown.every(Boolean)&&!now.busy)return;
+    if(Date.now()>=until)throw new Error('The mailbox did not finish attaching '+names.filter((_,index)=>!now.shown[index]).join(', ')+'. Nothing was sent.');
+    await sleep(300);
+  }
 }
 const editorSelector = provider => provider==='browser_gmail'
   ? '[contenteditable="true"][role="textbox"][aria-label="Message Body"], .Am.Al.editable[contenteditable="true"][role="textbox"]'
@@ -1304,6 +1550,57 @@ async function rebindReplyOriginal(value,incoming) {
   }
   return matches.length===1?matches[0]:null;
 }
+// Mail stored before its pictures and files were read: reopen exactly that
+// message by its saved reference, prove it is unchanged, then read its files.
+async function fetchAttachments(value,request) {
+  const incoming=request.incoming,ref=incoming?.browser_reference;
+  if(!ref||ref.contract!==REPLY_CONTRACT||ref.provider!==value.provider||typeof ref.row_id!=='string'||!ref.row_id||!['data-legacy-thread-id','data-thread-id','data-convid','data-itemid','data-id'].includes(ref.row_attr))
+    throw new Error('This message needs a fresh inbox check before its pictures and files can be read.');
+  if(!path.isAbsolute(String(request.attachments_dir||'')))throw new Error('No attachment folder was given.');
+  if(await hasComposer(value.page))throw new Error('A reply is open in the mailbox. Finish it, then read the pictures again.');
+  const started=request._startedAt,deadline=started+110000;
+  if((await status(value,request.connection)).state!=='connected') {
+    await reloadInbox(value,policy(value.provider).goto,'Sign in in the Nexus mail browser, then try again.');
+    if((await status(value,request.connection)).state!=='connected')throw new Error('Sign in in the Nexus mail browser, then try again.');
+  }
+  const again='Check the inbox again, then try again.';
+  await ensureInbox(value,{deadline:started+60000,follow:again});
+  if(value.provider==='browser_outlook'&&ref.inbox_tab&&['Focused','Other'].includes(ref.inbox_tab)) {
+    const tab=value.page.getByRole('tab',{name:ref.inbox_tab==='Other'?/^Other(?:\s+\d+)?$/:/^Focused(?:\s+\d+)?$/});
+    if(await tab.count()===1&&await tab.getAttribute('aria-selected')!=='true')await selectTab(value,tab,ref.inbox_tab,1);
+  }
+  const row=await locateReplyRow(value,ref,Math.min(Date.now()+20000,deadline));
+  await row.click();
+  value.lastOpenedRow=ref.row_id;
+  const same=candidate=>candidate&&candidate.sender===incoming.sender&&candidate.subject===incoming.subject&&candidate.body===incoming.body;
+  const token=randomUUID();
+  let message,senderOverride,expected=ref.message_id||'',cardTried=false,rebindTried=false;
+  const readStarted=Date.now(),readUntil=Math.min(readStarted+12000,deadline);
+  while(Date.now()<readUntil) {
+    try {
+      const candidate=await value.page.evaluate(readMessage,{provider:value.provider,expectedMessageId:expected,attachmentToken:token,minimumSide:ATTACH_IMAGE_SIDE,...senderOverride});
+      if(same(candidate)){message=candidate;break;}
+    } catch(error) {
+      const text=String(error.message||error);
+      if(!rebindTried&&Date.now()-readStarted>=1000&&/bound original message/.test(text)) {
+        rebindTried=true;
+        // Outlook renumbers its rendered message ids; find the one matching message in this conversation.
+        const match=await rebindReplyOriginal(value,incoming);
+        if(match){senderOverride=match.override;expected=match.candidate.message_id||'';continue;}
+      }
+      if(value.provider==='browser_outlook'&&!cardTried&&Date.now()-readStarted>=1000&&/sender is not ready/.test(text)) {
+        cardTried=true;
+        try{senderOverride=await resolveSenderCard(value.page,expected);}catch{}
+      }
+    }
+    await sleep(200);
+  }
+  if(!message)throw new Error('The message could not be found unchanged in the mailbox. '+again);
+  const until=Math.min(Date.now()+40000,deadline);
+  const targets=await settledTargets(value,{provider:value.provider,expectedMessageId:expected,...senderOverride},message,until);
+  const attachments=await collectAttachments(value,targets,request.attachments_dir,until);
+  return {status:'read',attachments};
+}
 async function sendReviewed(value,request) {
   let dispatched=false,record,file,recoveryFile,recoveryBinding,ownedComposer=false,sentView,stage='checking the mailbox';
   // Measured from the request (browser start and the preparation retry included):
@@ -1314,7 +1611,10 @@ async function sendReviewed(value,request) {
     if(!/^[a-f0-9]{32}$/.test(request.submission_id || '') || typeof request.body!=='string' || !request.body.trim() || request.body.length>200000) throw new Error('A valid approved reply and submission identity are required.');
     if(!value.profile || !request.connection?.email) throw new Error('A verified private mailbox profile is required for sending.');
     if(!ref || ref.contract!==REPLY_CONTRACT || ref.provider!==value.provider || !['data-legacy-thread-id','data-thread-id','data-convid','data-itemid','data-id'].includes(ref.row_attr) || typeof ref.row_id!=='string' || !ref.row_id || ref.row_id.length>2000 || ref.source_hash!==incoming.source_id || !/^[a-f0-9]{64}$/.test(ref.content_hash || '')) throw new Error('This message needs a fresh inbox scan before browser replying.');
-    const binding=digest([REPLY_CONTRACT,value.provider,request.connection.email.toLowerCase(),incoming.source_id,ref.content_hash,request.body]);
+    const files=Array.isArray(request.attachments)?request.attachments:[];
+    if(files.length>20||files.some(file=>!file||typeof file.path!=='string'||!path.isAbsolute(file.path)||!fs.existsSync(file.path)||typeof file.name!=='string'||!file.name))throw new Error('A file approved for this reply is missing. Nothing was sent.');
+    // The approved files are part of what this submission sends, exactly like its text.
+    const binding=digest([REPLY_CONTRACT,value.provider,request.connection.email.toLowerCase(),incoming.source_id,ref.content_hash,request.body,...(files.length?[files.map(file=>[file.name,file.sha256||''])]:[])]);
     const directory=path.join(value.profile,'nexus-reviewed-submissions');
     file=path.join(directory,request.submission_id+'.json');
     if(fs.existsSync(file)) {
@@ -1487,6 +1787,11 @@ async function sendReviewed(value,request) {
     await sleep(1200);
     composer=await value.page.evaluate(readComposer,value.provider);
     if(composer.recipient!==recipient || composer.body!==request.body.replace(/\r\n/g,'\n'))throw new Error('The browser reply does not exactly match the reviewed body and recipient.');
+    if(files.length){
+      stage='attaching the approved files';
+      await attachReplyFiles(value,files,dispatchDeadline);
+      await sleep(600);
+    }
     const finalIdentity=await status(value,request.connection);if(finalIdentity.state!=='connected')throw new Error('Mailbox identity changed before sending.');
     composer=await value.page.evaluate(readComposer,value.provider);
     if(composer.recipient!==recipient || composer.body!==request.body.replace(/\r\n/g,'\n'))throw new Error('Reply contents or recipient changed before sending.');

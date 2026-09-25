@@ -833,9 +833,15 @@ let checkup = null;
 let qaSuite = {present: false, cases: [], tags: []};
 let qaResult = null;
 
+let checkupAsked = 0;
 async function refreshCheckup(fresh = false) {
+  // Startup no longer waits for this answer, so a slower earlier check must
+  // never overwrite a newer one.
+  const asked = ++checkupAsked;
   try {
-    checkup = await request(`/api/checkup${fresh ? "?refresh=1" : ""}`);
+    const answer = await request(`/api/checkup${fresh ? "?refresh=1" : ""}`);
+    if (asked !== checkupAsked) return;
+    checkup = answer;
     pipelineCannotRun = String(checkup.cannot_run || "");
     showProjectAuthorityPause(checkup.authority, pipelineCannotRun);
     renderCheckup();
@@ -7000,7 +7006,10 @@ async function boot() {
     await validate();
     await refreshUsage();
     await loadWhatCanBeDoneForYou();
-    await refreshCheckup();
+    // The readiness checkup probes model routes and CLIs and can take seconds.
+    // Nothing below needs its answer, so the board, chats and event polling
+    // must not wait behind it; it fills in the Start view when it arrives.
+    void refreshCheckup();
     await refreshHowItWorks();
     await refreshChecks();
     restoreAuthorityRepairSuccess();
@@ -7720,8 +7729,9 @@ async function controlChatGoal(agentId) {
     return;
   }
   if (action === "resume" && goal.resume_recovery?.items?.length && !goal.resume_recovery.resume_safe) {
-    if (theBigOne === agentId) setBigChatTab("settings");
     const panel = theBigOne === agentId ? $("theBigChatTeamGoal") : theChatCardFor(agentId)?.querySelector(".swarm-chat-team-goal");
+    // Reveal whichever tab holds the recovery card right now.
+    if (theBigOne === agentId) setBigChatTab(panel?.closest("#theBigChatSettingsPanel") ? "settings" : "chat");
     const recovery = panel?.querySelector(".chat-goal-recovery");
     recovery?.scrollIntoView({block: "center", behavior: "smooth"});
     recovery?.focus();
@@ -7892,6 +7902,14 @@ function chatExecutionPreference(conversation, mode = "") {
   return "facilitator";
 }
 
+// The kind of assistant behind a board or goal agent (claude-cli, codex-cli, ...).
+function agentRouteKind(agent) {
+  const board = typeof theSwarmAgent === "function" ? theSwarmAgent(agent?.id) : null;
+  const route = String(agent?.who || board?.who || "");
+  const routes = typeof swarmSaid !== "undefined" ? swarmSaid?.who_can_be_used || [] : [];
+  return String(routes.find(one => one.route === route)?.kind || "");
+}
+
 function appendCollaborationControls(panel, settings, agents, settled, onSave, directMode = false) {
   const box = make("section", "chat-collaboration-controls");
   box.append(make("strong", "", "Collaboration"));
@@ -7917,14 +7935,24 @@ function appendCollaborationControls(panel, settings, agents, settled, onSave, d
     : "Flexible: both agents can inspect all copies and edit either draft. Fixed: Nexus reserves edits for the writer and approval for the reviewer. Native permission checks still apply; copies are not OS security sandboxes. Direct editing puts changes in the real project before review and tests.");
   const save = make("button", "", "Save collaboration"); save.type = "button";
   const status = make("p", "hint"); status.setAttribute("role", "status");
-  const render = () => {roles.hidden = mode.value !== "fixed"; for (const el of [mode, direct, ...Object.values(selectors)]) el.disabled = !settled;
+  // One press for the proven pairing: Claude writes, Codex reviews.
+  const builder = agents.find(agent => agentRouteKind(agent) === "claude-cli");
+  const reviewer = agents.find(agent => agentRouteKind(agent) === "codex-cli");
+  const preset = make("button", "chat-collaboration-preset", "Claude builds, Codex reviews"); preset.type = "button";
+  preset.title = builder && reviewer ? `${builder.name || builder.id} writes; ${reviewer.name || reviewer.id} reviews and gives feedback.` : "";
+  preset.hidden = !(builder && reviewer);
+  preset.addEventListener("click", () => {
+    mode.value = "fixed"; selectors.writer_id.value = builder.id; selectors.reviewer_id.value = reviewer.id;
+    render(); if (!save.disabled) save.click();
+  });
+  const render = () => {roles.hidden = mode.value !== "fixed"; for (const el of [mode, direct, preset, ...Object.values(selectors)]) el.disabled = !settled;
     save.disabled = !settled || mode.value === "fixed" && (!selectors.reviewer_id.value || selectors.writer_id.value === selectors.reviewer_id.value);};
   mode.addEventListener("change", render); for (const select of Object.values(selectors)) select.addEventListener("change", render);
   save.addEventListener("click", async () => {save.disabled = true; try {
     await onSave({mode: mode.value, writer_id: selectors.writer_id.value, reviewer_id: selectors.reviewer_id.value, allow_direct_real_edits: direct.checked});
     status.textContent = "Collaboration saved.";
   } catch (error) {status.textContent = error.message || String(error);} finally {render();}});
-  box.append(mode, roles, directLabel, hint, save, status); panel.append(box); render();
+  box.append(preset, mode, roles, directLabel, hint, save, status); panel.append(box); render();
   if (!settled) status.textContent = "Pause the team to change collaboration settings.";
 }
 
@@ -8055,6 +8083,7 @@ function appendGoalRecoveryControls(panel, goal, afterAction, binding) {
       const label = make("label", "", "I want a fresh attempt. The previous remote call may have completed; repeating it may duplicate remote actions or usage. Saved project work and command permissions will be kept.");
       acknowledgement = make("input"); acknowledgement.type = "checkbox"; label.prepend(acknowledgement); card.append(label);
     }
+    if (recovery.resume_safe) card.append(make("p", "hint", "Or write a message below and send it to the team; that also continues from the saved work."));
     const button = make("button", "primary", recovery.resume_safe ? "Resume interrupted turn" : "Retry interrupted agent call");
     button.type = "button"; button.disabled = Boolean(acknowledgement);
     acknowledgement?.addEventListener("change", () => {button.disabled = !acknowledgement.checked;});
@@ -8076,7 +8105,8 @@ function appendGoalRecoveryControls(panel, goal, afterAction, binding) {
     const inspect = make("button", "compact", "Inspect saved work"); inspect.type = "button";
     inspect.addEventListener("click", () => void openChatGoalDetails(goal)); card.append(inspect);
   }
-  card.append(status); panel.append(card);
+  // The one thing to act on goes first, ahead of the team's settings.
+  card.append(status); panel.prepend(card);
 }
 
 async function openPromptLibrary(composer, stillCurrent = () => true) {
@@ -8174,7 +8204,10 @@ function fillChatGoalPanel(container, agentId, context) {
     : terminal ? ""
     : pending.length || goal?.status === "waiting_for_user" ? "The team needs your answers before it can continue."
     : goal?.command_request?.state === "pending" ? "Review the command request to continue."
-    : goal?.resume_recovery?.items?.length ? "Review the interrupted agent turn to continue." : "";
+    // An interrupted turn needs the user only once its worker has stopped (or
+    // the setup changed); before that there is nothing to press.
+    : goal?.resume_recovery?.items?.length && goal.resume_recovery.needs_user !== false
+      ? "Review the interrupted agent turn to continue." : "";
   const inputKey = inputReason ? JSON.stringify([goal?.goal_id, inputReason, pending,
     goal?.command_request, goal?.resume_recovery, context.reconnectChat, context.repairChat]) : "";
   // Keep in-progress answers intact during the background status polls.
@@ -8526,12 +8559,26 @@ function syncBigChatTabs(agentId, context) {
   if (tab.dataset.chatKey !== key) {
     tab.dataset.chatKey = key; setBigChatTab("chat");
   }
-  const needed = Boolean(context.problem || context.goal?.pending_interrupts?.length
-    || context.goal?.command_request?.state === "pending" || context.goal?.resume_recovery?.items?.length);
-  $("theBigChatSettingsNeeded").hidden = !needed;
-  tab.classList.toggle("needs-user-input", needed);
-  tab.title = needed ? "The team needs your attention in collaboration settings." : "Work mode, roles, permissions and team details";
-  tab.setAttribute("aria-describedby", needed ? "theBigChatSettingsNeeded" : "");
+  const terminal = ["complete", "cancelled", "cancelling"].includes(context.goal?.status);
+  const needed = Boolean(context.problem || (!terminal && (context.goal?.pending_interrupts?.length
+    || context.goal?.status === "waiting_for_user"
+    || context.goal?.command_request?.state === "pending"
+    || (context.goal?.resume_recovery?.items?.length && context.goal.resume_recovery.needs_user !== false))));
+  // Questions and recovery choices belong where the user types: while the team
+  // needs input its panel sits at the top of CHAT, otherwise in settings.
+  const panel = $("theBigChatTeamGoal");
+  const home = needed ? $("theBigChatChatPanel")?.querySelector(".the-big-chat-transcript") : $("theBigChatSettingsPanel");
+  if (panel && home && panel.parentElement !== home) {
+    if (needed) home.prepend(panel); else home.append(panel);
+  }
+  $("theBigChatSettingsNeeded").hidden = true;
+  tab.classList.remove("needs-user-input");
+  tab.title = "Work mode, roles, permissions and team details";
+  tab.removeAttribute("aria-describedby");
+  const chatTab = $("theBigChatChatTab"), chatNeeded = $("theBigChatChatNeeded");
+  if (chatNeeded) chatNeeded.hidden = !needed;
+  chatTab?.classList.toggle("needs-user-input", needed);
+  if (chatTab) chatTab.title = needed ? "The team needs your input. It is shown at the top of CHAT." : "";
   if (!tab.dataset.wired) {
     tab.dataset.wired = "true";
     const buttons = [$("theBigChatChatTab"), tab];
@@ -10999,7 +11046,15 @@ function chatGoalActivity({goal, problem}) {
   const note = String(goal.note || "").trim();
   if (goal.pending_interrupts?.length || goal.status === "waiting_for_user") {
     return status("attention", "Waiting for your answer",
-      "The team has paused for a decision. Choose your answers in the decision cards. In expanded chat, open collaboration settings.");
+      "The team has paused for a decision. Choose your answers in the decision cards at the top of CHAT.");
+  }
+  if (goal.status === "paused" && goal.auto_resume?.at_ms && !goal.auto_resume.gives_up) {
+    const at = new Date(Number(goal.auto_resume.at_ms));
+    const when = at.toDateString() === new Date().toDateString()
+      ? at.toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"})
+      : at.toLocaleString([], {weekday: "short", hour: "2-digit", minute: "2-digit"});
+    return status("waiting", "Waiting for the usage limit to reset",
+      `A provider usage limit was reached. Nexus resumes this goal by itself at about ${when}; press Resume to try sooner.`);
   }
   if (["paused", "failed"].includes(goal.status)) {
     if (goal.resume_recovery?.items?.length) return status("attention", "Interrupted agent turn",
@@ -12374,6 +12429,7 @@ function agentSettingsFromAgent(agent) {
   return {
     name: agent.name || "",
     who: agent.who || "",
+    model: agent.model || "",
     job: agent.job || "",
     icon: appearance.icon,
     colour: appearance.colour,
@@ -12384,10 +12440,40 @@ function agentSettingsFromAgent(agent) {
   };
 }
 
+// The per-agent model picker: the route's default, the catalog models its kind
+// can run, the agent's current choice even when unlisted, and a typed name.
+function fillSwarmAgentModel(chosen, routeSetup, route) {
+  const select = $("swarmAgentModel"), other = $("swarmAgentModelOther");
+  if (!select || !other) return;
+  const current = String(chosen || "");
+  const routeModel = String(routeSetup?.model || "").trim();
+  select.replaceChildren();
+  const fallback = make("option", "", routeModel ? `Route default (${routeModel})` : "Route default");
+  fallback.value = "";
+  select.append(fallback);
+  const choices = (routeSetup?.model_choices || []).filter(one => one && one.id);
+  for (const one of choices) {
+    const option = make("option", "", one.label && one.label !== one.id ? `${one.label} (${one.id})` : one.id);
+    option.value = one.id;
+    select.append(option);
+  }
+  const listed = !current || choices.some(one => one.id === current);
+  const typed = make("option", "", "Other model (type its name)…");
+  typed.value = "__other__";
+  select.append(typed);
+  select.value = listed ? current : "__other__";
+  other.hidden = listed && select.value !== "__other__";
+  if (!listed) other.value = current;
+  else if (select.value !== "__other__") other.value = "";
+  select.title = route ? "" : "Choose which assistant it uses first.";
+}
+
 function agentSettingsFromForm() {
+  const picked = $("swarmAgentModel").value;
   return {
     name: $("swarmAgentName").value,
     who: $("swarmAgentWho").value,
+    model: picked === "__other__" ? $("swarmAgentModelOther").value.trim() : picked,
     job: $("swarmAgentJob").value,
     icon: $("swarmAgentIcon").value,
     colour: $("swarmAgentColour").value,
@@ -12502,6 +12588,7 @@ async function flushSwarmAgentSettings(agentId, announce = false) {
   renderSwarmAgentSaveState(agentId);
   draft.inFlight = (async () => {
     const who = values.who;
+    const model = values.model || "";
     const job = values.job;
     const icon = values.icon;
     const colour = values.colour;
@@ -12514,6 +12601,7 @@ async function flushSwarmAgentSettings(agentId, announce = false) {
       if (!held) return false;
       held.name = name;
       held.who = who;
+      held.model = model;
       held.job = job;
       held.icon = icon;
       held.colour = colour;
@@ -12640,6 +12728,7 @@ function renderSwarmAgentPanel(agent) {
   const route = String(values.who || "");
   const routeIdentity = $("swarmAgentRouteIdentity");
   const routeSetup = (swarmSaid.who_can_be_used || []).find((one) => one.route === route);
+  fillSwarmAgentModel(values.model, routeSetup, route);
   if (!route) {
     routeIdentity.textContent = "No provider route is assigned to this agent.";
     routeIdentity.dataset.tone = "missing";
@@ -12647,8 +12736,9 @@ function renderSwarmAgentPanel(agent) {
     routeIdentity.textContent = `Actual route: ${route}. It is not available on this computer.`;
     routeIdentity.dataset.tone = "missing";
   } else {
-    const model = String(routeSetup.model || agent.chat_destination?.model || "").trim();
-    routeIdentity.textContent = `Actual provider: ${routeSetup.label || routeSetup.kind || route}. Route: ${route}${model ? `. Model: ${model}` : ""}.`;
+    const routeModel = String(routeSetup.model || agent.chat_destination?.model || "").trim();
+    const model = String(values.model || routeModel).trim();
+    routeIdentity.textContent = `Actual provider: ${routeSetup.label || routeSetup.kind || route}. Route: ${route}${model ? `. Model: ${model}${values.model ? "" : " (route default)"}` : ""}.`;
     routeIdentity.dataset.tone = routeSetup.ready ? "ready" : "missing";
   }
   const cachedRepair = swarmAgentRepairPlans.get(agent.id);
@@ -12867,6 +12957,7 @@ function setWhatCanBePressedInSwarm() {
   for (const id of [
     "swarmAgentName", "swarmAgentWho", "swarmAgentJob", "swarmAgentIcon",
     "swarmAgentColour", "swarmAgentBubbleColour", "swarmAgentPictureBrowse",
+    "swarmAgentModel", "swarmAgentModelOther",
   ]) {
     $(id).disabled = held || !agent;
   }
@@ -14949,7 +15040,24 @@ function withAttachmentContextNotice(words, result) {
   return notice ? `${words} ${notice}` : words;
 }
 
+// Nexus's own look at the page when an agent says it is done: evidence shown
+// beside the claim, never a verdict on the agent and never a block.
+function appendNexusCompletionCheck(container, one) {
+  const verdict = String(one?.correlation?.nexus_check_verdict || "");
+  if (!verdict) return;
+  const problem = /PROBLEM/.test(verdict);
+  const row = make("div", `chat-nexus-check${problem ? " problem" : ""}`);
+  row.setAttribute("role", "note");
+  const page = String(one.correlation.nexus_check_page || "the page");
+  row.append(make("strong", "", problem ? `Nexus checked ${page}: a problem the user would see` : `Nexus checked ${page}`),
+    make("span", "", verdict));
+  const screenshot = String(one.correlation.nexus_check_screenshot || "");
+  if (screenshot) row.append(locationOpenButton(screenshot, "Open screenshot"));
+  container.append(row);
+}
+
 function appendChatDeliveryNotice(container, one) {
+  appendNexusCompletionCheck(container, one);
   const attachmentNotice = attachmentContextNotice(one?.correlation?.attachment_context);
   if (attachmentNotice) container.append(make("p", "hint chat-attachment-context-notice", attachmentNotice));
   const notice = chatDeliveryNotice(one);
@@ -19714,6 +19822,33 @@ function renderTheConversationProject(agentId) {
         : "This selected pair has no project in common. Choose another pair chat or connect both agents to the same project.";
 }
 
+// Calls and tokens this chat and its current goal used, counted once per call.
+const sessionUsageRead = {key: "", at: 0};
+async function renderSessionUsage(conversation) {
+  const line = $("theBigChatUsage");
+  if (!line) return;
+  const goal = conversation?.id ? longGoals.find(one => one.conversation_id === conversation.id
+    && !["cancelled"].includes(one.status)) : null;
+  const sessions = [conversation?.id ? `chat:${conversation.id}` : "", goal ? `goal:${goal.goal_id}` : ""].filter(Boolean);
+  const key = sessions.join("|");
+  if (!key) { line.hidden = true; return; }
+  if (sessionUsageRead.key === key && Date.now() - sessionUsageRead.at < 15000) return;
+  sessionUsageRead.key = key; sessionUsageRead.at = Date.now();
+  try {
+    const answer = await request(`/api/session-usage?${sessions.map(one => `session=${encodeURIComponent(one)}`).join("&")}`);
+    const words = [];
+    const tokens = n => n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}K` : String(n);
+    for (const one of answer.sessions || []) {
+      if (!one.calls) continue;
+      const label = one.session.startsWith("goal:") ? "Current goal" : "This chat";
+      const models = (one.by_model || []).map(m => m.model).filter(Boolean).join(", ");
+      words.push(`${label}: ${one.calls} model call${one.calls === 1 ? "" : "s"}, ${tokens(one.input_tokens)} tokens in, ${tokens(one.output_tokens)} out${models ? ` (${models})` : ""}${one.calls_without_token_counts ? `; ${one.calls_without_token_counts} without token counts` : ""}.`);
+    }
+    line.textContent = words.length ? `Usage · ${words.join(" ")} Subscription plans do not bill per token; this shows how much work was done.` : "";
+    line.hidden = !words.length;
+  } catch { line.hidden = true; }
+}
+
 function renderTheBigChat() {
   const list = $("theBigChatSaid");
   if (!list || !theBigOne) return;
@@ -19754,6 +19889,8 @@ function renderTheBigChat() {
     switching: swarmConversationSwitching.has(theBigOne),
     hydrating: swarmChatIsHydrating(theBigOne),
   })) renderTheConversationSidebar(theBigOne);
+  // Nexus orchestrator or Live team, chosen per chat (chat-orchestrator.js).
+  window.nexusChatOrchestrator?.sync(theBigOne, conversation);
   if (bigChatPartChanged("project", {
     id: conversation?.id || "", project: conversation?.project || "",
     projects: conversation?.projects || [], busy: swarmChatIsBusy(theBigOne),
@@ -19773,6 +19910,7 @@ function renderTheBigChat() {
       collaboration_problem: conversation.collaboration_problem,
     } : null,
   })) destination.replaceChildren(aChatDestination(agent, {conversation}));
+  void renderSessionUsage(conversation);
 
   const turns = [];
   let latestUserPrompt = "";
@@ -19802,7 +19940,8 @@ function renderTheBigChat() {
       structuredStateUnavailable: Boolean(one.structured_state_unavailable),
       participantOutcome: normalizedParticipantOutcome(one),
       longHorizonCorrelation: normalizedLongHorizonCorrelation(one),
-      deliveryNotice: chatDeliveryNotice(one) || attachmentContextNotice(one.correlation?.attachment_context),
+      deliveryNotice: chatDeliveryNotice(one) || attachmentContextNotice(one.correlation?.attachment_context)
+        || String(one.correlation?.nexus_check_verdict || ""),
       deliveryCorrelation: one.correlation,
       originalPrompt: latestUserPrompt,
     });
@@ -21985,9 +22124,21 @@ function wireUpTheSwarmBoard() {
       if (agent) await flushSwarmAgentSettings(agent.id);
       await connectPickedAgentToWebProvider(value.slice("__connect_web__:".length));
     } else {
+      // Models belong to a route: a new route starts on its own default.
+      $("swarmAgentModel").value = "";
+      $("swarmAgentModelOther").value = "";
+      $("swarmAgentModelOther").hidden = true;
       rememberSwarmAgentSettings(0);
     }
   });
+  $("swarmAgentModel").addEventListener("change", () => {
+    const other = $("swarmAgentModel").value === "__other__";
+    $("swarmAgentModelOther").hidden = !other;
+    if (other) { $("swarmAgentModelOther").focus(); if (!$("swarmAgentModelOther").value.trim()) return; }
+    rememberSwarmAgentSettings(0);
+  });
+  $("swarmAgentModelOther").addEventListener("input", () => rememberSwarmAgentSettings(700));
+  $("swarmAgentModelOther").addEventListener("change", () => rememberSwarmAgentSettings(0));
   for (const id of ["swarmAgentName", "swarmAgentJob"]) {
     $(id).addEventListener("input", () => {
       if (id === "swarmAgentName") previewSwarmAgentAppearance();

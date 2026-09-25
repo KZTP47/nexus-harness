@@ -1145,14 +1145,21 @@
               aria-label="Resize the agent chats list" aria-controls="theBigChatConversationList"
               title="Drag left or right. Double-click to reset this pane."><span aria-hidden="true"></span></button>
             <div class="the-big-chat-main">
+              <div class="chat-view-bar">
               <div class="chat-view-tabs" role="tablist" aria-label="Chat views">
                 <button id="theBigChatChatTab" type="button" role="tab" aria-selected="true"
-                  aria-controls="theBigChatChatPanel">CHAT</button>
+                  aria-label="CHAT" aria-controls="theBigChatChatPanel">CHAT
+                  <span id="theBigChatChatNeeded" class="chat-settings-needed" hidden>Input needed</span>
+                </button>
                 <button id="theBigChatSettingsTab" type="button" role="tab" aria-selected="false" tabindex="-1"
                   aria-label="collaboration settings" aria-controls="theBigChatSettingsPanel">collaboration settings
                   <span id="theBigChatSettingsNeeded" class="chat-settings-needed" hidden>Input needed</span>
                 </button>
               </div>
+              <div id="theBigChatOrchestrator" class="chat-orchestrator" role="group"
+                aria-label="Orchestrator for this chat" hidden></div>
+              </div>
+              <section id="theBigChatLiveTeam" class="chat-live-team" aria-label="Live team for this chat" hidden></section>
               <section id="theBigChatSettingsPanel" role="tabpanel" aria-labelledby="theBigChatSettingsTab" hidden>
               <div id="theBigChatWorkMode"></div>
               <section id="theBigChatDestination" aria-labelledby="theBigChatDestinationTitle">
@@ -1163,6 +1170,7 @@
                   <span id="theBigChatProjectHelp" class="hint">Start Work together to let both agents build, discuss, and check the result here.</span>
                 </div>
                 <div id="theBigChatDestinationInfo"></div>
+                <p id="theBigChatUsage" class="hint chat-session-usage" aria-live="polite" hidden></p>
               </section>
               <section id="theBigChatTeamGoal" class="chat-team-goal" hidden
                 aria-live="polite" aria-label="Team goal and questions"></section>
@@ -1397,6 +1405,14 @@
         <select id="swarmAgentWho">
           <option value="">Not chosen yet</option>
         </select>
+        <label for="swarmAgentModel">Model</label>
+        <select id="swarmAgentModel" aria-describedby="swarmAgentModelHelp">
+          <option value="">Route default</option>
+        </select>
+        <input id="swarmAgentModelOther" type="text" maxlength="120" hidden
+          aria-label="Type a model name" placeholder="Type a model name, for example claude-opus-5">
+        <p id="swarmAgentModelHelp" class="field-help">Which model this agent uses. Each agent can use a
+          different one; the change applies from its next message.</p>
         <p id="swarmAgentRouteIdentity" class="swarm-agent-route-identity" role="status"></p>
         <section id="swarmAgentRepair" class="swarm-agent-repair" data-tone="idle"
           aria-labelledby="swarmAgentRepairTitle">
@@ -1934,5 +1950,6 @@
   <script src="/app.js"></script>
   <script src="/session-health.js"></script>
   <script src="/live-team.js"></script>
+  <script src="/chat-orchestrator.js"></script>
 </body>
 </html>

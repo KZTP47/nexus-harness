@@ -759,10 +759,18 @@ def _filesystem_project_identity(path: str) -> dict[str, Any]:
             "directory_identity_version": PROJECT_DIRECTORY_IDENTITY_VERSION,
             "directory_identity_sha256": "",
         }
+    device = int(found.st_dev)
+    if os.name == "nt":
+        # Python 3.12+ reports a 64-bit st_dev on Windows where 3.11 reported
+        # the 32-bit volume serial held in its low half. Without this the
+        # same folder looked replaced whenever the Python runtime changed,
+        # and every saved chat for it paused. Existing bindings kept the
+        # 32-bit value, so they stay valid.
+        device &= 0xFFFFFFFF
     payload = {
         "directory_identity_version": PROJECT_DIRECTORY_IDENTITY_VERSION,
         "path_fingerprint_sha256": path_fingerprint,
-        "device": str(int(found.st_dev)),
+        "device": str(device),
         "file_id": str(file_id),
     }
     digest = hashlib.sha256(json.dumps(

@@ -11,12 +11,16 @@ import itertools
 import json
 import os
 import subprocess
+import sys
+import tempfile
 import threading
 from collections import deque
+from pathlib import Path
 from typing import Any, Callable
 
 from . import events as ev
 from .base import AgentSession, SeatSpec
+from .browser_guard import hook_settings
 from .jsonrpc import kill_tree
 
 PERMISSIONS = {
@@ -46,6 +50,7 @@ class ClaudeSession(AgentSession):
         self._tools: dict[str, dict[str, Any]] = {}
         self.stderr_tail: deque[str] = deque(maxlen=30)
         self._started = threading.Event()
+        self._files = ""
 
     def argv(self) -> list[str]:
         args = [self.executable, *list((self.spec.command or [])[1:]), "-p",
@@ -54,16 +59,35 @@ class ClaudeSession(AgentSession):
         if self.spec.model:
             args += ["--model", self.spec.model]
         args += PERMISSIONS.get(self.spec.access, PERMISSIONS["ask"])
+        # Text and JSON go in files, never on the command line: an npm install
+        # starts Claude through claude.cmd, and cmd.exe re-reads the arguments,
+        # so a double quote in the rules silently broke every argument after it
+        # (the nexus tools and the browser guard were simply missing).
         if self.spec.instructions:
-            args += ["--append-system-prompt", self.spec.instructions]
+            args += ["--append-system-prompt-file", self._file("rules.md", self.spec.instructions)]
         if self.spec.mcp:
             command = list(self.spec.mcp.get("command") or [])
             server = {"type": "stdio", "command": command[0], "args": command[1:],
                       **({"env": dict(self.spec.mcp["env"])} if self.spec.mcp.get("env") else {})}
-            args += ["--mcp-config", json.dumps({"mcpServers": {"nexus": server}})]
+            args += ["--mcp-config", self._file("mcp.json", json.dumps({"mcpServers": {"nexus": server}}))]
+        for folder in self.spec.extra_dirs:
+            args += ["--add-dir", folder]
+        if self.spec.browser_settings:
+            # Keeps pages and windows off the user's screen while browser checks are hidden.
+            hooks = hook_settings(self.spec.browser_settings, sys.executable)
+            args += ["--settings", self._file("claude-settings.json", json.dumps(hooks))]
         if self.spec.resume_id:
             args += ["--resume", self.spec.resume_id]
         return args
+
+    def _file(self, name: str, text: str) -> str:
+        if not self._files:
+            base = Path(self.spec.state_dir) if self.spec.state_dir else Path(tempfile.mkdtemp(prefix="nexus-claude-"))
+            base.mkdir(parents=True, exist_ok=True)
+            self._files = str(base)
+        path = Path(self._files) / name
+        path.write_text(text, encoding="utf-8")
+        return str(path)
 
     def start(self) -> None:
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0

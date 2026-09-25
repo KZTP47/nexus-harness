@@ -3,7 +3,7 @@
   'use strict';
   function createEmailStudio(root, api, options = {}) {
     const doc = root.ownerDocument;
-    const state = {snapshot: {}, localConnections: new Map(), pendingRevision: null, loaded: false, account: '', message: '', draft: '', dirty: false, busy: false, refreshing: false, refreshPromise: null, mutationRevision: 0, editRevision: null, editBase: null, memoryEdits: new Map(), memoryAdds: new Map(), newAccount: false, providerRepair: null, oauthRequest: '', registrationDirty: new Set(), modelByRoute: new Map(), oauthLinks: new Map(), seen: new Set(), baseline: false};
+    const state = {snapshot: {}, localConnections: new Map(), pendingRevision: null, loaded: false, account: '', message: '', draft: '', dirty: false, busy: false, refreshing: false, refreshPromise: null, mutationRevision: 0, editRevision: null, editBase: null, memoryEdits: new Map(), memoryAdds: new Map(), newAccount: false, providerRepair: null, oauthRequest: '', registrationDirty: new Set(), modelByRoute: new Map(), oauthLinks: new Map(), seen: new Set(), baseline: false, promptFiles: new Map(), uploading: 0, attachmentReads: new Set()};
     const el = (tag, text, cls) => { const node = doc.createElement(tag); if (text !== undefined) node.textContent = text; if (cls) node.className = cls; return node; };
     const by = id => root.querySelector('#' + id);
     const field = (parent, id, title, type = 'text') => { const label = el('label', title); label.htmlFor = id; const input = el(type === 'textarea' ? 'textarea' : 'input'); input.id = id; if (type !== 'textarea') input.type = type; parent.append(label, input); return input; };
@@ -78,7 +78,12 @@
       emailSubject: 'Subject line of the imported message.',
       emailBody: 'Text of the imported message.',
       emailRaw: 'Paste a complete .eml message instead of filling the fields above.',
-      emailFile: 'Choose an .eml file to read the message from.'
+      emailFile: 'Choose an .eml file to read the message from.',
+      emailIncomingFiles: 'Pictures and files that came with this email. The assistant reads them when it drafts and revises.',
+      emailReplyAttachButton: 'Attach pictures or files to this reply. You can also paste or drop them onto Your reply.',
+      emailReplyFiles: 'Files sent with this reply when you approve it.',
+      emailRevisionAttachButton: 'Give the AI pictures or files with this change request. You can also paste or drop them into the request box.',
+      emailRevisionFiles: 'Files the AI reads with this change request. They are not sent with the reply.'
     };
     function applyHints() { for (const node of root.querySelectorAll('[id]')) { const hint = HINTS[node.id]; if (hint && node.title !== hint) node.title = hint; } }
     const note = (text, error = false) => { by('emailNotice').textContent = text; by('emailNotice').classList.toggle('email-error', error); };
@@ -158,6 +163,136 @@
       timing.textContent = text;
     }
     const post = (action, body) => api('/api/email/' + action, {method: 'POST', body: JSON.stringify(body)});
+    // Attachments: the server keeps the bytes; the page asks for one file when it shows or saves it.
+    const MOST_UPLOAD_BYTES = 8_500_000;
+    const sizeText = bytes => !bytes ? '' : bytes >= 1e6 ? (bytes / 1e6).toFixed(1) + ' MB' : bytes >= 1e3 ? Math.round(bytes / 1e3) + ' KB' : bytes + ' B';
+    const previews = new Map();
+    function fileContent(owner, item) {
+      const key = JSON.stringify([state.account, owner, item.id]);
+      if (!previews.has(key)) {
+        previews.set(key, post('attachment_content', {account_id: state.account, ...owner, attachment_id: item.id}).then(result => {
+          const bytes = Uint8Array.from(host.atob(result.data), char => char.charCodeAt(0));
+          return {data: result.data, url: host.URL.createObjectURL(new Blob([bytes], {type: item.type || 'application/octet-stream'}))};
+        }).catch(error => { previews.delete(key); throw error; }));
+        while (previews.size > 80) { const [oldest, value] = previews.entries().next().value; previews.delete(oldest); value.then(entry => host.URL.revokeObjectURL(entry.url), () => {}); }
+      }
+      return previews.get(key);
+    }
+    async function saveFile(owner, item) {
+      try {
+        const content = await fileContent(owner, item);
+        if (typeof host.harnessDesktop?.saveMailAttachment === 'function') {
+          const saved = await host.harnessDesktop.saveMailAttachment(item.name, content.data);
+          return note(saved?.saved ? 'Saved ' + item.name + (saved.path ? ' to ' + saved.path : '') + '.' : 'Save cancelled. No file was saved.');
+        }
+        const link = el('a'); link.href = content.url; link.download = item.name || 'attachment'; root.append(link); link.click(); link.remove();
+        note('Download requested. Check your browser downloads.');
+      } catch (error) { note('Could not save ' + (item.name || 'the file') + ': ' + error.message, true); }
+    }
+    // One list for incoming files, reply files and request files. Rebuilt only when
+    // what it shows changes, so polling never flickers the pictures.
+    function renderFiles(container, items, owner, actions = {}) {
+      const signature = JSON.stringify([state.account, owner, items.map(item => item.id), !!actions.reuse, !!actions.remove, state.busy]);
+      if (container.dataset.signature === signature) return;
+      container.dataset.signature = signature; container.replaceChildren();
+      for (const item of items) {
+        const card = el('div', undefined, 'email-file');
+        if (!item.sha256) {
+          card.classList.add('email-file-missing');
+          card.append(el('span', item.name || 'Attachment', 'email-file-name'), el('span', item.note || 'Not available.', 'email-file-note'));
+          container.append(card); continue;
+        }
+        if (item.image && owner) {
+          const picture = el('img', undefined, 'email-file-preview'); picture.alt = item.name || 'Picture'; picture.title = 'Select to enlarge';
+          picture.addEventListener('click', () => picture.classList.toggle('is-open'));
+          picture.addEventListener('error', () => picture.replaceWith(el('span', 'This picture type cannot be previewed; save it to open it.', 'email-file-note')), {once: true});
+          fileContent(owner, item).then(content => { picture.src = content.url; }, () => picture.replaceWith(el('span', 'Preview unavailable.', 'email-file-note')));
+          card.append(picture);
+        }
+        card.append(el('span', item.name || 'Attachment', 'email-file-name'), el('span', [sizeText(item.size), item.inline ? 'in the message' : ''].filter(Boolean).join(' \u00b7 '), 'email-file-note'));
+        const row = el('span', undefined, 'email-file-actions');
+        if (owner) button(row, '', 'Save', () => saveFile(owner, item)).title = 'Save a copy of this file on this computer.';
+        if (actions.reuse) { const reuse = button(row, '', 'Attach to reply', () => actions.reuse(item)); reuse.title = 'Send this file back with your reply.'; reuse.disabled = state.busy; }
+        if (actions.remove) { const remove = button(row, '', 'Remove', () => actions.remove(item)); remove.title = 'Take this file off again.'; remove.disabled = state.busy; }
+        card.append(row); container.append(card);
+      }
+    }
+    async function pictureWithin(file) {
+      // A photo larger than an upload is shrunk here, as the mail apps do; other files are refused.
+      if (file.size <= MOST_UPLOAD_BYTES || !/^image\/(png|jpeg|webp|bmp)$/.test(file.type) || typeof host.createImageBitmap !== 'function') return file;
+      const bitmap = await host.createImageBitmap(file);
+      const scale = Math.min(1, 3000 / Math.max(bitmap.width, bitmap.height));
+      const canvas = doc.createElement('canvas'); canvas.width = Math.round(bitmap.width * scale); canvas.height = Math.round(bitmap.height * scale);
+      canvas.getContext('2d').drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+      const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.85));
+      return blob ? new host.File([blob], file.name.replace(/\.[^.]+$/, '') + '.jpg', {type: 'image/jpeg'}) : file;
+    }
+    async function upload(file) {
+      const ready = await pictureWithin(file);
+      if (ready.size > MOST_UPLOAD_BYTES) throw new Error(file.name + ' is ' + sizeText(ready.size) + '. Files up to ' + sizeText(MOST_UPLOAD_BYTES) + ' can be attached here.');
+      const data = await new Promise((resolve, reject) => { const reader = new host.FileReader(); reader.onload = () => resolve(String(reader.result).split(',')[1] || ''); reader.onerror = () => reject(new Error('Could not read ' + file.name + '.')); reader.readAsDataURL(ready); });
+      return (await post('upload_attachment', {account_id: state.account, name: ready.name || 'pasted-picture.png', type: ready.type || '', data})).attachment;
+    }
+    const pastedFiles = event => [...(event.clipboardData?.items || [])].filter(item => item.kind === 'file').map(item => item.getAsFile()).filter(Boolean);
+    function acceptDrops(target, handler) {
+      target.addEventListener('dragover', event => { if ([...(event.dataTransfer?.types || [])].includes('Files')) { event.preventDefault(); target.classList.add('email-drop-target'); } });
+      target.addEventListener('dragleave', () => target.classList.remove('email-drop-target'));
+      target.addEventListener('drop', event => { target.classList.remove('email-drop-target'); const files = [...(event.dataTransfer?.files || [])]; if (files.length) { event.preventDefault(); handler(files); } });
+    }
+    // Attaching also saves the reply text shown with it, so approval covers exactly what was seen.
+    async function changeReplyFiles(action, items) {
+      const draft = currentDraft();
+      if (!draft || !canEditDraft(draft)) return note('Open a reply you can edit before attaching files.', true);
+      if (state.busy || !state.loaded) return note('Wait for the current action to finish.', true);
+      if (!reply.value.trim()) return note('Write some reply text before attaching files.', true);
+      state.busy = true; state.mutationRevision += 1; controls(); note(action === 'draft_detach' ? 'Removing the file…' : 'Attaching…');
+      let changed = 0;
+      try {
+        let revision = state.editRevision ?? draft.revision;
+        for (const item of items) {
+          const payload = {account_id: state.account, draft_id: draft.id, revision, text: reply.value};
+          if (action === 'draft_detach') payload.attachment_id = item.id;
+          else if (item instanceof host.Blob) payload.upload_id = (await upload(item)).id;
+          else payload.message_attachment_id = item.id;
+          const result = await post(action, payload);
+          revision = result.draft.revision; state.editRevision = revision; state.editBase = result.draft.edited; state.dirty = false; changed += 1;
+        }
+        await refresh();
+        note(action === 'draft_detach' ? 'Removed from this reply. Your text was saved.' : changed === 1 ? 'Attached. It is sent with this reply when you approve it; your text was saved.' : changed + ' files attached. They are sent with this reply when you approve it; your text was saved.');
+      } catch (error) { if (changed) await refresh(); note(error.message, true); }
+      finally { state.busy = false; controls(); }
+    }
+    async function addRequestFiles(files) {
+      const draft = currentDraft();
+      if (!draft || !canEditDraft(draft)) return note('Open a reply you can revise before adding files for the AI.', true);
+      state.uploading += 1; controls(); note('Adding ' + (files.length === 1 ? files[0].name || 'the picture' : files.length + ' files') + ' for the AI…');
+      try {
+        const list = state.promptFiles.get(draft.id) || [];
+        for (const file of files) { const added = await upload(file); if (!list.some(item => item.id === added.id)) list.push(added); }
+        state.promptFiles.set(draft.id, list.slice(-20));
+        note('Added. The AI reads ' + (list.length === 1 ? 'it' : 'them') + ' with your next Revise with AI request.');
+      } catch (error) { note(error.message, true); }
+      finally { state.uploading -= 1; renderRequestFiles(); controls(); }
+    }
+    // Browser mail stored before its pictures were read gets them from the mailbox once, when opened.
+    function readAttachments(message) {
+      state.attachmentReads.add(message.id);
+      post('load_attachments', {account_id: state.account, message_id: message.id}).then(() => refresh(), error => { note(error.message, true); renderAttachmentRead(message); });
+    }
+    function renderAttachmentRead(message) {
+      const status = by('emailIncomingFilesStatus'), retry = by('emailIncomingFilesRetry');
+      const unread = !!message?.attachments_unread;
+      if (unread && !state.attachmentReads.has(message.id) && state.loaded) readAttachments(message);
+      const op = message ? (state.snapshot.operations || []).find(item => (item.id || item.kind) === 'attachments:' + message.id) : null;
+      const text = !message ? '' : op?.state === 'running' || (unread && !op && state.attachmentReads.has(message.id)) ? 'Reading the pictures and files of this email from the mailbox…'
+        : op?.state === 'failed' && unread ? 'The pictures and files could not be read: ' + (op.error || 'try again.') : '';
+      status.textContent = text; status.hidden = !text; status.classList.toggle('email-error', op?.state === 'failed' && unread);
+      retry.hidden = !(op?.state === 'failed' && unread); retry.onclick = () => { if (message) readAttachments(message); };
+    }
+    function renderRequestFiles() {
+      const list = state.promptFiles.get(state.draft) || [];
+      renderFiles(by('emailRevisionFiles'), list, {upload: true}, {remove: item => { state.promptFiles.set(state.draft, list.filter(one => one.id !== item.id)); renderRequestFiles(); }});
+    }
     async function act(action, payload, success) {
       if (state.busy || !state.loaded) return;
       const kind = {create_draft: 'draft', retry_draft: 'draft', revise_draft: 'revise', approve_draft: 'approve', resume_draft: 'approve'}[action];
@@ -211,6 +346,9 @@
       const revising = (!!state.pendingRevision && state.pendingRevision.id === state.draft) || running('revise');
       for (const id of ['emailSave', 'emailApprove', 'emailRevise']) by(id).disabled = state.busy || !editable || revising;
       by('emailRevisionRequest').disabled = state.busy || !editable || revising;
+      by('emailReplyAttachButton').disabled = state.busy || !editable || revising;
+      by('emailRevisionAttachButton').disabled = state.busy || !editable || revising;
+      if (state.uploading) by('emailRevise').disabled = true;
       by('emailDiscard').disabled = state.busy || revising || !['queued', 'review', 'error', 'approved', 'delivery_unknown'].includes(draft?.status); by('emailRevert').disabled = state.busy || revising || !state.dirty; by('emailReply').disabled = state.busy || !editable || revising; by('emailRetry').hidden = draft?.status !== 'error'; by('emailResume').hidden = draft?.status !== 'approved'; by('emailDownload').hidden = draft?.status !== 'exported'; by('emailRetryLearning').hidden = !draft?.learning_error;
       by('emailGenerate').disabled = state.busy || !state.message || !state.account || state.dirty;
       by('emailGenerate').disabled ||= running('draft') || ['queued', 'generating'].includes(draft?.status);
@@ -507,12 +645,24 @@
     queue.append(filters);
     const list = el('div'); list.id = 'emailQueue'; queue.append(list); columns.append(queue);
     const review = el('section', undefined, 'email-review'); review.append(el('h2', 'Review reply')); const incoming = el('pre', 'Choose an email.'); incoming.id = 'emailIncoming'; review.append(incoming);
+    const incomingFilesStatus = el('p', '', 'field-help'); incomingFilesStatus.id = 'emailIncomingFilesStatus'; incomingFilesStatus.setAttribute('role', 'status'); incomingFilesStatus.hidden = true; review.append(incomingFilesStatus);
+    const incomingFilesRetry = el('button', 'Read pictures and files again'); incomingFilesRetry.type = 'button'; incomingFilesRetry.id = 'emailIncomingFilesRetry'; incomingFilesRetry.hidden = true; review.append(incomingFilesRetry);
+    const incomingFiles = el('div', undefined, 'email-files'); incomingFiles.id = 'emailIncomingFiles'; incomingFiles.setAttribute('aria-label', 'Attachments of this email'); review.append(incomingFiles);
     button(review, 'emailGenerate', 'Create draft', () => act('create_draft', {account_id: state.account, message_id: state.message, provider_route: by('emailProvider').value, provider_model: by('emailModel').value}, result => { state.draft = result.draft?.id || state.draft; })).dataset.work = '1';
     feedback(review, 'emailGenerateStatus');
     const draftStatus = el('p'); draftStatus.id = 'emailDraftStatus'; draftStatus.setAttribute('role', 'status'); review.append(draftStatus);
     const recipient = el('p'); recipient.id = 'emailReplyRecipient'; review.append(recipient);
     const comparison = el('div', undefined, 'email-comparison'); const originalBox = el('div'); originalBox.append(el('h3', 'Original AI draft'), el('p', 'Read-only initial suggestion, kept here for comparison. Edit the copy in Your reply.', 'field-help')); const original = el('pre'); original.id = 'emailOriginal'; original.setAttribute('aria-label', 'Read-only original AI suggestion'); originalBox.append(original); comparison.append(originalBox);
     const editedBox = el('div'); const reply = field(editedBox, 'emailReply', 'Your reply', 'textarea'); const replyHelp = el('p', 'Starts as a copy of the AI suggestion. Edit this text yourself or ask the AI to revise it. Select Send your reply to send this version.', 'field-help'); replyHelp.id = 'emailReplyHelp'; reply.setAttribute('aria-describedby', 'emailReplyHelp'); editedBox.insertBefore(replyHelp, reply); reply.rows = 14; reply.addEventListener('input', () => { state.dirty = true; sendVersion = 'edited'; showDiff(); controls(); }); comparison.append(editedBox); review.append(comparison);
+    const replyAttach = el('div', undefined, 'email-attach-row');
+    const replyPicker = el('input'); replyPicker.type = 'file'; replyPicker.multiple = true; replyPicker.id = 'emailReplyAttach';
+    replyPicker.addEventListener('change', () => { const files = [...replyPicker.files]; replyPicker.value = ''; if (files.length) changeReplyFiles('draft_attach', files); });
+    button(replyAttach, 'emailReplyAttachButton', 'Attach files or pictures', () => replyPicker.click());
+    replyAttach.append(replyPicker, el('span', 'Sent with this reply. Paste or drop files onto Your reply too.', 'field-help'));
+    const replyFiles = el('div', undefined, 'email-files'); replyFiles.id = 'emailReplyFiles'; replyFiles.setAttribute('aria-label', 'Files attached to this reply');
+    editedBox.append(replyAttach, replyFiles);
+    reply.addEventListener('paste', event => { const files = pastedFiles(event); if (files.length) { event.preventDefault(); changeReplyFiles('draft_attach', files); } });
+    acceptDrops(reply, files => changeReplyFiles('draft_attach', files));
     for (const [parent, id, value, title] of [[originalBox, 'emailUseOriginal', 'original', 'Send original AI draft'], [editedBox, 'emailUseEdited', 'edited', 'Send your reply']]) {
       const choice = el('input'); choice.type = 'radio'; choice.name = 'emailSendVersion'; choice.id = id; choice.value = value;
       const label = el('label', title, 'email-version-choice'); label.append(choice); parent.prepend(label);
@@ -526,14 +676,24 @@
       versionNotice.textContent = 'Selected for sending: ' + (sendVersion === 'original' ? 'Original AI draft' : 'Your reply') + '. You will review this exact text in the mail window.';
     }
     const revisionBox = el('div', undefined, 'email-revision');
-    field(revisionBox, 'emailRevisionRequest', 'Ask the AI to change this reply', 'textarea').placeholder = 'For example: make it shorter and friendlier, but keep the proposed date.';
+    const revisionRequest = field(revisionBox, 'emailRevisionRequest', 'Ask the AI to change this reply', 'textarea'); revisionRequest.placeholder = 'For example: make it shorter and friendlier, but keep the proposed date. Paste or drop pictures here for the AI to look at.';
+    const requestAttach = el('div', undefined, 'email-attach-row');
+    const requestPicker = el('input'); requestPicker.type = 'file'; requestPicker.multiple = true; requestPicker.id = 'emailRevisionAttach';
+    requestPicker.addEventListener('change', () => { const files = [...requestPicker.files]; requestPicker.value = ''; if (files.length) addRequestFiles(files); });
+    button(requestAttach, 'emailRevisionAttachButton', 'Add pictures or files for the AI', () => requestPicker.click());
+    requestAttach.append(requestPicker, el('span', 'The AI reads these with your request; they are not sent with the reply.', 'field-help'));
+    const requestFiles = el('div', undefined, 'email-files'); requestFiles.id = 'emailRevisionFiles'; requestFiles.setAttribute('aria-label', 'Files for the AI with this request');
+    revisionBox.append(requestAttach, requestFiles);
+    revisionRequest.addEventListener('paste', event => { const files = pastedFiles(event); if (files.length) { event.preventDefault(); addRequestFiles(files); } });
+    acceptDrops(revisionRequest, addRequestFiles);
     button(revisionBox, 'emailRevise', 'Revise with AI', async () => {
       let draft = currentDraft(); const instruction = by('emailRevisionRequest').value.trim();
-      if (!draft || !instruction) return note('Describe the change you want the AI to make.', true);
+      const requestFileList = draft ? state.promptFiles.get(draft.id) || [] : [];
+      if (!draft || (!instruction && !requestFileList.length)) return note('Describe the change you want the AI to make.', true);
       if (!await preflightDraft('revise')) return;
       draft = currentDraft();
       const submitted = {id: draft.id, text: reply.value, revision: state.editRevision ?? draft.revision};
-      await act('revise_draft', {account_id: state.account, draft_id: draft.id, revision: submitted.revision, text: submitted.text, instruction, provider_route: by('emailProvider').value, provider_model: by('emailModel').value}, () => { state.pendingRevision = submitted; state.dirty = true; return {notice: 'The AI is revising your current reply. You can review the result before approving it.'}; });
+      await act('revise_draft', {account_id: state.account, draft_id: draft.id, revision: submitted.revision, text: submitted.text, instruction, provider_route: by('emailProvider').value, provider_model: by('emailModel').value, ...(requestFileList.length ? {prompt_attachments: requestFileList.map(item => item.id)} : {})}, () => { state.pendingRevision = submitted; state.dirty = true; state.promptFiles.delete(draft.id); renderRequestFiles(); return {notice: 'The AI is revising your current reply' + (requestFileList.length ? ' with the files you added' : '') + '. You can review the result before approving it.'}; });
     }); feedback(revisionBox, 'emailRevisionStatus'); const automaticStatus = el('p', '', 'field-help'); automaticStatus.id = 'emailAutomaticLearningStatus'; automaticStatus.setAttribute('role', 'status'); revisionBox.append(automaticStatus); review.append(revisionBox);
     const diff = el('pre'); diff.id = 'emailDiff'; diff.setAttribute('role', 'status'); review.append(diff);
     const learn = field(review, 'emailLearn', 'Learn from my edits', 'checkbox'); learn.checked = true;
@@ -559,6 +719,7 @@
     const composeText = (draft, resume) => resume ? draft.edited : sendVersion === 'original' ? (originalEdits.get(originalKey(draft)) ?? draft.original) : reply.value;
     composeVersion.addEventListener('change', () => { sendVersion = composeVersion.value; composeBody.value = composeText(currentDraft(), false); showSendVersion(); });
     const composeBody = field(compose, 'emailComposeBody', 'Message', 'textarea'); composeBody.rows = 14;
+    const composeFiles = el('p', '', 'email-compose-files'); composeFiles.id = 'emailComposeFiles'; compose.append(composeFiles);
     compose.append(el('p', 'From, To and Subject belong to the original conversation. Review the message before sending.', 'field-help'));
     let composeBinding = null, composeSending = false;
     composeBody.addEventListener('input', () => {
@@ -607,6 +768,8 @@
       if (composeBinding.resume) sendVersion = 'edited';
       composeVersion.value = sendVersion; composeVersion.disabled = composeBinding.resume; composeBody.readOnly = composeBinding.resume;
       composeBody.value = composeText(draft, composeBinding.resume); composeError.textContent = '';
+      const outgoing = draft.attachments || [];
+      composeFiles.textContent = outgoing.length ? 'Attached: ' + outgoing.map(item => item.name + (item.size ? ' (' + sizeText(item.size) + ')' : '')).join(', ') : 'No files attached.';
       showSendVersion();
       by('emailComposeSend').textContent = ['classic_outlook', 'import'].includes(account?.kind) ? 'Export reply' : 'Send';
       compose.showModal(); composeBody.focus();
@@ -678,6 +841,8 @@
         const messages = {
           not_recorded: 'This earlier revision has no recorded learning outcome. You can learn from its saved request.',
           learned: 'Reusable preferences were learned for this recipient.',
+          preferences_removed: 'You deleted what was learned from this request, so it no longer shapes replies to this recipient.',
+          superseded: 'A later request for this recipient replaced what was learned here.',
           no_reusable_preferences: 'The AI checked your revision but found no reusable preference. You can retry learning from the saved revision.',
           failed: 'Automatic learning failed. You can retry learning from the saved revision.',
           no_recipient: 'Learning could not be saved because this reply has no single recipient.',
@@ -711,7 +876,9 @@
         const account = state.account; const key = JSON.stringify([account, automatic, m.id]);
         const card = el('div', undefined, 'email-memory-card'); const input = field(card, 'email-memory-' + (automatic ? 'automatic-' : '') + m.id, automatic ? 'Automatic preference' : 'Learned preference', 'textarea');
         input.value = state.memoryEdits.get(key) ?? m.text; input.addEventListener('input', () => state.memoryEdits.set(key, input.value));
-        card.append(el('small', (m.source_draft_id ? (automatic ? 'From AI revision of draft ' : 'From reviewed draft ') + m.source_draft_id + (m.source_revision != null ? ', source revision ' + m.source_revision : '') : 'Added by you') + (m.revision != null ? ' · Preference revision ' + m.revision : '') + ' · ' + (m.status || 'active')));
+        // Where it was learned, not who wrote the current wording: editing keeps the origin.
+        const typed = !automatic && (m.learned_authority || m.authority) === 'user';
+        card.append(el('small', (m.source_draft_id && !typed ? (automatic ? 'From AI revision of draft ' : 'From reviewed draft ') + m.source_draft_id + (m.source_revision != null ? ', source revision ' + m.source_revision : '') : 'Added by you') + (m.revision != null ? ' · Preference revision ' + m.revision : '') + ' · ' + (m.status || 'active')));
         const save = button(card, '', 'Save', () => act('memory_save', {account_id: account, memory_id: m.id, text: input.value}, () => state.memoryEdits.delete(key))); save.dataset.work = '1';
         const remove = button(card, '', 'Delete', () => act('memory_delete', {account_id: account, memory_id: m.id}, () => state.memoryEdits.delete(key))); remove.dataset.work = '1';
         parent.append(card);
@@ -847,7 +1014,7 @@
       else if (!messages.length) by('emailQueue').append(el('p', 'No messages match your search. Clear the search box to see them all.'));
       const scroller = el('div', undefined, 'email-queue-scroll'); if (messages.length) by('emailQueue').append(scroller);
       const focusMessage = id => { for (const node of by('emailQueue').querySelectorAll('.email-message')) if (node.dataset.messageId === id) return node.focus({preventScroll: true}); };
-      for (const m of messages) { const drafts = (s.drafts || []).filter(d => d.message_id === m.id && d.account_id === state.account); const newest = [...drafts].reverse(); const d = newest.find(d => !['discarded', 'sent', 'exported'].includes(d.status)) || newest[0]; const b = button(scroller, '', (m.subject || '(No subject)') + '\n' + m.sender + (d ? '\n' + d.status : ''), () => { if (state.busy) return note('Wait for the current action to finish.', true); if (state.dirty) return note('Save or discard your edits before opening another email.', true); state.message = m.id; state.draft = d?.id || ''; render(); focusMessage(m.id); }); b.className = 'email-message'; b.dataset.messageId = m.id; b.title = 'Open this message and the reply drafted for it.'; b.setAttribute('aria-pressed', String(state.message === m.id)); }
+      for (const m of messages) { const drafts = (s.drafts || []).filter(d => d.message_id === m.id && d.account_id === state.account); const newest = [...drafts].reverse(); const d = newest.find(d => !['discarded', 'sent', 'exported'].includes(d.status)) || newest[0]; const fileCount = (m.attachments || []).filter(item => item.sha256).length; const b = button(scroller, '', (m.subject || '(No subject)') + '\n' + m.sender + (fileCount ? '\n' + fileCount + (fileCount === 1 ? ' attachment' : ' attachments') : '') + (d ? '\n' + d.status : ''), () => { if (state.busy) return note('Wait for the current action to finish.', true); if (state.dirty) return note('Save or discard your edits before opening another email.', true); state.message = m.id; state.draft = d?.id || ''; render(); focusMessage(m.id); }); b.className = 'email-message'; b.dataset.messageId = m.id; b.title = 'Open this message and the reply drafted for it.'; b.setAttribute('aria-pressed', String(state.message === m.id)); }
       scroller.scrollTop = keptScroll;
       if (focusedMessage) focusMessage(focusedMessage);
       const message = held.find(m => m.id === state.message); by('emailIncoming').textContent = message ? 'From: ' + message.sender + '\nSubject: ' + message.subject + '\n\n' + message.body : 'Choose an email.';
@@ -858,6 +1025,10 @@
         if (operation?.state === 'failed') { if (draft.edited === pending.text) state.editRevision = draft.revision; state.pendingRevision = null; note(operation.error || 'AI revision failed. Your edits are preserved.', true); }
         else if (draft.revision > pending.revision && draft.status === 'review' && operation?.state !== 'running') { if (reply.value === pending.text) state.dirty = false; state.pendingRevision = null; by('emailRevisionRequest').value = ''; }
       }
+      renderFiles(by('emailIncomingFiles'), message?.attachments || [], message ? {message_id: message.id} : null, canEditDraft(draft) ? {reuse: item => changeReplyFiles('draft_attach', [item])} : {});
+      renderAttachmentRead(message);
+      renderFiles(by('emailReplyFiles'), draft?.attachments || [], draft ? {draft_id: draft.id} : null, canEditDraft(draft) ? {remove: item => changeReplyFiles('draft_detach', [item])} : {});
+      renderRequestFiles();
       by('emailOriginal').textContent = draft?.original || ''; if (!state.dirty) { reply.value = draft?.edited ?? draft?.original ?? ''; state.editRevision = draft?.revision ?? null; state.editBase = draft?.edited ?? draft?.original ?? ''; }
       by('emailDraftStatus').textContent = draft ? 'Status: ' + ({submitted: 'Queued with the mailbox service; sending is not yet confirmed', delivery_unknown: 'Sending outcome is uncertain. Check status; do not resend automatically.', sent: draft.delivery_status === 'user_confirmed' ? 'You verified this reply was sent' : draft.delivery_status === 'browser_confirmed' ? 'Mailbox UI accepted the send action; recipient delivery is not confirmed' : 'Accepted for sending; recipient delivery is not confirmed', exported: 'Exported only; sending is not confirmed'}[draft.status] || draft.status) + (draft.error ? '\n' + draft.error : '') + (draft.learning_error ? '\nLearning failed: ' + draft.learning_error : '') : 'No draft yet.';
       by('emailReplyRecipient').textContent = message ? 'Reply to: ' + (message.reply_to || message.sender) + (['classic_outlook', 'import'].includes(currentAccount()?.kind) ? '. Choose the version below, then review the exact message before exporting.' : '. Choose the version below, then review the exact message before sending.') : '';

@@ -17,20 +17,29 @@ def enabled(goal):
 
 
 def recipient(goal, task, action):
-    """Resolve agent-selected public routing without granting new membership."""
+    """Resolve agent-selected public routing without granting new membership.
+
+    Lenient by design: an address Nexus cannot use (the agent itself, a
+    teammate's name instead of its id, an unknown kind) falls back to normal
+    conversation routing (``None``) instead of failing the agent's turn.
+    """
     supplied = action.get("summary_delivery") or {}
-    kind = supplied.get("kind", "auto")
-    if kind == "auto":
+    if not isinstance(supplied, dict):
         return None
-    agent_id = supplied.get("agent_id", "")
+    kind = str(supplied.get("kind") or "auto").strip().lower()
+    agent_id = str(supplied.get("agent_id") or "").strip()
     if kind in {"user", "team"} and not agent_id:
         return {"schema_version": 1, "kind": kind, "agent_id": "",
                 "name": "You" if kind == "user" else "the team"}
-    agent = next((one for one in goal["agents"] if one["id"] == agent_id), None)
-    if kind != "agent" or not agent or agent_id == task["assigned_agent_id"]:
-        raise HarnessError("Address a selected teammate, the team, or the user.")
-    return {"schema_version": 1, "kind": "agent", "agent_id": agent_id,
-            "name": agent.get("name") or agent_id}
+    if kind not in {"agent", "user", "team"} or not agent_id:
+        return None
+    wanted = agent_id.casefold()
+    agent = next((one for one in goal["agents"] if one["id"] == agent_id), None) or next(
+        (one for one in goal["agents"] if str(one.get("name") or "").strip().casefold() == wanted), None)
+    if not agent or agent["id"] == task["assigned_agent_id"]:
+        return None
+    return {"schema_version": 1, "kind": "agent", "agent_id": agent["id"],
+            "name": agent.get("name") or agent["id"]}
 
 
 def reply_requested(action, delivery):
@@ -113,13 +122,51 @@ def denied_commands(goal):
     return denied
 
 
+SHRINK_MIN_BYTES = 8_000
+SHRINK_RATIO = 0.4
+
+
+def shrunk_files(goal, root, limit=6):
+    """Files a saved change cut to a fraction of their earlier size.
+
+    A long file resent in full can be cut off mid-reply; the change still
+    applies (agent work is never refused) but the agents must be told, with the
+    backup that holds the earlier version. Measured against the file on disk
+    now, so the notice disappears once the file is restored or grows back.
+    """
+    found, seen = [], set()
+    for artifact in reversed((goal.get("artifacts") or [])[-40:]):
+        if not isinstance(artifact, dict) or artifact.get("kind") != "file_transaction":
+            continue
+        for change in artifact.get("changes") or []:
+            path = str(change.get("path") or "")
+            before = change.get("backup_bytes")
+            if not path or path in seen or change.get("delete") or not isinstance(before, int) or before < SHRINK_MIN_BYTES:
+                continue
+            seen.add(path)
+            try:
+                now = (Path(root) / path).stat().st_size
+            except OSError:
+                continue
+            if now < before * SHRINK_RATIO:
+                found.append({"path": path, "bytes_before": before, "bytes_now": now,
+                              "earlier_version": f".harness/backups/{artifact.get('transaction_id')}/files/{path}",
+                              "notice": f"{path} went from {before} to {now} bytes in one saved change. If that was not "
+                                        "intended (a reply cut off while resending the whole file), restore the earlier "
+                                        "version and make targeted edits instead."})
+            if len(found) >= limit:
+                return found
+    return found
+
+
 def context(goal, task, root, ledger, evidence, files, definitions):
     from . import action_protocol, goal_decisions, swarm_work
     from .long_horizon import PREVIOUS_EFFECTS_BUDGET, _shown_tool_results
     projected_task = {key: task.get(key) for key in (
         "id", "title", "description", "kind", "state", "assigned_agent_id", "depends_on")}
     messages = [{key: message.get(key) for key in (
-        "id", "sequence", "agent_id", "summary", "recipient", "reply_requested", "phase")}
+        "id", "sequence", "agent_id", "summary", "recipient", "reply_requested", "phase", "nexus_check")
+        if key != "nexus_check" or message.get(key)}
         for message in (goal.get("dialogue") or {}).get("messages", [])
         if message.get("visibility") != "agent_only"
         or (message.get("recipient") or {}).get("agent_id") == task["assigned_agent_id"]]
@@ -140,6 +187,12 @@ def context(goal, task, root, ledger, evidence, files, definitions):
         "tool_calls may be empty. Tool errors are observations to correct, not progress. Use complete "
         "when your contribution is finished, ask_user only for missing user information. "
         "Use native tools directly when available; choose the tools and division of work yourself. "
+        "To change part of a large existing file use edit_file or native edits; a whole large file resent "
+        "through changes can be cut off and lose work. Look at what you build before calling a round done: "
+        "run it, and open web pages and browser games with the page preview command when you have one "
+        "(otherwise preview_web_page), which opens them from disk the way the user does; then read its "
+        "errors and look at its screenshots. When the user asks for rounds of improvement, "
+        "each round starts from what the preview and checks actually show. "
         "Set summary_delivery to {kind: agent, agent_id: the selected teammate ID}, "
         "{kind: team, agent_id: ''}, or {kind: user, agent_id: ''}. Use kind auto for the next teammate. "
         "Include reply_requested: true in summary_delivery only when you need a teammate to respond; "
@@ -157,6 +210,7 @@ def context(goal, task, root, ledger, evidence, files, definitions):
                       "conversation": messages, "roles": goal.get("workspace_collaboration"),
                       "team": goal["agents"], "tasks": ledger,
                       "user_evidence": evidence, "verification": goal.get("verification"),
+                      "shrunk_files": shrunk_files(goal, root),
                       # Bounded by its share of the one tool-result budget.
                       "previous_tool_effects": _shown_tool_results([
                           {key: result.get(key) for key in ("call_id", "name", "result", "error")}

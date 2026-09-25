@@ -15,6 +15,7 @@ from typing import Any
 
 from .config import LoadedConfig, is_project_local_config_trusted
 from .detect import combined_commands, detect_project
+from .local_probe import loopback_refuses
 from .plugins import load_plugins
 from .providers import CODEX_AUTH_DEFERRED, ProviderRegistry, codex_cli_preflight
 
@@ -38,6 +39,8 @@ def _provider_check(config: LoadedConfig) -> Check:
         return Check("ok", "provider", f"Local provider command found: {command[0]}")
     endpoint = str(config.get("provider.endpoint")).rstrip("/")
     if name == "ollama":
+        if loopback_refuses(endpoint):
+            return Check("warn", "provider", f"Ollama is not reachable at {endpoint}")
         try:
             with urllib.request.urlopen(f"{endpoint}/api/tags", timeout=2) as response:
                 if response.status == 200:

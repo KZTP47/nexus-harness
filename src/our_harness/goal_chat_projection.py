@@ -284,6 +284,12 @@ def keep_page(
                     "source_goal_event_type": str(message.get("source_goal_event_type")
                                                   or ("provider_acknowledged" if agent_id else "goal_steered")),
                 })
+            check = message.get("nexus_check")
+            if agent_id and isinstance(check, dict) and check.get("verdict"):
+                # Nexus's own check of a done claim, shown beside it and never mixed into the agent's words.
+                correlation.update({"nexus_check_verdict": str(check.get("verdict") or "")[:1_200],
+                                    "nexus_check_page": str(check.get("page") or "")[:300],
+                                    "nexus_check_screenshot": str(check.get("screenshot") or "")[:1_000]})
             provider_activity = message.get("provider_activity") if message.get("phase") == "provider_activity" else None
             if agent_id and not provider_activity:
                 correlation.update(report_metadata(goal))
@@ -421,3 +427,119 @@ def keep_page(
         chat.read_it(config, route, filed_as)
         chat._keep_it(config, route, [], filed_as, replace_projection=True, transform_projection=project)
     return projection_result
+
+
+# ---- Replay receipts -------------------------------------------------------
+#
+# Listing goals copies each goal's progress into its chat. That copy is
+# idempotent, but finding out that there is nothing new meant re-reading and
+# re-verifying the whole transcript several times per goal, for every goal,
+# on every listing: tens of seconds before a board's chats appeared. A receipt
+# records the exact goal snapshot and the exact transcript bytes a completed
+# replay left behind. Only the replay is skipped when both are unchanged;
+# every read that shows a transcript still verifies it in full, and any
+# change to the goal, the transcript, its anchor or this code replays again.
+
+RECEIPT_SCHEMA = 1
+RECEIPT_CONTRACT = "goal-chat-projection-receipt/v1"
+MOST_RECEIPTS_PER_TRANSCRIPT = 64
+
+
+def _engine_fingerprint() -> str:
+    from pathlib import Path
+    import hashlib
+
+    digest = hashlib.sha256(RECEIPT_CONTRACT.encode("utf-8"))
+    here = Path(__file__).resolve().parent
+    for name in ("goal_chat_projection.py", "chat.py", "goal_chat_progress.py", "server.py"):
+        try:
+            digest.update((here / name).read_bytes())
+        except OSError:
+            digest.update(name.encode("utf-8"))
+    return digest.hexdigest()
+
+
+_ENGINE = _engine_fingerprint()
+
+
+def _goal_fingerprint(goal: dict[str, Any]) -> str:
+    import hashlib
+
+    return hashlib.sha256(json.dumps(
+        goal, sort_keys=True, separators=(",", ":"), default=str,
+    ).encode("utf-8")).hexdigest()
+
+
+def _transcript_state(config: LoadedConfig, route: str, filed_as: str):
+    """(receipt path, digest of transcript and anchor bytes) or None."""
+
+    import hashlib
+    from .runtime_integrity import runtime_root
+
+    events = chat.where_it_is_kept(config, route, filed_as).with_suffix(".events.jsonl")
+    try:
+        body = events.read_bytes()
+    except OSError:
+        return None
+    anchor = chat._transcript_anchor_path(events)
+    try:
+        anchored = anchor.read_bytes()
+    except OSError:
+        anchored = b""
+    identity = hashlib.sha256(str(events.resolve()).encode("utf-8")).hexdigest()
+    digest = hashlib.sha256()
+    for part in (identity.encode("utf-8"), body, b"\0", anchored):
+        digest.update(part)
+    return runtime_root() / "goal-projection-receipts" / f"{identity}.json", digest.hexdigest()
+
+
+def _read_receipt(where) -> dict[str, Any]:
+    try:
+        held = json.loads(where.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(held, dict) or held.get("schema_version") != RECEIPT_SCHEMA \
+            or held.get("contract") != RECEIPT_CONTRACT or held.get("engine") != _ENGINE \
+            or not isinstance(held.get("goals"), dict):
+        return {}
+    return held["goals"]
+
+
+def already_projected(config: LoadedConfig, route: str, goal: dict[str, Any], *, filed_as: str) -> bool:
+    """Whether this exact goal snapshot was already replayed into these exact bytes."""
+
+    state = _transcript_state(config, route, filed_as)
+    if state is None:
+        return False
+    where, digest = state
+    seen = _read_receipt(where).get(str(goal.get("goal_id") or ""))
+    return isinstance(seen, dict) and seen.get("goal") == _goal_fingerprint(goal) \
+        and seen.get("transcript") == digest
+
+
+def remember_projected(config: LoadedConfig, route: str, goals: list[dict[str, Any]], *, filed_as: str) -> None:
+    """Record that every goal given is fully replayed into the transcript as it is now."""
+
+    from .runtime_integrity import atomic_text
+
+    state = _transcript_state(config, route, filed_as)
+    if state is None or not goals:
+        return
+    where, digest = state
+    with chat._the_lock_for(chat._filed_under(filed_as or route)):
+        kept = {key: value for key, value in _read_receipt(where).items() if isinstance(value, dict)}
+        for goal in goals:
+            goal_id = str(goal.get("goal_id") or "")
+            if goal_id:
+                kept.pop(goal_id, None)
+                kept[goal_id] = {"goal": _goal_fingerprint(goal), "transcript": digest}
+        while len(kept) > MOST_RECEIPTS_PER_TRANSCRIPT:
+            kept.pop(next(iter(kept)))
+        try:
+            atomic_text(where, json.dumps({
+                "schema_version": RECEIPT_SCHEMA, "contract": RECEIPT_CONTRACT,
+                "engine": _ENGINE, "goals": kept,
+            }, sort_keys=True) + "\n")
+        except OSError:
+            # A receipt only saves work. Without it the next listing replays.
+            return

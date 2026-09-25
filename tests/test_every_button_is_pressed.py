@@ -382,6 +382,7 @@ def what_the_checks_do() -> tuple[set[str], str, set[str]]:
         "goal-access.test.js", "goal-recovery.test.js", "provider-reconnect.test.js",
         "chat-qol.test.js", "composer-permissions.test.js", "agent-workspaces.test.js",
         "prompt-library.test.js", "chat-view-tabs.test.js", "team-goal-disclosure.test.js",
+        "agent-model-picker.test.js",
     ):
         packaged_e2e = (ROOT / "desktop" / packaged_name).read_text(encoding="utf-8")
         pressed.update(re.findall(

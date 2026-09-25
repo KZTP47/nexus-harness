@@ -314,7 +314,8 @@ class EmailService:
                    "account_save", "import", "create_draft", "retry_draft", "retry_learning", "retry_automatic_learning",
                    "emailengine_configure", "emailengine_accounts", "emailengine_connect", "emailengine_prepare", "emailengine_sign_in", "check_delivery",
                    "save_draft", "approve_draft", "confirm_browser_delivery", "discard_draft", "memory_save", "memory_delete",
-                   "notification_settings", "dismiss_failed_import"}
+                   "notification_settings", "dismiss_failed_import",
+                   "upload_attachment", "attachment_content", "draft_attach", "draft_detach", "load_attachments"}
         if action not in allowed:
             raise HarnessError("Unknown email action.")
         if action == 'notification_settings':
@@ -354,6 +355,10 @@ class EmailService:
             return result
         if action == 'local_disconnect':
             return self.studio.disconnect_local(payload.get('account_id'))
+        if action == 'load_attachments':
+            # Reopening the message in the mailbox page can take a minute.
+            self._background('attachments:' + str(payload.get('message_id', '')), lambda: self.studio.load_attachments(payload))
+            return {'started': True}
         if action == 'revise_draft':
             self._background('revise:' + str(payload.get('draft_id', '')), lambda: self.studio.revise_draft(payload))
             return {'started': True}

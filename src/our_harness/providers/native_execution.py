@@ -112,13 +112,36 @@ def instructions(request, *, denials_enforced=False):
     return _instructions(request, root) + denial_instructions(request, enforced=denials_enforced)
 
 
+# Why these words: agents with native access kept using Nexus read_file one
+# chunk per turn and resending whole files through changes. A long file resent
+# in full was cut off mid-reply (an 83 KB game became 7.7 KB), and no agent ever
+# ran or looked at what it built. Say plainly what is faster and safer.
+_NATIVE_WORK_HABITS = (
+    "Read, search, edit, create and run things directly with your own tools in this turn: that is much faster "
+    "than a Nexus tool request or needs_files, which each cost a whole extra turn. Edit only the part of a file "
+    "that changes; never resend a large existing file in full through changes, because a long reply can be cut off "
+    "and lose work. Use Nexus tool_calls only for what your own tools cannot do: messages to teammates, the shared "
+    "conversation, user decisions and Nexus checks; Nexus tool names are not native tools, so never call them as one. "
+    "Run and look at what you build before calling a step done: run its tests or scripts, and for a web page or "
+    "browser game run the page preview command below (it opens the page from disk the way the user will, reports "
+    "script errors, and prints screenshot paths you open with your image-reading tool). Fix what you see before moving on. "
+)
+
+
+def _preview_line(root):
+    from ..web_preview import agent_command
+    command = agent_command(root)
+    return ("PAGE PREVIEW COMMAND (run it yourself, from the working directory; change index.html to the page): "
+            + command + " . ") if command else ""
+
+
 def _instructions(request, root):
     writable = request.native_execution == "work"
     if request.workspace_context.execution_mode == "facilitator":
         return (
             "NATIVE AGENT EXECUTION\nYour working directory is the selected project: " + str(root) + ". "
             + ("Use native commands and edits under the granted access. Saved files are immediately visible. "
-               "Return changes=[] for files already edited. " if writable else
+               "Return changes=[] for files already edited. " + _NATIVE_WORK_HABITS + _preview_line(root) if writable else
                "Use native inspection tools. Propose permitted edits through changes and request commands through Nexus tool_calls. ")
             + "Report command failures and test results accurately; they do not hide saved work. "
             "Respect the user's selected roles and permissions. Return the requested structured action."
@@ -127,7 +150,7 @@ def _instructions(request, root):
         "NATIVE AGENT EXECUTION\nYour working directory is your own project copy: " + str(root) + ". "
         "Use your native file, search, web and skill tools to investigate the task. "
         + ("Use native commands, scripts and edits in this copy. Nexus collects the actual changed files; "
-           "return changes=[] for files already edited with native tools. " if writable else
+           "return changes=[] for files already edited with native tools. " + _NATIVE_WORK_HABITS + _preview_line(root) if writable else
            "This turn permits native inspection. Propose edits in the changes field and request commands "
            "through Nexus tools under the current user access setting. ")
         + "Nexus context tools also refer to this copy. Tool permission denials are real constraints: report them "

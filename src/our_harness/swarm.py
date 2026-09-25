@@ -150,12 +150,17 @@ class Agent:
     # Keep that original key when the display name changes so history cannot
     # become an orphan merely because an agent was renamed.
     filed_as_name: str = ""
+    # The model this agent uses on its route. Empty means the route's own
+    # default, so an agent follows a route's model change until the user
+    # picks one for this agent.
+    model: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
             "name": self.name,
             "who": self.who,
+            "model": self.model,
             "job": self.job,
             "at": dict(self.at),
             "colour": self.colour,
@@ -377,6 +382,26 @@ def _some_words(said: Any, longest: int) -> str:
     return " ".join(str(said or "").split())[:longest]
 
 
+LONGEST_MODEL = 120
+
+
+def agent_model(agent_id: str, route: str) -> str:
+    """The model the user chose for this board agent now, or "" for the route default.
+
+    Read from the saved board at dispatch time so a change applies to the next
+    message, including running goals. Only an agent on the same route counts:
+    an id on another board or route never lends its model.
+    """
+    try:
+        board = load()
+    except Exception:
+        return ""
+    for one in board.agents:
+        if one.id == str(agent_id or "") and one.who == str(route or ""):
+            return one.model
+    return ""
+
+
 def _bounded_words(said: Any, longest: int, what: str) -> str:
     """Normalise a short identifier without silently cutting it."""
 
@@ -501,6 +526,7 @@ def read_it(said: Any, made_agents: int = 0, made_projects: int = 0) -> Board:
             id=held_id,
             name=name,
             who=_bounded_words(one.get("who"), 64, "An assistant route"),
+            model=_bounded_words(one.get("model"), LONGEST_MODEL, "A model name"),
             job=_bounded_instruction(
                 one.get("job"), LONGEST_JOB, "An agent role description"
             ),
@@ -995,11 +1021,13 @@ def discover_who_can_be_used(config) -> list[dict[str, Any]]:
     can_talk = [
         one for one in chat_lab.who_can_talk(config) if one.get("route")
     ]
+    from .providers.catalog import model_choices
     for one in can_talk:
         one["can_be_connected"] = (
             "" if one.get("ready")
             else _which_one_to_connect(one.get("route", ""), one)
         )
+        one["model_choices"] = model_choices(one.get("kind", ""), one.get("model", ""))
     return can_talk
 
 
@@ -3298,7 +3326,7 @@ def _check_import_shape(board: dict[str, Any]) -> None:
     agent_ids: set[str] = set()
     for agent in board.get("agents", []):
         if set(agent) - {
-            "id", "name", "who", "job", "at", "colour", "icon",
+            "id", "name", "who", "model", "job", "at", "colour", "icon",
             "bubble_colour", "profile_picture", "picture_zoom", "picture_hue",
             "filed_as",
         }:
@@ -3313,6 +3341,7 @@ def _check_import_shape(board: dict[str, Any]) -> None:
             "name": LONGEST_NAME,
             "filed_as": LONGEST_NAME,
             "who": 64,
+            "model": LONGEST_MODEL,
             "job": LONGEST_JOB,
         }.items():
             value = agent.get(key, "")
@@ -3476,16 +3505,14 @@ def keep_this_board(name: str, config: Any) -> dict[str, Any]:
         filed = _filed_under(name)
         saved_name = " ".join(str(name).split())
         live = load()
-        # Save-as is a fork, not an alias. Two separately named boards may use
-        # the same short agent/project ids, so copying the live workspace id
-        # into both would make their pair chats indistinguishable. Saving the
-        # board which is currently open back onto that same name is an update
-        # and deliberately retains its identity and conversations.
-        workspace_id = (
-            live.workspace_id
-            if live.active_saved_board == saved_name
-            else _new_workspace_id()
-        )
+        # Save As continues the board being worked on under the new name, the
+        # way it does in any editor. Its chats are part of that work, so the
+        # saved board keeps the live identity and the live board becomes that
+        # saved board. Forking the identity here instead left every chat behind
+        # on the old one: reopening the new name showed empty chats, and every
+        # conversation had after the save vanished with it.
+        workspace_id = live.workspace_id or _new_workspace_id()
+        switching = live.active_saved_board != saved_name
         snapshot = live.to_dict()
         snapshot["workspace_id"] = workspace_id
         held = {
@@ -3504,7 +3531,46 @@ def keep_this_board(name: str, config: Any) -> dict[str, Any]:
             os.replace(beside, where / filed)
         finally:
             beside.unlink(missing_ok=True)
-        return {"name": held["name"], "saved_at": held["saved_at"]}
+        # Two named boards must never share one identity: they may reuse the
+        # same short agent ids, which would make their pair chats
+        # indistinguishable. The earlier save point this work came from keeps
+        # its snapshot and gets an identity of its own.
+        for other in sorted(where.glob("*.json")):
+            if other.name != filed:
+                _give_kept_board_its_own_identity(other, workspace_id)
+    if switching:
+        from .swarm_runs import global_board_metadata_mutation
+
+        with global_board_metadata_mutation(config):
+            board = load()
+            if board.workspace_id == workspace_id and board.active_saved_board != saved_name:
+                _save_while_board_authority_is_held(
+                    dict(board.to_dict(), active_saved_board=saved_name), config
+                )
+    return {"name": held["name"], "saved_at": held["saved_at"]}
+
+
+def _give_kept_board_its_own_identity(where: Path, workspace_id: str) -> bool:
+    """Re-identify one saved board that shares ``workspace_id``; True if it did."""
+
+    try:
+        held = json.loads(where.read_text(encoding="utf-8"))
+        board = held["board"]
+        name = " ".join(str(held.get("name") or "").split())
+        if _kept_board_workspace_id(where, name, read_it(board)) != workspace_id:
+            return False
+    except (OSError, ValueError, KeyError, TypeError, RecursionError, SwarmError):
+        # An unreadable save is reported by the saved-board list; saving
+        # another board must not fail or rewrite it because of that.
+        return False
+    board["workspace_id"] = _new_workspace_id()
+    beside = where.parent / f".{where.name}.{os.getpid()}.{time.time_ns()}.part"
+    try:
+        beside.write_text(json.dumps(held, indent=2) + "\n", encoding="utf-8")
+        os.replace(beside, where)
+    finally:
+        beside.unlink(missing_ok=True)
+    return True
 
 
 @_requires_board_qa_access

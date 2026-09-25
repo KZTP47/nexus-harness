@@ -75,7 +75,12 @@ class FullAccessToolRuntimeTests(unittest.TestCase):
         self.assertEqual(updated["tasks"][0]["state"], "pending_apply")
         self.assertEqual(updated["interrupts"][0]["state"], "superseded")
         self.assertTrue(updated["project_queue"]["auto_start_pending"])
+        before = long_horizon.GoalStore(self.config).get(goal["goal_id"])
         self.assertFalse(long_horizon.GoalStore(self.config).recover_full_access_reviews(goal["goal_id"])[1])
+        # Nothing to recover writes nothing: a start must not advance revisions.
+        after = long_horizon.GoalStore(self.config).get(goal["goal_id"])
+        self.assertEqual(after["revision"], before["revision"])
+        self.assertEqual(after["updated_ms"], before["updated_ms"])
 
     def test_legacy_full_access_prompt_recovers_after_restart(self):
         goal = self.create("ask")

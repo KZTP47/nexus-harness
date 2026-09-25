@@ -106,7 +106,11 @@ def _layout(document: dict[str, Any], runtime_root: Path) -> tuple[Path, Path, P
 
 def _source_identity(source: Path) -> str:
     metadata = source.stat()
-    return _digest({"path": os.path.normcase(str(source)), "device": metadata.st_dev, "inode": metadata.st_ino})
+    # Python 3.12+ widened Windows st_dev to 64 bits; the low half is the
+    # volume serial older runtimes reported. Keep saved identities valid
+    # across a runtime upgrade.
+    device = metadata.st_dev & 0xFFFFFFFF if os.name == "nt" else metadata.st_dev
+    return _digest({"path": os.path.normcase(str(source)), "device": device, "inode": metadata.st_ino})
 
 
 def _key(home: Path, *, create: bool = False) -> bytes:

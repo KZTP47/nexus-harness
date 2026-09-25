@@ -129,7 +129,7 @@ test('starting a team posts the chosen agents, lead and settings', {skip: !execu
     await view.click('#ltStart');
     await view.waitForFunction(() => window.posts.some(p => p.action === 'create'));
     assert.deepEqual(await view.evaluate(() => window.posts.find(p => p.action === 'create')),
-      {action: 'create', agents: ['codex', 'claude'], lead: 'claude', goal: 'Make a game', project: 'C:/work', access: 'ask', mode: 'worktrees'});
+      {action: 'create', agents: ['codex', 'claude'], lead: 'claude', goal: 'Make a game', project: 'C:/work', access: 'ask', mode: 'worktrees', browser: 'hidden'});
   } finally {
     await browser.close();
   }

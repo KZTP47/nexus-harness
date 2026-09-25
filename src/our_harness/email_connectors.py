@@ -39,6 +39,11 @@ _STORE_LOCKS = {}
 _STORE_LOCKS_GUARD = threading.Lock()
 MAX_RESPONSE = 3_000_000
 MAX_MAIL = 2_000_000
+# One downloaded attachment (bytes, or Gmail's base64 JSON around them).
+MAX_ATTACHMENT_RESPONSE = 21_000_000
+# Largest reply each API accepts in this form: Graph sendMail takes base64 MIME
+# in a 4 MB request; Gmail's upload endpoint takes 35 MB, kept well below.
+SEND_LIMITS = {'outlook': 2_900_000, 'gmail': 25_000_000}
 PROVIDERS = {
     'outlook': {
         'name': 'Outlook / Microsoft 365',
@@ -75,9 +80,10 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 def _transport(method, url, headers=None, body=None):
     request = urllib.request.Request(url, data=body, headers=headers or {}, method=method)
     try:
-        with urllib.request.build_opener(_NoRedirect()).open(request, timeout=30) as response:
-            raw = response.read(MAX_RESPONSE + 1)
-            if len(raw) > MAX_RESPONSE:
+        with urllib.request.build_opener(_NoRedirect()).open(request, timeout=60) as response:
+            # JSON callers check MAX_RESPONSE themselves; attachment downloads may be larger.
+            raw = response.read(MAX_ATTACHMENT_RESPONSE + 1)
+            if len(raw) > MAX_ATTACHMENT_RESPONSE:
                 raise HarnessError('The mail provider response exceeded the supported size.')
             return raw
     except urllib.error.HTTPError as exc:
@@ -505,11 +511,42 @@ class MessageImportError(HarnessError):
     """A single message must be retained for review without generating a draft."""
 
 
+_NO_TEXT = '[This email has no readable text body.]'
+
+
 def _bounded_body(body):
     text = str(body or '').strip()
     if len(text) > 200_000:
         raise MessageImportError('The email text exceeds the 200,000 character processing limit. No draft was generated.')
-    return text or '[This email has no readable text body. Attachments were not imported.]'
+    # Mail that is only pictures or files keeps an empty body once they are read.
+    return text or _NO_TEXT
+
+
+def _gmail_files(payload):
+    """Attachment and inline-picture parts of a Gmail payload (never the text bodies)."""
+    found, pending, visited = [], [payload], 0
+    while pending and visited < 200:
+        part = pending.pop(0)
+        visited += 1
+        if not isinstance(part, dict):
+            continue
+        headers = {str(h.get('name', '')).lower(): str(h.get('value', '')) for h in part.get('headers', []) if isinstance(h, dict)}
+        mime = str(part.get('mimeType') or '').lower()
+        body = part.get('body') or {}
+        if mime.startswith('multipart/'):
+            pending.extend(part.get('parts', [])[:200])
+            continue
+        disposition = headers.get('content-disposition', '').lower()
+        is_file = bool(part.get('filename')) or disposition.startswith('attachment') or (
+            bool(headers.get('content-id')) and not mime.startswith('text/'))
+        if not is_file or not (body.get('attachmentId') or body.get('data')):
+            continue
+        found.append({'name': str(part.get('filename') or ''), 'type': mime, 'attachment_id': str(body.get('attachmentId') or ''),
+                      'data': body.get('data') if isinstance(body.get('data'), str) else '',
+                      'size': body.get('size') if isinstance(body.get('size'), int) else 0,
+                      'inline': disposition.startswith('inline') or (bool(headers.get('content-id')) and not disposition.startswith('attachment')),
+                      'content_id': headers.get('content-id', '')})
+    return found
 
 
 def _mail_header(value, limit):
@@ -929,7 +966,7 @@ class EmailConnectors:
                 raise
         return value
 
-    def _api(self, value, method, url, *, body=None, content_type=None, raw=False, extra_headers=None):
+    def _api(self, value, method, url, *, body=None, content_type=None, raw=False, extra_headers=None, limit=MAX_MAIL):
         provider = value['provider']
         parsed = urllib.parse.urlsplit(url)
         expected = 'graph.microsoft.com' if provider == 'outlook' else 'gmail.googleapis.com'
@@ -940,7 +977,9 @@ class EmailConnectors:
             headers['Content-Type'] = content_type
         if raw:
             result = self.transport(method, url, headers, body)
-            if not isinstance(result, bytes) or len(result) > MAX_MAIL:
+            if isinstance(result, dict):  # Injectable transport for isolated tests.
+                result = json.dumps(result).encode()
+            if not isinstance(result, bytes) or len(result) > limit:
                 raise HarnessError('Email exceeds the supported size.')
             return result
         return self._json_request(method, url, headers, body)
@@ -1014,10 +1053,13 @@ class EmailConnectors:
                     failed_messages.append({'source_id': message_id, 'error': str(exc)})
                     warnings.append(str(exc))
                     continue
+                attachments = self._graph_attachments(value, message_id, warnings)
+                if content == _NO_TEXT and attachments:
+                    content = ''
                 messages.append({'source_id': message_id, 'sender': _mail_header(sender.get('address'), 500), 'subject': _mail_header(message.get('subject'), 1000), 'body': content,
                                  'reply_to': reply_to, 'internet_message_id': _mail_header(message.get('internetMessageId'), 1000),
                                  'thread_id': str(message.get('conversationId') or ''), 'received_at': str(message.get('receivedDateTime') or ''),
-                                 **({'hidden_text': hidden_text} if hidden_text else {})})
+                                 **({'hidden_text': hidden_text} if hidden_text else {}), **({'attachments': attachments} if attachments else {})})
             next_url = result.get('@odata.nextLink') or result.get('@odata.deltaLink')
             if not isinstance(next_url, str) or not next_url:
                 raise HarnessError('The mailbox did not return a continuation cursor.')
@@ -1077,14 +1119,71 @@ class EmailConnectors:
                 failed_messages.append({'source_id': message_id, 'error': str(exc)})
                 warnings.append(str(exc))
                 continue
+            attachments = self._gmail_attachments(value, message_id, _gmail_files(payload), warnings)
+            if content == _NO_TEXT and attachments:
+                content = ''
             messages.append({'source_id': message_id, 'sender': _mail_header(headers.get('from'), 500), 'subject': _mail_header(headers.get('subject'), 1000), 'body': content,
                              'reply_to': reply_to, 'internet_message_id': _mail_header(headers.get('message-id'), 1000),
                              'references': _mail_header(headers.get('references'), 4000), 'thread_id': str(item.get('threadId') or ''), 'received_at': received,
-                             **({'hidden_text': '\n'.join(hidden)} if hidden else {})})
+                             **({'hidden_text': '\n'.join(hidden)} if hidden else {}), **({'attachments': attachments} if attachments else {})})
         next_page = result.get('nextPageToken', '')
         history = held['history'] if next_page or held['mode'] == 'initial' else str(result.get('historyId') or held['history'])
         mode = held['mode'] if next_page else 'history'
         return {'messages': messages, 'cursor': self._cursor(value, {'mode': mode, 'history': history, 'page': next_page}), 'has_more': bool(next_page), 'warnings': list(dict.fromkeys(warnings)), 'failed_messages': failed_messages}
+
+    def _graph_attachments(self, value, message_id, warnings):
+        """The files of one Graph message, including inline pictures, bounded per file."""
+        from .email_attachments import MAX_FILE_BYTES, MAX_FILES
+        quoted = urllib.parse.quote(message_id, safe='')
+        try:
+            listing = self._api(value, 'GET', 'https://graph.microsoft.com/v1.0/me/messages/' + quoted
+                                + '/attachments?$select=id,name,contentType,size,isInline')
+        except HarnessError:
+            warnings.append('The attachments of a message could not be listed; its text was imported.')
+            return []
+        items = []
+        for entry in (listing.get('value') or [])[:MAX_FILES]:
+            if not isinstance(entry, dict) or not isinstance(entry.get('id'), str):
+                continue
+            kind = str(entry.get('@odata.type') or '')
+            name, size = str(entry.get('name') or ''), entry.get('size') if isinstance(entry.get('size'), int) else 0
+            item_mail = kind.endswith('itemAttachment')
+            base = {'name': name + ('.eml' if item_mail and not name.lower().endswith('.eml') else ''),
+                    'type': 'message/rfc822' if item_mail else str(entry.get('contentType') or ''),
+                    'inline': entry.get('isInline') is True, 'size': size}
+            if kind.endswith('referenceAttachment'):
+                items.append({**base, 'omitted': 'A link to a cloud file; open it from the mailbox.'})
+                continue
+            if size > MAX_FILE_BYTES + 200_000:
+                items.append({**base, 'omitted': 'Larger than the attachment size limit; open it in the mailbox.'})
+                continue
+            try:
+                raw = self._api(value, 'GET', 'https://graph.microsoft.com/v1.0/me/messages/' + quoted + '/attachments/'
+                                + urllib.parse.quote(entry['id'], safe='') + '/$value', raw=True, limit=MAX_FILE_BYTES)
+                items.append({**base, 'raw': raw})
+            except HarnessError:
+                items.append({**base, 'omitted': 'The file could not be downloaded; open it in the mailbox.'})
+        return items
+
+    def _gmail_attachments(self, value, message_id, files, warnings):
+        from .email_attachments import MAX_FILE_BYTES, MAX_FILES
+        items = []
+        for entry in files[:MAX_FILES]:
+            base = {key: entry[key] for key in ('name', 'type', 'inline', 'content_id', 'size')}
+            if entry['size'] > MAX_FILE_BYTES:
+                items.append({**base, 'omitted': 'Larger than the attachment size limit; open it in the mailbox.'})
+                continue
+            encoded = entry['data']
+            if not encoded:
+                try:
+                    raw = self._api(value, 'GET', 'https://gmail.googleapis.com/gmail/v1/users/me/messages/' + urllib.parse.quote(message_id, safe='')
+                                    + '/attachments/' + urllib.parse.quote(entry['attachment_id'], safe=''), raw=True, limit=MAX_ATTACHMENT_RESPONSE)
+                    encoded = str(json.loads(raw).get('data') or '')
+                except (HarnessError, ValueError, AttributeError):
+                    items.append({**base, 'omitted': 'The file could not be downloaded; open it in the mailbox.'})
+                    continue
+            items.append({**base, 'data': encoded})
+        return items
 
     def send(self, identity, mail, *, thread_id=''):
         with self._mutation():
@@ -1094,16 +1193,27 @@ class EmailConnectors:
             if str(mail.get('From') or '').strip().casefold() != value['email'].casefold():
                 raise HarnessError('The reply sender does not match the connected mailbox.')
             raw = mail.as_bytes(policy=policy.SMTP)
-            if len(raw) > MAX_MAIL:
+            if len(raw) > SEND_LIMITS[value['provider']]:
                 raise HarnessError('This reply exceeds the supported size.')
             # Deliberately no retry, including 401: delivery can be ambiguous.
             if value['provider'] == 'outlook':
                 self._api(value, 'POST', 'https://graph.microsoft.com/v1.0/me/sendMail', body=base64.b64encode(raw), content_type='text/plain')
                 return {'accepted': True}
-            payload = {'raw': _b64(raw)}
-            if thread_id:
-                payload['threadId'] = str(thread_id)
-            result = self._api(value, 'POST', 'https://gmail.googleapis.com/gmail/v1/users/me/messages/send', body=json.dumps(payload).encode(), content_type='application/json')
+            if len(raw) <= MAX_MAIL:
+                payload = {'raw': _b64(raw)}
+                if thread_id:
+                    payload['threadId'] = str(thread_id)
+                result = self._api(value, 'POST', 'https://gmail.googleapis.com/gmail/v1/users/me/messages/send', body=json.dumps(payload).encode(), content_type='application/json')
+                return {'accepted': True, 'id': str(result.get('id') or '')}
+            # A reply with larger attachments goes through Gmail's upload endpoint,
+            # with the thread named in the metadata part.
+            boundary = ('nexus-' + uuid.uuid4().hex).encode()
+            metadata = json.dumps({'threadId': str(thread_id)} if thread_id else {}).encode()
+            body = (b'--' + boundary + b'\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n' + metadata
+                    + b'\r\n--' + boundary + b'\r\nContent-Type: message/rfc822\r\n\r\n' + raw
+                    + b'\r\n--' + boundary + b'--\r\n')
+            result = self._api(value, 'POST', 'https://gmail.googleapis.com/upload/gmail/v1/users/me/messages/send?uploadType=multipart',
+                               body=body, content_type='multipart/related; boundary=' + boundary.decode())
             return {'accepted': True, 'id': str(result.get('id') or '')}
 
     def close(self):

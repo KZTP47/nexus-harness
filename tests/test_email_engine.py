@@ -208,7 +208,7 @@ class EmailEngineTests(unittest.TestCase):
         self.server.details['one']['text'] = {}
         self.server.details['one']['subject'] = 'Hello\r\nsecond line'
         result = self.client.sync('mailbox')['messages'][0]
-        self.assertIn('Attachments have not been imported', result['body'])
+        self.assertIn('no readable text', result['body'])
         self.assertEqual(result['subject'], 'Hello second line')
 
     def test_reply_delegates_thread_recipient_and_uses_stable_idempotency(self):

@@ -45,6 +45,9 @@ test("interrupted chat shows actionable recovery, preserves approvals and reject
     assert.deepEqual(await page.evaluate(()=>calls[0].body.payload),{expected_revision:7,recovery:{schema_version:1,fingerprint:'exact-fingerprint',decision:'retry_provider'}});
     assert.equal(await page.getByLabel('Agent access for this chat').inputValue(),'full');
     await page.evaluate(()=>reset(true));
+    // The one actionable thing leads the panel, ahead of the team's settings.
+    assert.equal(await page.evaluate(()=>document.getElementById('panel').firstElementChild.classList.contains('chat-goal-recovery')),true);
+    assert.match(await page.locator('.chat-goal-recovery').innerText(),/send it to the team/);
     await page.getByRole('button',{name:'Resume interrupted turn',exact:true}).click();
     assert.equal(await page.evaluate(()=>calls[0].body.payload.recovery),undefined);
     await page.evaluate(()=>{reset();fail=true;});

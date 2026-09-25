@@ -2,7 +2,6 @@
 import unittest
 
 from our_harness import facilitator, long_horizon
-from our_harness.models import HarnessError
 from tests import test_long_horizon_dialogue as fixtures
 
 
@@ -59,11 +58,22 @@ class FacilitatorConversationTests(unittest.TestCase):
         self.assertTrue(any(e["type"] == "context_progress_observed" for e in events))
         self.assertFalse(any(e["type"] == "context_progress_paused" for e in events))
 
-    def test_unknown_and_self_recipient_rejected(self):
+    def test_unusable_recipient_falls_back_to_normal_routing(self):
+        # A lead once addressed a message Nexus could not use; its whole task
+        # failed and the goal paused. Now the message takes the usual route.
         goal = self.create("recipient-boundary", facilitator_mode=True)
-        for target in ("outside-project", "builder"):
-            with self.assertRaises(HarnessError):
-                facilitator.recipient(goal, goal["tasks"][0], say(target=target))
+        task = goal["tasks"][0]
+        for target in ("outside-project", task["assigned_agent_id"]):
+            self.assertIsNone(facilitator.recipient(goal, task, say(target=target)))
+            routed = long_horizon._summary_delivery(goal, task, say(target=target))
+            self.assertNotIn(routed.get("agent_id"), {"outside-project", task["assigned_agent_id"]})
+        self.assertIsNone(facilitator.recipient(goal, task, fixtures.reply(
+            "work", "x", summary_delivery={"kind": "robots", "agent_id": ""})))
+        # A teammate named instead of identified still reaches that teammate.
+        peer = next(one for one in goal["agents"] if one["id"] != task["assigned_agent_id"])
+        named = facilitator.recipient(goal, task, fixtures.reply(
+            "work", "x", summary_delivery={"kind": "agent", "agent_id": " " + peer["name"].upper() + " "}))
+        self.assertEqual(named["agent_id"], peer["id"])
         # Routing cannot masquerade as a user decision request's destination.
         self.assertEqual(long_horizon._summary_delivery(goal, goal["tasks"][0],
                          say("ask_user", target="peer"))["kind"], "user")

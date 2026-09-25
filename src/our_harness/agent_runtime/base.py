@@ -33,6 +33,9 @@ class SeatSpec:
     mcp: dict[str, Any] | None = None       # {"command": [...], "env": {...}}
     resume_id: str = ""
     extra_env: dict[str, str] = field(default_factory=dict)
+    extra_dirs: list[str] = field(default_factory=list)   # more folders the agent may read (attachments)
+    browser_settings: str = ""     # the team's settings.json; Claude's browser guard reads it
+    state_dir: str = ""            # where the adapter may keep files it hands its CLI
 
 
 class AgentSession:

@@ -521,6 +521,49 @@ def goal_command_approval(config: LoadedConfig, goal: dict[str, Any], *, runtime
     }
 
 
+def page_preview(root: Path, deadline=None) -> dict[str, Any] | None:
+    """With no checks to run, still look at a web page the way the user will.
+
+    Evidence only: it never changes the verification status. Returns None when
+    the project has no top-level page to open.
+    """
+    from . import web_preview
+    root = Path(root)
+    pages = sorted(one.name for one in root.glob("*.htm*") if one.is_file() and one.suffix.lower() in {".html", ".htm"})
+    page = "index.html" if "index.html" in pages else pages[0] if len(pages) == 1 else ""
+    if not page:
+        return None
+    from .playwright_runtime import discover_bundled_playwright_runtime
+    if discover_bundled_playwright_runtime() is None:
+        return None
+    try:
+        timeout = web_preview.RUN_SECONDS if deadline is None else deadline.remaining_seconds(
+            "before opening the page", web_preview.RUN_SECONDS)
+        result = web_preview.preview(root, page, timeout=timeout)
+    except (HarnessError, OSError) as exc:
+        return {"page": page, "unavailable": str(exc)[:400]}
+    keep = ("mode", "url", "title", "looks_blank", "error_count", "errors", "failed_requests", "screenshot", "load_error")
+    return {"page": page, "advice": result.get("advice", []),
+            "pages": [{key: (one.get(key)[:5] if key in {"errors", "failed_requests"} else one.get(key))
+                       for key in keep if one.get(key) not in (None, [], "")} for one in result.get("pages", [])]}
+
+
+def _page_preview_words(preview: dict[str, Any] | None) -> str:
+    if not preview:
+        return ""
+    if preview.get("unavailable"):
+        return f" Nexus could not open {preview['page']} in its browser: {preview['unavailable']}"
+    parts = []
+    for one in preview.get("pages", []):
+        where = "opened from disk" if one.get("mode") == "file" else "served locally"
+        problems = [f"{one['error_count']} script errors" if one.get("error_count") else "",
+                    "looks blank" if one.get("looks_blank") else "",
+                    "did not load" if one.get("load_error") else ""]
+        problems = [text for text in problems if text]
+        parts.append(f"{where}: " + (", ".join(problems) if problems else "draws without script errors"))
+    return f" Nexus opened {preview['page']} in a browser ({'; '.join(parts)}); screenshots are in .harness/previews."
+
+
 def _run_facilitator_verification(config, root, project, progress=None, *, deadline=None,
                                   verification_session_id=""):
     """Report executed checks under saved access, without private-copy policy."""
@@ -539,8 +582,10 @@ def _run_facilitator_verification(config, root, project, progress=None, *, deadl
     authority_config, authority_root = verification_authority(config, root, project)
     commands, source = work._verification_commands(config, root, project)
     if not commands:
+        preview = page_preview(root, deadline)
         return outcome("not_configured", "no_selected_checks",
-                       "No configured or discoverable checks were found; no tests ran.")
+                       "No configured or discoverable checks were found; no tests ran." + _page_preview_words(preview),
+                       **({"page_preview": preview} if preview else {}))
     digest = work._command_approval_digest(root, commands,
         declared_path=str(project.get("path") or ""), authority_root=authority_root)
     access = command_gate(project, commands, digest, source)
@@ -680,14 +725,17 @@ def run_configured_goal_verification(
                 runtime_requested=True, tests_requested=True,
                 file_count=len(manifest), **no_change,
             )
+        preview = page_preview(root, deadline)
         return outcome(
             "not_configured", "no_selected_checks",
             "No deterministic project checks are configured or discoverable; no tests ran. "
             "Tests were not explicitly requested, so test evidence is optional: complete the work on the "
             "agents' own inspected evidence and report accurately that no tests ran."
-            + (" No file changes were recorded; a reasoned no-change conclusion is a valid result." if no_change else ""),
+            + (" No file changes were recorded; a reasoned no-change conclusion is a valid result." if no_change else "")
+            + _page_preview_words(preview),
             current_tree_merkle=merkle, file_count=len(manifest),
             runtime_paths=source_paths[:100], tests_requested=False, **no_change,
+            **({"page_preview": preview} if preview else {}),
         )
     from .goal_access import command_gate
     access = command_gate(project, commands, work._command_approval_digest(

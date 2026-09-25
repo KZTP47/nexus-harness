@@ -7,6 +7,7 @@ to do about the ones that are not.
 
 from __future__ import annotations
 
+import concurrent.futures
 import os
 import ssl
 import threading
@@ -18,6 +19,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from .config import LoadedConfig
+from .local_probe import loopback_refuses
 
 READY = "ready"
 INSTALLED = "installed"
@@ -78,6 +80,8 @@ class ProviderOption:
 
 
 def _reachable(url: str, timeout: float = PROBE_TIMEOUT_SECONDS) -> bool:
+    if loopback_refuses(url):
+        return False
     try:
         with urllib.request.urlopen(url, timeout=timeout) as answer:
             return 200 <= int(answer.status) < 500
@@ -294,12 +298,15 @@ def provider_options(config: LoadedConfig) -> list[ProviderOption]:
     """Every way of connecting a model, with the ready ones first."""
 
     chosen = str(config.get("provider.name") or "")
+    # Each local probe waits on its own CLI or service; ask them all at once.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+        probed = [pool.submit(_ollama, config, in_use=chosen == "ollama")] + [
+            pool.submit(_signed_in_tool, kind, config, in_use=chosen == kind)
+            for kind in ("claude-cli", "copilot-cli", "gemini-cli", "codex-cli")
+        ]
+        local = [answer.result() for answer in probed]
     options = [
-        _ollama(config, in_use=chosen == "ollama"),
-        _signed_in_tool("claude-cli", config, in_use=chosen == "claude-cli"),
-        _signed_in_tool("copilot-cli", config, in_use=chosen == "copilot-cli"),
-        _signed_in_tool("gemini-cli", config, in_use=chosen == "gemini-cli"),
-        _signed_in_tool("codex-cli", config, in_use=chosen == "codex-cli"),
+        *local,
         _hosted("anthropic", "Anthropic", "ANTHROPIC_API_KEY", "console.anthropic.com", chosen == "anthropic"),
         _hosted("openai", "OpenAI", "OPENAI_API_KEY", "platform.openai.com", chosen == "openai"),
         _hosted("gemini", "Google Gemini API", "GEMINI_API_KEY", "aistudio.google.com", chosen == "gemini"),

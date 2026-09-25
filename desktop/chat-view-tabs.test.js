@@ -94,17 +94,27 @@ test('chat tabs isolate settings, bind facilitator choices, retain drafts and ex
     await page.keyboard.press('Home');
     assert.equal(await chat.getAttribute('aria-selected'),'true');
     await page.evaluate(()=>{context.goal={goal_id:'saved-goal',execution_workspace:{path:'private'},revision:19,status:'paused',agent_access:{mode:'ask'},pending_interrupts:[{id:'answer'}]};render();});
-    assert.equal(await page.locator('#theBigChatSettingsNeeded').isVisible(),true);
+    // Questions are answered where the user types: the panel moves into CHAT.
+    assert.equal(await page.locator('#theBigChatChatNeeded').isVisible(),true);
+    assert.equal(await page.locator('#theBigChatSettingsNeeded').isVisible(),false);
+    assert.equal(await page.locator('#theBigChatChatPanel #theBigChatTeamGoal').count(),1);
     assert.equal(await chat.getAttribute('aria-selected'),'true','Incoming input must not steal the chat');
     await settings.click();
     assert.match(await page.locator('#theBigChatWorkMode').innerText(),/saved goal uses private working copies/);
     assert.equal(await page.getByRole('button',{name:'Switch to facilitator mode',exact:true}).count(),0);
     await page.evaluate(()=>{context.goal.resume_recovery={items:[{kind:'provider'}],resume_safe:false,message:'Inspect interrupted work'};render();setBigChatTab('chat');document.getElementById('theBigChatStop').disabled=false;});
     await page.locator('#theBigChatStop').click();
-    assert.equal(await settings.getAttribute('aria-selected'),'true','Resume must reveal required recovery controls');
+    assert.equal(await chat.getAttribute('aria-selected'),'true','Resume must reveal required recovery controls in CHAT');
+    assert.equal(await page.locator('#theBigChatChatPanel #theBigChatTeamGoal').count(),1);
+    // A recovery that waits for the worker to stop has nothing to press yet.
+    await page.evaluate(()=>{context.goal.pending_interrupts=[];context.goal.resume_recovery.needs_user=false;render();});
+    assert.equal(await page.locator('#theBigChatChatNeeded').isVisible(),false);
+    assert.equal(await page.locator('#theBigChatSettingsPanel #theBigChatTeamGoal').count(),1);
+    await page.evaluate(()=>{context.goal.pending_interrupts=[{id:'answer'}];render();});
     assert.equal(await page.evaluate(()=>calls.length),0,'Unsafe Resume must not dispatch work');
     await page.evaluate(()=>delete context.goal.resume_recovery);
     await page.evaluate(()=>{context.goal.pending_interrupts=[];context.goal.revision++;render();});
+    await settings.click();
     await page.getByRole('button',{name:'Switch to facilitator mode',exact:true}).click();
     assert.deepEqual(await page.evaluate(()=>calls[0].body),{goal_id:'saved-goal',chat_id:'first-chat',project_id:'project-a',participant_ids:['a','b'],action:'resume',payload:{facilitator_mode:true,expected_revision:20}});
     assert.match(await page.locator('#theBigChatWorkMode').innerText(),/On.*Working in the selected project/);

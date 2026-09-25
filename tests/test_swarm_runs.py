@@ -1460,7 +1460,8 @@ class SwarmRunStoreTests(unittest.TestCase):
                 self.assertEqual(after.projects, initial.projects)
                 self.assertEqual(after.works_on, initial.works_on)
                 self.assertEqual(after.talks_to, initial.talks_to)
-                self.assertEqual(after.active_saved_board, "")
+                # Save As names the live board; nothing else is opened.
+                self.assertEqual(after.active_saved_board, "During run")
                 self.assertEqual(
                     {one["name"] for one in swarm.every_kept_board()},
                     {"During run", "Imported during run"},

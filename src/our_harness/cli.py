@@ -54,7 +54,7 @@ from .resident import ResidentClient, start_daemon
 PROVIDER_DEFAULTS = {
     "ollama": ("qwen2.5-coder:7b", "http://127.0.0.1:11434", ""),
     "openai": ("gpt-5", "https://api.openai.com/v1", "OPENAI_API_KEY"),
-    "anthropic": ("claude-sonnet-4-5", "https://api.anthropic.com/v1", "ANTHROPIC_API_KEY"),
+    "anthropic": ("claude-opus-5", "https://api.anthropic.com/v1", "ANTHROPIC_API_KEY"),
     "openai-compatible": ("local-model", "http://127.0.0.1:8000/v1", ""),
     "local": ("local-model", "", ""),
 }

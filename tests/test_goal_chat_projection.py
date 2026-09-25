@@ -533,5 +533,64 @@ assert.equal(limitsForSwarmChat('b').input_characters, 200000);
             self.assertEqual([one.text for one in self.speech()], words)
 
 
+class ProjectionReceiptTests(unittest.TestCase):
+    """Listing goals must not replay unchanged goal history into chats."""
+
+    message = GoalChatProjectionTests.message
+    page = GoalChatProjectionTests.page
+    server = GoalChatProjectionTests.server
+    speech = GoalChatProjectionTests.speech
+
+    def setUp(self):
+        runtime = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, runtime, True)
+        patched = mock.patch.dict("os.environ", {"OUR_HARNESS_SWARM_RUN_DIR": str(runtime)})
+        patched.start()
+        self.addCleanup(patched.stop)
+        self.runtime = runtime
+        GoalChatProjectionTests.setUp(self)
+        self.messages = [self.message(1), self.message(2)]
+        self.state = self.server(lambda *args, **kwargs: self.page(self.messages))
+
+    def replay(self, goal=None):
+        with mock.patch.object(goal_chat_projection, "keep_page", wraps=goal_chat_projection.keep_page) as kept:
+            HarnessHTTPServer.project_long_horizon_chat_statuses(self.state, [goal or self.goal])
+        return kept.call_count
+
+    def test_an_unchanged_goal_and_chat_are_not_replayed_again(self):
+        self.assertEqual(self.replay(), 1)
+        self.assertEqual(self.replay(), 0)
+        # A restarted process reads the same durable receipt.
+        self.state.config = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), self.root, [], {})
+        self.assertEqual(self.replay(), 0)
+        self.assertEqual([one.text for one in self.speech()], ["Public message 1", "Public message 2"])
+
+    def test_a_changed_goal_replays_and_brings_its_new_speech(self):
+        self.replay()
+        self.messages.append(self.message(3))
+        later = {**self.goal, "revision": 11, "event_seq": 5001, "dialogue": {"sequence": 206}}
+        self.assertEqual(self.replay(later), 1)
+        self.assertIn("Public message 3", [one.text for one in self.speech()])
+
+    def test_a_changed_transcript_or_lost_receipt_replays(self):
+        self.replay()
+        chat.keep_long_horizon_prompt(
+            self.config, "route-blue", "Another request", filed_as=self.filed_as,
+            request_id="request-b", chat_id="chat-a", project_id="project-a", lead_id="builder",
+            intent_sha256=chat.long_horizon_intent_sha256("chat-a", "project-a", "builder", "Another request", []),
+        )
+        self.assertEqual(self.replay(), 1)
+        self.assertEqual(self.replay(), 0)
+        for receipt in (self.runtime / "goal-projection-receipts").glob("*.json"):
+            receipt.write_text("{damaged", encoding="utf-8")
+        self.assertEqual(self.replay(), 1)
+        self.assertEqual(sum(one.text == "Public message 1" for one in self.speech()), 1)
+
+    def test_a_receipt_from_other_engine_code_is_ignored(self):
+        self.replay()
+        with mock.patch.object(goal_chat_projection, "_ENGINE", "different-code"):
+            self.assertEqual(self.replay(), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -111,6 +111,12 @@ TOOL_DEFINITIONS = [
     definition("list_mcp_resources", "List one page of resources from a configured MCP server.", {"server": TEXT, "cursor": TEXT}, ["server"]),
     definition("list_mcp_resource_templates", "List one page of resource templates from a configured MCP server.", {"server": TEXT, "cursor": TEXT}, ["server"]),
     definition("read_mcp_resource", "Read a URI supplied by a configured MCP server. The server remains the resource authority.", {"server": TEXT, "uri": TEXT}, ["server", "uri"]),
+    definition("preview_web_page", "Open a project HTML page the way the user will and report what they would see: "
+               "once straight from disk (file://, like double-clicking index.html) and once from a local server. "
+               "Returns script errors, files that failed to load, whether the page (and its main canvas) looks blank, "
+               "plain advice, and screenshots under .harness/previews to open with your image-reading tool. "
+               "Use it to check a web page or game before calling a step done.",
+               {"page": PATH, "wait_ms": {"type": "integer", "minimum": 0, "maximum": 20000}}),
     definition("web_search", "Search public web pages and return source links. No account required; service blocks or empty results are reported honestly.",
                {"query": TEXT, "max_results": LIMIT}, ["query"]),
 ]
@@ -289,6 +295,11 @@ print(json.dumps({'matches':matches[:a['maximum']], 'truncated':len(matches)>a['
             return self._language_server(args)
         if name.startswith(("list_mcp_", "read_mcp_")):
             return self._mcp(name, args)
+        if name == "preview_web_page":
+            from . import web_preview
+            timeout = self.session.deadline.remaining_seconds("before web page preview", web_preview.RUN_SECONDS)
+            return web_preview.preview(self.root, args.get("page") or "index.html",
+                                       wait_ms=args.get("wait_ms", web_preview.DEFAULT_WAIT_MS), timeout=timeout)
         if name == "web_search":
             from .search_results import usable
             try:

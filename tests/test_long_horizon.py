@@ -6740,6 +6740,99 @@ class LongHorizonTests(unittest.TestCase):
         self.assertEqual(kinds.count("context_step_acknowledged"), 2)
         self.assertEqual(kinds.count("context_tool_result"), 2)
 
+    def _refusal_run(self, replies):
+        """Run one task whose provider replies (or raises) in order; return what it saw."""
+
+        runtime = long_horizon.LongHorizonRuntime(self.config)
+        self.addCleanup(runtime.close)
+        goal = runtime.store.create(self.board, "project", ["Read the game file"], "refusal")
+        task = runtime.store.claim_ready(goal["goal_id"], "worker")[0]
+        fake_tools = mock.Mock()
+        # The looping call's argument, echoed back in the tool's error.
+        fake_tools.execute.side_effect = [
+            {"content": '{"error":"Path does not exist: unicorn.html Oops no. I must output valid JSON"}'},
+            {"matches": [{"path": "unicorn.html", "line": 1}]},
+        ]
+        contexts = []
+
+        def ask(*_args, **kwargs):
+            contexts.append(kwargs["context"])
+            kwargs["before_provider_dispatch"]("initial")
+            reply = replies.pop(0)
+            if isinstance(reply, Exception):
+                raise reply
+            return {"text": json.dumps(reply)}
+        with mock.patch.object(long_horizon.swarm_work, "CollaborationLedger") as ledger_class, \
+                mock.patch.object(long_horizon.swarm_work, "_ProjectContextTools", return_value=fake_tools), \
+                mock.patch.object(long_horizon.chat_lab, "ask_once", side_effect=ask):
+            ledger_class.return_value.begin.return_value = mock.Mock(session_id="tools-session")
+            _task, returned = runtime._execute_one(goal["goal_id"], task["id"])
+        held = runtime.store.get(goal["goal_id"])
+        events = runtime.store.events(goal["goal_id"])["events"]
+        return returned, contexts, next(one for one in held["tasks"] if one["id"] == task["id"]), events
+
+    REFUSED = HarnessError(
+        "codex was asked and did not answer: Codex CLI exited 1: Invalid prompt: your prompt was flagged as "
+        "potentially violating our usage policy. Please try again with a different prompt: "
+        "https://platform.openai.com/docs/guides/reasoning#advice-on-prompting")
+
+    def test_a_refused_prompt_is_asked_again_without_the_failed_tool_history(self):
+        returned, contexts, task, events = self._refusal_run([
+            action("work", tool_calls=[{"call_id": "bad", "name": "search_workspace",
+                                        "arguments": {"query": "x", "max_results": 1}}]),
+            action("work", tool_calls=[{"call_id": "good", "name": "search_workspace",
+                                        "arguments": {"query": "y", "max_results": 1}}]),
+            self.REFUSED,
+            action("complete"),
+        ])
+        self.assertEqual(returned["action"], "complete")
+        self.assertIn("Oops no", contexts[2])  # What the refused prompt carried.
+        self.assertNotIn("Oops no", contexts[3])
+        self.assertIn('"line":1', contexts[3].replace(" ", ""))  # Successful results stay.
+        self.assertIn("PROVIDER REFUSAL RECOVERY", contexts[3])
+        refused = [one for one in events if one["type"] == "provider_prompt_refused"]
+        self.assertEqual([one["payload"]["attempt"] for one in refused], [1])
+        self.assertEqual(task["prompt_refusal"]["attempts"], 1)
+        self.assertEqual(task["prompt_refusal"]["trimmed_steps"], 2)
+        from our_harness import goal_chat_progress
+        text, outcome = goal_chat_progress.milestone(refused[0], "GPT Codex")
+        self.assertEqual(outcome, "retrying")
+        self.assertIn("not a sign-in or connection problem", text)
+
+    def test_repeated_refusals_stop_after_the_bounded_retries(self):
+        returned, contexts, task, events = self._refusal_run([
+            action("work", tool_calls=[{"call_id": "good", "name": "search_workspace",
+                                        "arguments": {"query": "y", "max_results": 1}}]),
+            self.REFUSED, self.REFUSED, self.REFUSED,
+        ])
+        self.assertEqual(returned["action"], "failed")
+        self.assertEqual(len(contexts), 4)
+        self.assertNotIn("CONTEXT TOOL RESULTS", contexts[3])  # Second retry drops every result.
+        self.assertEqual(task["prompt_refusal"]["attempts"], 2)
+        self.assertEqual(sum(one["type"] == "provider_prompt_refused" for one in events), 2)
+
+    def test_other_provider_failures_are_not_retried_as_refusals(self):
+        returned, contexts, task, events = self._refusal_run([
+            HarnessError("codex was asked and did not answer: Codex CLI exited 1: stream disconnected"),
+        ])
+        self.assertEqual(returned["action"], "failed")
+        self.assertEqual(len(contexts), 1)
+        self.assertNotIn("prompt_refusal", task)
+        self.assertFalse(any(one["type"] == "provider_prompt_refused" for one in events))
+
+    def test_failed_tool_results_are_recognised_in_both_shapes(self):
+        steps = [{"state": "complete", "context_binding": "b", "results": [
+            {"call_id": "bad", "name": "extract_archive", "result": {"content": '{"error":"Oops no"}'}},
+            {"call_id": "good", "name": "search_workspace", "result": {"matches": []}}]}]
+        failed = [one for one in steps[0]["results"] if long_horizon._failed_tool_result(one)]
+        self.assertEqual([one["call_id"] for one in failed], ["bad"])
+        kept = long_horizon._after_prompt_refusal(
+            [{"call_id": one["call_id"], "name": one["name"], "result": one["result"]} for one in steps[0]["results"]], 1)
+        self.assertEqual([one["call_id"] for one in kept], ["good"])
+        self.assertEqual(long_horizon._after_prompt_refusal(kept, 2), [])
+        self.assertTrue(long_horizon._failed_tool_result({"error": "boom"}))
+        self.assertFalse(long_horizon._failed_tool_result({"result": {"content": "plain text"}}))
+
     def test_zip_attachment_is_read_by_real_goal_tools_after_restart(self):
         from test_research_tools import make_zip
         raw = make_zip({"bundle/SKILL.md": "Use resources/reference.md for the tracker requirements.",
