@@ -58,6 +58,38 @@ _dispatch_version_cache: dict[tuple[object, ...], dict[str, Any]] = {}
 # still be stable; after this long the program is asked again.
 _UNSETTLED_VERSION_SECONDS = 300.0
 _dispatch_version_unsettled: dict[tuple[object, ...], tuple[float, dict[str, Any]]] = {}
+# Settled observations are also kept on this machine between runs, bound to
+# the exact program (see version_memory), so an unchanged CLI is not started on
+# every app start just to be asked its version again.
+_DISPATCH_VERSIONS_FILE = "dispatch-versions.json"
+_dispatch_versions_loaded = False
+
+
+def _load_dispatch_versions() -> None:
+    """Caller holds _dispatch_version_lock. Seed the cache once per process."""
+
+    global _dispatch_versions_loaded
+    if _dispatch_versions_loaded:
+        return
+    _dispatch_versions_loaded = True
+    from . import version_memory
+
+    for key, version in version_memory.load(_DISPATCH_VERSIONS_FILE):
+        try:
+            path, device, file_id, size, modified, command, contract = key
+            signature = (str(path), int(device), int(file_id), int(size), int(modified),
+                         tuple(str(one) for one in command), str(contract))
+        except (TypeError, ValueError):
+            continue
+        if isinstance(version, dict):
+            _dispatch_version_cache.setdefault(signature, version)
+
+
+def _keep_dispatch_version(signature: tuple[object, ...], version: dict[str, Any]) -> None:
+    from . import version_memory
+
+    key = [*signature[:5], list(signature[5]), signature[6]]
+    version_memory.remember(_DISPATCH_VERSIONS_FILE, key, str(signature[0]), version)
 
 
 def _strict_output_schema(schema: dict[str, Any]) -> dict[str, Any]:
@@ -353,6 +385,7 @@ class Provider(ABC):
                             int(observed.st_mtime_ns), tuple(command), contract,
                         )
                         with _dispatch_version_lock:
+                            _load_dispatch_versions()
                             version = copy.deepcopy(
                                 _dispatch_version_cache.get(signature)
                             )
@@ -384,6 +417,7 @@ class Provider(ABC):
                                         version
                                     )
                                     _dispatch_version_unsettled.pop(signature, None)
+                                    _keep_dispatch_version(signature, version)
                                 else:
                                     if len(_dispatch_version_unsettled) >= 128:
                                         _dispatch_version_unsettled.pop(

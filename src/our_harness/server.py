@@ -23,7 +23,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import files
 from pathlib import Path
-from typing import Any, Iterator, TYPE_CHECKING
+from typing import Any, Callable, Iterator, TYPE_CHECKING
 
 from . import bundle
 from . import cancellation
@@ -631,7 +631,7 @@ class HarnessHTTPServer(ThreadingHTTPServer):
                     self._long_horizon = None
                     self._long_horizon_recovering = old_long_horizon
                 old_long_horizon.close()
-            with self.authority_lock:
+            with self._store_builds_settled(), self.authority_lock:
                 # An automatic start may have won the first live-worker check.
                 # close stops new starts, but a blocked provider may still be
                 # draining. Its config/checkpointer must remain owned until done.
@@ -642,6 +642,7 @@ class HarnessHTTPServer(ThreadingHTTPServer):
                     )
                 self._long_horizon_recovering = None
                 if reset_project_state:
+                    self._reset_stores_epoch()
                     self._pipeline_store = None
                     self._swarm_runs = None
                     self._swarm_communication_runs = None
@@ -677,34 +678,80 @@ class HarnessHTTPServer(ThreadingHTTPServer):
                 self._swarm_known_routes_revision = 0
         return config
 
+    def _lazy_store(self, attribute: str, build: Callable[[LoadedConfig], Any]) -> Any:
+        """Open one cached store without holding ``authority_lock`` while it opens.
+
+        Opening a run store verifies every saved run's integrity, which takes
+        seconds on a long-used install. Doing that under ``authority_lock``
+        made every other request that merely reads the config - including the
+        chat list a user just opened - wait for it. Each store still opens
+        once; a settings or authority reset during the open is detected by the
+        store epoch and the store is opened again for the current state.
+        """
+
+        locks = self.__dict__.setdefault("_store_build_locks", {})
+        lock = locks.setdefault(attribute, threading.Lock())
+        while True:
+            with self.authority_lock:
+                held = getattr(self, attribute)
+                if held is not None:
+                    return held
+            with lock:
+                with self.authority_lock:
+                    held = getattr(self, attribute)
+                    if held is not None:
+                        return held
+                    config = self.config
+                    epoch = getattr(self, "_store_epoch", 0)
+                built = build(config)
+                with self.authority_lock:
+                    if getattr(self, "_store_epoch", 0) == epoch and self.config is config:
+                        if getattr(self, attribute) is None:
+                            setattr(self, attribute, built)
+                        return getattr(self, attribute)
+
+    def _reset_stores_epoch(self) -> None:
+        """Caller holds ``authority_lock``; stores opened before this are stale."""
+
+        self._store_epoch = getattr(self, "_store_epoch", 0) + 1
+
+    _LAZY_STORES = ("_pipeline_store", "_swarm_communication_runs", "_swarm_goal_queue", "_swarm_runs")
+
+    @contextmanager
+    def _store_builds_settled(self) -> Iterator[None]:
+        """Wait for every store that is opening, and hold new opens off.
+
+        A project move or authority repair must not overtake a store that is
+        still opening for the old project: that store is handed to the caller
+        who asked for it, and only then is the cache cleared. Take this before
+        ``authority_lock``, the same order every store open uses.
+        """
+
+        locks = self.__dict__.setdefault("_store_build_locks", {})
+        held = [locks.setdefault(name, threading.Lock()) for name in self._LAZY_STORES]
+        for lock in held:
+            lock.acquire()
+        try:
+            yield
+        finally:
+            for lock in reversed(held):
+                lock.release()
+
     @property
     def pipeline_store(self) -> pipeline_runtime.PipelineRunStore:
-        with self.authority_lock:
-            held = self._pipeline_store
-            if held is None:
-                held = pipeline_runtime.PipelineRunStore(self.config)
-                self._pipeline_store = held
-            return held
+        return self._lazy_store("_pipeline_store", pipeline_runtime.PipelineRunStore)
 
     @property
     def swarm_runs(self) -> swarm_runs.SwarmRunStore:
-        with self.authority_lock:
-            held = self._swarm_runs
-            if held is None:
-                held = swarm_runs.SwarmRunStore(self.config)
-                self._swarm_runs = held
-            return held
+        return self._lazy_store("_swarm_runs", swarm_runs.SwarmRunStore)
 
     @property
     def swarm_communication_runs(self) -> swarm_runs.SwarmRunStore:
         """Durable provider/chat effects that carry no project-work authority."""
 
-        with self.authority_lock:
-            held = self._swarm_communication_runs
-            if held is None:
-                held = swarm_runs.SwarmRunStore.for_communication(self.config)
-                self._swarm_communication_runs = held
-            return held
+        return self._lazy_store(
+            "_swarm_communication_runs", swarm_runs.SwarmRunStore.for_communication,
+        )
 
     def find_swarm_run(
         self, identity: str,
@@ -776,26 +823,23 @@ class HarnessHTTPServer(ThreadingHTTPServer):
 
     @property
     def swarm_runner(self) -> swarm_lab.Running:
-        with self.authority_lock:
-            held = self._swarm_runner
-            if held is None:
-                # Avoid recursively taking authority_lock via the property.
-                store = self._swarm_runs
-                if store is None:
-                    store = swarm_runs.SwarmRunStore(self.config)
-                    self._swarm_runs = store
-                held = swarm_lab.Running(store)
-                self._swarm_runner = held
-            return held
+        while True:
+            with self.authority_lock:
+                held = self._swarm_runner
+                if held is not None:
+                    return held
+            # Opened outside authority_lock; see _lazy_store.
+            store = self.swarm_runs
+            with self.authority_lock:
+                if self._swarm_runner is not None:
+                    return self._swarm_runner
+                if self._swarm_runs is store:
+                    self._swarm_runner = swarm_lab.Running(store)
+                    return self._swarm_runner
 
     @property
     def swarm_goal_queue(self) -> swarm_goal_queue.SwarmGoalQueueStore:
-        with self.authority_lock:
-            held = self._swarm_goal_queue
-            if held is None:
-                held = swarm_goal_queue.SwarmGoalQueueStore(self.config)
-                self._swarm_goal_queue = held
-            return held
+        return self._lazy_store("_swarm_goal_queue", swarm_goal_queue.SwarmGoalQueueStore)
 
     @property
     def long_horizon(self) -> long_horizon.LongHorizonRuntime:
@@ -5235,13 +5279,14 @@ class HarnessHandler(BaseHTTPRequestHandler):
                         raise HarnessError(
                             "A board run is active; stop it before repairing authority."
                         )
-                    with self.server.authority_lock:
+                    with self.server._store_builds_settled(), self.server.authority_lock:
                         authority_id = pipeline_runtime.repair_project_authority(
                             self.server.config.project_root,
                             str(body.get("fingerprint") or ""),
                         )
                         # Discard only cached execution objects, and only after
                         # the descriptor and user-local registration both land.
+                        self.server._reset_stores_epoch()
                         self.server._pipeline_store = None
                         self.server._swarm_runs = None
                         self.server._swarm_runner = None
