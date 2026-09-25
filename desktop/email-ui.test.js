@@ -904,6 +904,33 @@ test('Changed mailbox fingerprint hides obsolete mail and clears its selection w
   } finally { await browser.close(); }
 });
 
+test('Manual preference cards name where each was learned, including after the user rewords it', {skip: !executablePath, timeout: 45000}, async () => {
+  const browser = await chromium.launch({executablePath, headless: true});
+  try {
+    const page = await browser.newPage(); await page.setContent('<main id="emailView"></main>');
+    await page.evaluate(() => {
+      // Shapes as the memory ledger stores them: a typed preference still carries its own ID as source_draft_id.
+      window.snapshot = {accounts:[{id:'a', name:'Primary', kind:'import'}], providers:[], messages:[], drafts:[], automatic_memories:[], memories:[
+        {id:'typed',account_id:'a',text:'Sign off with Best',revision:1,source_draft_id:'typed-source',source_revision:1,authority:'user',learned_authority:'user'},
+        {id:'reworded',account_id:'a',text:'Sign off with Kind regards',revision:2,source_draft_id:'reworded-source',source_revision:1,authority:'user',learned_authority:'user',user_edited:true},
+        {id:'learned',account_id:'a',text:'Keep replies concise',revision:1,source_draft_id:'draft7',source_revision:3,authority:'approved_edit',learned_authority:'approved_edit'},
+        {id:'learned-edited',account_id:'a',text:'Keep replies very concise',revision:2,source_draft_id:'draft8',source_revision:2,authority:'user',learned_authority:'approved_edit',user_edited:true},
+        {id:'older',account_id:'a',text:'Older record without origin fields',source_draft_id:'draft9',authority:'approved_edit'}
+      ]};
+      window.request = async () => structuredClone(window.snapshot);
+    });
+    await page.addScriptTag({content:source}); await page.evaluate(() => window.nexusEmail.refresh());
+    await page.locator('#emailAccount').selectOption('a');
+    const label = id => page.locator('#email-memory-' + id).locator('..').locator('small').textContent();
+    assert.match(await label('typed'), /^Added by you · Preference revision 1/);
+    assert.match(await label('reworded'), /^Added by you · Preference revision 2/);
+    assert.match(await label('learned'), /^From reviewed draft draft7, source revision 3/);
+    assert.match(await label('learned-edited'), /^From reviewed draft draft8, source revision 2 · Preference revision 2/);
+    assert.match(await label('older'), /^From reviewed draft draft9/);
+    assert.doesNotMatch(await page.locator('#emailMemories').textContent(), /typed-source|reworded-source/);
+  } finally { await browser.close(); }
+});
+
 test('Automatic learning tabs isolate recipients and mailboxes, preserve edits, and support saving and deletion', {skip: !executablePath, timeout: 45000}, async () => {
   const browser = await chromium.launch({executablePath, headless: true});
   try {
@@ -1041,6 +1068,16 @@ test('Automatic learning outcomes explain empty results per recipient and retry 
     assert.match(await grandma.textContent(), /Reusable preferences were learned/);
     assert.equal(await page.locator('#email-memory-automatic-g').inputValue(),'Use a warm tone');
     assert.ok((await page.evaluate(() => window.calls)).every(call => call.url.endsWith('/retry_automatic_learning')));
+    await page.evaluate(() => {
+      window.snapshot.automatic_memories = window.snapshot.automatic_memories.filter(m => m.id !== 'g');
+      Object.assign(window.snapshot.automatic_learning_outcomes[1], {status:'preferences_removed', retry_available:false});
+      window.snapshot.automatic_learning_outcomes[0].status = 'superseded';
+    });
+    await page.evaluate(() => window.nexusEmail.refresh());
+    assert.match(await grandma.textContent(), /You deleted what was learned from this request/);
+    assert.match(await grandma.textContent(), /A later request for this recipient replaced what was learned here/);
+    assert.doesNotMatch(await grandma.textContent(), /Reusable preferences were learned/);
+    assert.equal(await grandma.getByRole('button',{name:'Retry learning'}).count(), 1, 'Only the replaced attempt offers a retry');
   } finally {await browser.close();}
 });
 

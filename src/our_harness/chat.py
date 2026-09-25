@@ -28,6 +28,7 @@ Its boundaries, on purpose:
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import hmac
 import base64
@@ -40,6 +41,7 @@ import time
 import uuid
 from .filesystem_paths import filesystem_path
 from urllib.parse import urlsplit
+import contextvars
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -57,6 +59,7 @@ from .models import HarnessError, ProviderOutcomeUnknown, ProviderRequest, Provi
 from .providers import ProviderRegistry, create_provider
 from .providers.base import effective_dispatch_fingerprint
 from .providers.input_context import workspace_instructions
+from .prompt_refusal import prompt_was_refused
 from .redaction import CredentialRedactor, bounded_redacted_text
 from .safety import confined_path
 
@@ -266,6 +269,10 @@ CHAT_HISTORY_PROMPT_CHARACTERS = int(
     LONG_HORIZON_CONTEXT_POLICY["prompt_transcript_characters"]
 )
 LONGEST_WAIT_SECONDS = 600.0
+# An agent turn that edits and runs things in a project with its own tools can
+# legitimately take far longer than an answer; ten minutes cut strong models off
+# mid-work and paused the goal.
+NATIVE_WORK_WAIT_SECONDS = 3_600.0
 # Non-interactive CLI adapters use this as their minimum capture budget.  The
 # execution command limit is a different concern and used to truncate provider
 # answers even when the response schema explicitly allowed larger file sets.
@@ -365,6 +372,23 @@ HOW_TO_WORK_TOGETHER = (
     "action schema, with a clear summary and concrete results. Continue useful "
     "work until the user's goal is met, or explain the specific missing access "
     "or decision that prevents progress."
+)
+
+# For agents that work in the project with their own tools (Claude Code or
+# Codex with write access). The general wording above sent them to Nexus
+# tool_calls and whole-file changes first, and they never used their tools.
+HOW_TO_WORK_TOGETHER_NATIVE = (
+    "You are one of the user's agents working together on a shared project goal, working directly in "
+    "the project folder with your own tools. In this turn, read, search, edit, create and run files "
+    "yourself: saved edits are immediately visible to the user and teammates. Do real, substantial "
+    "work toward the user's goal in each turn, and respond to your teammate's real observations and the "
+    "user's latest steering. Look at what you build before saying it works: run it, and preview web pages "
+    "and browser games with the page preview command given below, then open its screenshots and fix what "
+    "you see. Your summary is shown verbatim as your chat message. Never invent another agent's reply or "
+    "claim a check ran without its result. Use Nexus tool_calls only for what your own tools cannot do "
+    "(teammates, the shared conversation, user decisions, Nexus checks) and return changes=[] for "
+    "files you already saved. End with the exact action schema. Continue useful work until the "
+    "user's goal is met, or explain the specific missing access or decision that prevents progress."
 )
 
 ATTACHMENT_GUIDANCE = (
@@ -928,7 +952,64 @@ def _where_the_noes_are(config: LoadedConfig) -> Path:
         config.project_root, WHERE_THE_NOES_LIVE, allow_missing=True, allow_control=True)
 
 
+# One operation (an HTTP request, a startup recovery pass) asks for the same
+# few routes' identities dozens of times: every saved goal and chat binding
+# re-resolves its agents' executables, which searches the disk for CLI builds
+# each time. Inside one such operation the answer cannot meaningfully change,
+# so it is worked out once. Outside a scope nothing is remembered.
+_ROUTE_CONTEXT_MEMO: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "nexus_route_context_memo", default=None,
+)
+
+
+@contextmanager
+def remembered_route_contexts():
+    """Remember route identities for the rest of this one operation."""
+
+    if _ROUTE_CONTEXT_MEMO.get() is not None:
+        yield
+        return
+    token = _ROUTE_CONTEXT_MEMO.set({})
+    try:
+        yield
+    finally:
+        _ROUTE_CONTEXT_MEMO.reset(token)
+
+
 def _route_failure_context(
+    config: LoadedConfig, route: str, *,
+    effective_dispatch_contract_override: str = "",
+    principal_dispatch_fingerprint_override: str = "",
+) -> tuple[str, dict[str, Any]]:
+    memo = _ROUTE_CONTEXT_MEMO.get()
+    named = str(route or "").strip()
+    if memo is None or named.startswith("web:"):
+        return _route_failure_context_now(
+            config, route,
+            effective_dispatch_contract_override=effective_dispatch_contract_override,
+            principal_dispatch_fingerprint_override=principal_dispatch_fingerprint_override,
+        )
+    try:
+        key = (id(config), named, effective_dispatch_contract_override,
+               principal_dispatch_fingerprint_override,
+               json.dumps([config.get("providers"), config.get("provider")],
+                          sort_keys=True, default=str))
+    except (TypeError, ValueError):
+        key = None
+    if key is not None and key in memo:
+        kind, context = memo[key]
+        return kind, copy.deepcopy(context)
+    kind, context = _route_failure_context_now(
+        config, route,
+        effective_dispatch_contract_override=effective_dispatch_contract_override,
+        principal_dispatch_fingerprint_override=principal_dispatch_fingerprint_override,
+    )
+    if key is not None:
+        memo[key] = (kind, copy.deepcopy(context))
+    return kind, context
+
+
+def _route_failure_context_now(
     config: LoadedConfig, route: str, *,
     effective_dispatch_contract_override: str = "",
     principal_dispatch_fingerprint_override: str = "",
@@ -1471,6 +1552,12 @@ def what_would_not_answer(config: LoadedConfig) -> dict[str, dict[str, Any]]:
                 cleaned.pop(route, None)
                 changed = True
                 continue
+            if prompt_was_refused(one["why"]):
+                # Saved by earlier builds: one refused prompt said nothing about
+                # the connection, so it must not keep the agent marked broken.
+                cleaned.pop(route, None)
+                changed = True
+                continue
             safe_why = bounded_redacted_text(
                 redactor, _without_personal_account_details(one["why"]), 65_536
             )
@@ -1539,6 +1626,11 @@ def _write_down_that_it_would_not(config: LoadedConfig, route: str, why: str) ->
     turn a working chat into a broken one over a note.
     """
 
+    if why and prompt_was_refused(why):
+        # The provider answered and refused this one prompt under its usage
+        # policy. The sign-in and route are fine, so this is not a connection
+        # failure, and the note from the last real outcome stays as it was.
+        return
     try:
         # One at a time, and inside the guard. Working out where the file goes
         # can throw as easily as writing it, and neither is worth turning
@@ -1803,6 +1895,9 @@ DIRECT_LONG_HORIZON_GOAL_ID_CHARACTERS = 160
 
 
 _CORRELATION_TEXT_LIMITS = {
+    "nexus_check_verdict": 1_200,
+    "nexus_check_page": 300,
+    "nexus_check_screenshot": 1_000,
     "event_id": 64,
     "kind": 80,
     "request_id": DIRECT_LONG_HORIZON_REQUEST_ID_CHARACTERS,
@@ -2686,6 +2781,9 @@ def _complete_with_one_schema_repair(
         messages=[*request.messages, {"role": "assistant", "content": rejected_excerpt},
                   {"role": "user", "content": correction}],
         prefer_existing_conversation=False,
+        # A format-only correction must not act again: with native tools on, the
+        # repair run could repeat the edits and commands of the turn it fixes.
+        native_execution="",
     ), "schema_repair")
     second_failure = _contract_failure(repaired.text, request.response_format)
     if second_failure:
@@ -2722,6 +2820,8 @@ def say(
     recipients: list[dict[str, Any]] | None = None,
     conversation_key: str = "",
     prefer_existing_conversation: bool = True,
+    model: str = "",
+    usage_session: str = "",
 ) -> dict[str, Any]:
     """Say one thing to one of them, and keep what comes back.
 
@@ -2759,9 +2859,10 @@ def say(
             ))
         ) from exc
 
+    # A board agent's own model choice wins over its route's default.
     model = (
         f"{(web_chats.active().route(named) or {}).get('provider', 'web')} web chat"
-        if named.startswith("web:") else str(routed.get("provider.model") or "")
+        if named.startswith("web:") else str(model or routed.get("provider.model") or "")
     )
     # From here to the write is one piece of work: read what was said, add to
     # it, write it back. Two of those at once each write what the other did not
@@ -2797,6 +2898,7 @@ def say(
             prefer_existing_conversation=prefer_existing_conversation,
             max_output_tokens=int(routed.get("provider.max_output_tokens") or 65_536),
             reasoning_effort=str(routed.get("provider.reasoning_effort") or "") or None,
+            usage_session=usage_session,
         )
 
 
@@ -2874,6 +2976,7 @@ def _ask_and_keep(
     prefer_existing_conversation=False,
     max_output_tokens=65_536,
     reasoning_effort=None,
+    usage_session="",
 ) -> dict[str, Any]:
     so_far = read_it(config, route, filed_as)
     eligible = [
@@ -2907,6 +3010,7 @@ def _ask_and_keep(
             conversation_key or _filed_under(filed_as or route)
         ),
         prefer_existing_conversation=bool(prefer_existing_conversation),
+        on_public_activity=_ambient_activity(route),
     )
     started = time.monotonic()
     try:
@@ -2956,6 +3060,8 @@ def _ask_and_keep(
                 f"{_in_plain_words(exc)}"
             ))
         ) from exc
+    from . import session_usage
+    session_usage.record(usage_session, route=named, model=model, response=answered)
     raw_back = _checked_answer(
         redactor.text(str(getattr(answered, "text", "") or "")),
         named or "The assistant",
@@ -3012,6 +3118,35 @@ def _ask_and_keep(
     }
 
 
+# Live public activity for whatever request this thread (or a worker it
+# started through cancellation.submit, which copies the context) is serving.
+# A board chat sets it once; every provider call made while answering that
+# chat then streams its allow-listed thinking summaries, tool calls, edits and
+# interim messages to the chat, without each engine passing a sink along.
+_AMBIENT_ACTIVITY: contextvars.ContextVar[Callable[[dict[str, Any]], None] | None] = (
+    contextvars.ContextVar("nexus_ambient_public_activity", default=None)
+)
+
+
+@contextmanager
+def streaming_public_activity(sink: Callable[[dict[str, Any]], None] | None):
+    token = _AMBIENT_ACTIVITY.set(sink)
+    try:
+        yield
+    finally:
+        _AMBIENT_ACTIVITY.reset(token)
+
+
+def _ambient_activity(route: str) -> Callable[[dict[str, Any]], None] | None:
+    sink = _AMBIENT_ACTIVITY.get()
+    if sink is None:
+        return None
+
+    def forward(event: dict[str, Any]) -> None:
+        sink({**event, "route": str(route or "")})
+    return forward
+
+
 def ask_once(
     config: LoadedConfig,
     route: str,
@@ -3027,6 +3162,8 @@ def ask_once(
     working_directory: str = "",
     workspace_context: ProviderWorkspaceContext | None = None,
     native_execution: str = "",
+    model: str = "",
+    usage_session: str = "",
     on_public_activity: Callable[[dict[str, Any]], None] | None = None,
     public_activity_factory: Callable[[], Callable[[dict[str, Any]], None]] | None = None,
     on_provider_wait: Callable[[dict[str, Any]], None] | None = None,
@@ -3039,6 +3176,8 @@ def ask_once(
     known_problem = _known_route_setup_problem(config, named)
     if known_problem:
         raise ChatError(known_problem)
+    if on_public_activity is None and public_activity_factory is None:
+        on_public_activity = _ambient_activity(named)
     try:
         if named.startswith("web:"):
             from . import web_chats
@@ -3059,7 +3198,8 @@ def ask_once(
             and response_format.name == "nexus_long_horizon_action_v1" else ""
         )
         request = ProviderRequest(
-            system_prefix=(HOW_TO_WORK_TOGETHER if response_format is not None
+            system_prefix=((HOW_TO_WORK_TOGETHER_NATIVE if actual_native == "work" else HOW_TO_WORK_TOGETHER)
+                           if response_format is not None
                            and response_format.name == "nexus_long_horizon_action_v1"
                            else HOW_TO_ANSWER)
                           + ("\n\n" + ATTACHMENT_GUIDANCE if provider_attachments else "")
@@ -3069,10 +3209,11 @@ def ask_once(
                              and "tool_calls" in response_format.schema.get("properties", {}) else ""),
             dynamic_context=str(context or ""),
             messages=[{"role": "user", "content": redactor.text(asked)}],
-            model=str(routed.get("provider.model") or ""),
+            # A board agent's own model choice wins over its route's default.
+            model=str(model or routed.get("provider.model") or ""),
             temperature=0.2,
             max_output_tokens=max(1, int(routed.get("provider.max_output_tokens") or 65_536)),
-            timeout_seconds=LONGEST_WAIT_SECONDS,
+            timeout_seconds=NATIVE_WORK_WAIT_SECONDS if actual_native == "work" else LONGEST_WAIT_SECONDS,
             reasoning_effort=str(routed.get("provider.reasoning_effort") or "") or None,
             response_format=response_format,
             attachments=list(provider_attachments or []),
@@ -3177,13 +3318,16 @@ def ask_once(
     # over just as strongly here; leaving it behind kept obsolete login/config
     # errors on the agent card after the provider had started answering again.
     _write_down_that_it_would_not(config, named, "")
+    from . import session_usage
+    session_usage.record(usage_session, route=named, model=str(model or routed.get("provider.model") or ""),
+                         response=response)
     return {
         "text": answer,
         "milliseconds": int((time.monotonic() - started) * 1000),
         "relay_timing": relay_timing.from_response(response),
         "model": (
             f"{(web_chats.active().route(named) or {}).get('provider', 'web')} web chat"
-            if named.startswith("web:") else str(routed.get("provider.model") or "")
+            if named.startswith("web:") else str(model or routed.get("provider.model") or "")
         ),
     }
 

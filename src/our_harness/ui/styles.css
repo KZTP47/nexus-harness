@@ -1976,6 +1976,7 @@ body.has-a-tray .app-shell { padding-bottom: 68px; }
   background: #0b202c;
 }
 .the-big-chat-transcript:has(#theBigChatTeamGoal[hidden]), #theBigChatChatPanel .the-big-chat-transcript { grid-template-rows: minmax(0, 1fr) auto; }
+#theBigChatChatPanel .the-big-chat-transcript:has(> #theBigChatTeamGoal:not([hidden])) { grid-template-rows: auto minmax(0, 1fr) auto; }
 .the-big-chat-said {
   list-style: none;
   margin: 0; padding: 16px;
@@ -2592,7 +2593,9 @@ button.compact { min-height: 32px; padding: 4px 8px; margin: 2px 0; }
 .chat-collaboration-direct { display: flex; align-items: start; gap: 0.5rem; }
 
 /* Conversation and collaboration occupy separate panes, including on small screens. */
-.the-big-chat .the-big-chat-main:has(> .chat-view-tabs) { grid-template-rows: auto minmax(0, 1fr); gap: 4px; }
+.the-big-chat .the-big-chat-main:has(> .chat-view-tabs), .the-big-chat .the-big-chat-main:has(> .chat-view-bar) { grid-template-rows: auto minmax(0, 1fr); gap: 4px; }
+.chat-view-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; min-width: 0; }
+.chat-view-bar > .chat-view-tabs { flex: 1 1 auto; }
 .chat-view-tabs { display: flex; flex-wrap: wrap; gap: 6px; border-bottom: 1px solid var(--line); padding-bottom: 6px; }
 .chat-view-tabs [role=tab] { border-radius: 8px 8px 0 0; padding: 4px 12px; }
 .chat-view-tabs [aria-selected=true] { background: #153e4d; border-color: var(--cyan, #52d5ea); color: #dcfaff; }
@@ -2628,3 +2631,30 @@ button.compact { min-height: 32px; padding: 4px 8px; margin: 2px 0; }
 @media (max-width: 520px) {
   #theBigChatChatPanel { grid-template-rows: minmax(100px, 1fr) 180px; }
 }
+
+/* App-wide sign-in health banner (session-health.js). Loud on purpose. */
+.nexus-session-banner { position: sticky; top: 0; z-index: 60; margin: 0 16px 12px; display: grid; gap: 8px; }
+.nexus-session-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; padding: 12px 16px; border-radius: 10px; border: 2px solid; font-size: 14px; }
+.nexus-session-problem { background: #3a1d0b; border-color: #ff9f43; color: #ffe8d2; box-shadow: 0 0 0 1px #0006, 0 6px 24px #ff9f4333; }
+.nexus-session-ok { background: #0d3322; border-color: #3ddc97; color: #d6ffea; }
+.nexus-session-text { flex: 1 1 320px; display: grid; gap: 4px; }
+.nexus-session-text small, .nexus-session-note { opacity: .85; white-space: pre-wrap; overflow-wrap: anywhere; }
+.nexus-session-text details summary { cursor: pointer; font-size: 12px; opacity: .8; }
+.nexus-session-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.nexus-session-setting { font-size: 12px; opacity: .85; padding: 0 4px; }
+.email-waiting { color: #ffd08a; }
+
+/* Live agent activity in the chat's working panel (showLiveActivityFeed). */
+.chat-activity-feed { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 4px; max-height: 220px; overflow-y: auto; }
+.chat-activity-feed[hidden] { display: none; }
+.chat-activity-line { display: flex; gap: 6px; align-items: baseline; font-size: 12.5px; line-height: 1.4; min-width: 0; opacity: .92; }
+.chat-activity-line:last-child { opacity: 1; font-weight: 500; }
+.chat-activity-icon { flex: 0 0 auto; width: 1.2em; text-align: center; }
+.chat-activity-who { flex: 0 0 auto; }
+.chat-activity-text { min-width: 0; overflow-wrap: anywhere; }
+.chat-activity-failed .chat-activity-text { color: #ff9b9b; }
+
+/* Nexus's check beside an agent's "done" claim (evidence, not a verdict). */
+.chat-nexus-check { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: center; margin-top: 6px; padding: 6px 10px; border: 1px solid #3ddc97; border-radius: 6px; background: #10301f; color: #d6ffea; font-size: .82rem; overflow-wrap: anywhere; }
+.chat-nexus-check.problem { border-color: #ffc65a; background: #302b20; color: #ffe4a3; }
+.chat-nexus-check strong { flex: 1 0 100%; }

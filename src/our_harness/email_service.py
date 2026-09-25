@@ -132,7 +132,42 @@ class EmailService:
 
         threading.Thread(target=run, name="nexus-email-job", daemon=True).start()
 
+    def _session_monitor(self):
+        from .session_health import SessionHealthMonitor
+        monitor = getattr(self.server, 'session_health', None)
+        return monitor if isinstance(monitor, SessionHealthMonitor) else None
+
+    def _sign_in_hold(self, route):
+        monitor = self._session_monitor()
+        try:
+            return monitor.blocked(route) if monitor is not None else None
+        except Exception:
+            return None
+
+    def provider_recovered(self, routes):
+        """An AI sign-in works again: retry the drafts that failed on it."""
+        wanted = set(routes)
+        try:
+            drafts = self.studio.snapshot()['drafts']
+        except Exception:
+            return
+        retried = 0
+        for draft in drafts:
+            if (draft['status'] == 'error' and not draft.get('approved_at')
+                    and draft.get('provider_route') in wanted and retried < 50):
+                try:
+                    self.dispatch('retry_draft', {'account_id': draft['account_id'], 'draft_id': draft['id']})
+                    retried += 1
+                except Exception:
+                    continue
+        # Queued drafts that were waiting start on the next maintenance pass.
+
     def _start_draft(self, draft):
+        if self._sign_in_hold(draft.get('provider_route', '')):
+            # Starting it would only fail; it stays queued and starts by itself
+            # once the sign-in works again.
+            return
+
         def work():
             try:
                 # Poll and recovery can hold the same stale queued snapshot.
@@ -197,6 +232,15 @@ class EmailService:
                                            or self._jobs.get('sync:' + a['id'], {}).get('state') == 'running'
                                            else max(0, round(self._poll_due.get(a['id'], now) - now, 2))),
                  **self._scan_timing.get(a['id'], {})} for a in result['accounts']]}
+        holds = {}
+        for draft in result['drafts']:
+            if draft['status'] == 'queued' and not draft.get('execution_id'):
+                held = self._sign_in_hold(draft.get('provider_route', ''))
+                if held:
+                    entry = holds.setdefault(held['key'], {'session': held['key'], 'label': held['label'],
+                                                           'reason': held.get('reason', ''), 'drafts': 0})
+                    entry['drafts'] += 1
+        result['sign_in_holds'] = list(holds.values())
         result['notifications'] = self.notification_settings()
         result['captured_at'] = datetime.now(timezone.utc).isoformat()
         self._start_poller()
@@ -270,7 +314,8 @@ class EmailService:
                    "account_save", "import", "create_draft", "retry_draft", "retry_learning", "retry_automatic_learning",
                    "emailengine_configure", "emailengine_accounts", "emailengine_connect", "emailengine_prepare", "emailengine_sign_in", "check_delivery",
                    "save_draft", "approve_draft", "confirm_browser_delivery", "discard_draft", "memory_save", "memory_delete",
-                   "notification_settings", "dismiss_failed_import"}
+                   "notification_settings", "dismiss_failed_import",
+                   "upload_attachment", "attachment_content", "draft_attach", "draft_detach", "load_attachments"}
         if action not in allowed:
             raise HarnessError("Unknown email action.")
         if action == 'notification_settings':
@@ -310,6 +355,10 @@ class EmailService:
             return result
         if action == 'local_disconnect':
             return self.studio.disconnect_local(payload.get('account_id'))
+        if action == 'load_attachments':
+            # Reopening the message in the mailbox page can take a minute.
+            self._background('attachments:' + str(payload.get('message_id', '')), lambda: self.studio.load_attachments(payload))
+            return {'started': True}
         if action == 'revise_draft':
             self._background('revise:' + str(payload.get('draft_id', '')), lambda: self.studio.revise_draft(payload))
             return {'started': True}
@@ -471,6 +520,10 @@ class EmailService:
         for account in accounts:
             key = account['id']
             interval = max(1, int(account.get('poll_seconds', 60)))
+            if account.get('session_state') == 'sign_in_required':
+                # Each check of a signed-out mailbox waits for a sign-in page;
+                # look again calmly until the user has signed in.
+                interval = max(interval, 90)
             settings = (interval, bool(account.get('poll_enabled')), account.get('connection_state'))
             with self._lock:
                 if self._poll_settings.get(key) != settings:
@@ -486,13 +539,53 @@ class EmailService:
                 self._poll_due[key] = time.monotonic() + interval
                 self._background('sync:' + key, lambda account_id=key: self._poll_account(account_id))
 
+    def _mailbox_session(self, account_id, failed):
+        """Tell the session monitor whether this mailbox's sign-in works."""
+        monitor = self._session_monitor()
+        if monitor is None:
+            return
+        key = 'mailbox:' + account_id
+        if not failed:
+            monitor.external_resolved(key)
+            return
+        try:
+            account = self.studio._get('account', account_id)
+        except Exception:
+            return
+        if account.get('session_state') != 'sign_in_required' and account.get('connection_state') != 'reconnect_required':
+            return
+        opener = None
+        if account.get('kind') in {'browser_outlook', 'browser_gmail'} and account.get('connector_id'):
+            def opener(kind=account['kind'], connector=account['connector_id']):
+                self.studio.local_mail.open(kind, connector, browser_mode='headed')
+                return {'opened': True, 'note': 'The mailbox sign-in window is open. Sign in there; Nexus reconnects by itself.'}
+
+        def checker(key=account_id):
+            with self._lock:
+                self._poll_due[key] = 0
+        label = (account.get('email') or 'Your') + ' mailbox'
+        monitor.external_incident(key, label, account.get('error') or 'The mailbox needs you to sign in again.',
+                                  opener=opener, checker=checker)
+
     def _poll_account(self, account_id):
         started = time.monotonic()
         with self._lock:
             self._scan_timing[account_id] = {**self._scan_timing.get(account_id, {}),
                 'last_started_at': datetime.now(timezone.utc).isoformat()}
         try:
-            return self._scan_account(account_id)
+            result = self._scan_account(account_id)
+        except Exception:
+            try:
+                self._mailbox_session(account_id, True)
+            except Exception:
+                pass
+            raise
+        else:
+            try:
+                self._mailbox_session(account_id, False)
+            except Exception:
+                pass
+            return result
         finally:
             with self._lock:
                 self._scan_timing[account_id].update(last_finished_at=datetime.now(timezone.utc).isoformat(),

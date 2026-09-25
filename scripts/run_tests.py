@@ -36,7 +36,9 @@ EIGHT_PART_ASSIGNMENTS = {"test_swarm_work": 3, "test_the_board_of_agents": 4}
 # These short additions fit in part 5 without moving any existing module.
 EIGHT_PART_ADDITIONS = {"test_full_access_tool_runtime": 5, "test_harness_tools": 5,
                         "test_goal_messages": 6, "test_agents_lead_policy": 6,
-                        "test_agent_support_limits": 8, "test_user_restrictions": 6}
+                        "test_agent_support_limits": 8, "test_user_restrictions": 6,
+                        "test_session_health": 8, "test_live_chat_activity": 8, "test_agent_runtime_v3": 5, "test_email_attachments": 7,
+                        "test_prompt_refusal": 6, "test_live_team_quality": 5}
 
 
 def every_test_file() -> list[str]:

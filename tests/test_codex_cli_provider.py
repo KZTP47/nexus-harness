@@ -100,6 +100,17 @@ if record:
         "catalog_mode": catalog_path.stat().st_mode & 0o777,
         "openai_api_key_present": bool(os.environ.get("OPENAI_API_KEY")),
     }), encoding="utf-8")
+if mode in {"stall-once", "stall-always"}:
+    marker = pathlib.Path(str(record) + ".stalled")
+    if mode == "stall-always" or not marker.exists():
+        marker.write_text(str(int(marker.read_text() if marker.exists() else "0") + 1), encoding="utf-8")
+        print(json.dumps({"type": "thread.started"}))
+        print(json.dumps({"type": "turn.started"}), flush=True)
+        time.sleep(30)
+if mode == "busy-but-slow":
+    print(json.dumps({"type": "turn.started"}))
+    print(json.dumps({"type": "item.started", "item": {"type": "command_execution", "command": "npm test"}}), flush=True)
+    time.sleep(3)
 if mode == "timeout":
     time.sleep(5)
 if mode in {"timeout-tree", "fast-root-tree"}:
@@ -167,6 +178,75 @@ else:
         "reasoning_output_tokens": 2,
     }}))
 '''
+
+
+class CodexStallRetryTests(unittest.TestCase):
+    """A turn that goes silent after it started is replaced, never waited out."""
+
+    make_provider = None  # bound below from CodexCLIProviderTests
+    request = None
+
+    def run_mode(self, mode, timeout=60.0):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _config, provider, record = CodexCLIProviderTests.make_provider(self, root, mode)
+            from dataclasses import replace
+            starts = []
+            request = replace(CodexCLIProviderTests.request(timeout), on_request_started=starts.append)
+            started = time.monotonic()
+            with patch.object(codex_cli, "STALL_RETRY_SECONDS", (1.0, 1.0)):
+                try:
+                    response = provider.complete(request)
+                    error = None
+                except HarnessError as exc:
+                    response, error = None, exc
+            marker = Path(str(record) + ".stalled")
+            stalls = int(marker.read_text()) if marker.exists() else 0
+            return response, error, time.monotonic() - started, stalls, starts
+
+    def test_a_silent_turn_is_retried_and_the_retry_answers(self):
+        response, error, elapsed, stalls, starts = self.run_mode("stall-once")
+        self.assertIsNone(error)
+        self.assertEqual(json.loads(response.text), {"answer": "ok"})
+        self.assertEqual(stalls, 1)
+        self.assertLess(elapsed, 20, "the stalled attempt must not be waited out")
+        self.assertEqual(len(starts), 2, "the waiting page hears about the fresh attempt")
+
+    def test_repeated_silence_ends_with_a_clear_message_before_the_deadline(self):
+        response, error, elapsed, stalls, _starts = self.run_mode("stall-always", timeout=25.0)
+        self.assertIsNone(response)
+        self.assertEqual(stalls, 3, "two stall-limited attempts, then one without a stall limit")
+        self.assertIn("timed out", str(error))
+
+    def test_a_turn_that_started_work_is_never_stopped_for_silence(self):
+        response, error, elapsed, stalls, starts = self.run_mode("busy-but-slow")
+        self.assertIsNone(error)
+        self.assertEqual(json.loads(response.text), {"answer": "ok"})
+        self.assertGreaterEqual(elapsed, 3)
+        self.assertEqual(len(starts), 1)
+
+    def test_stall_watch_counts_only_real_progress(self):
+        now = [0.0]
+        watch = codex_cli._StallWatch(10, clock=lambda: now[0])
+        watch.feed(b'{"type":"thread.started"}\n{"type":"turn.st')
+        watch.feed(b'arted"}\n')
+        now[0] = 11
+        self.assertTrue(watch.expired())
+        busy = codex_cli._StallWatch(10, clock=lambda: now[0])
+        busy.feed(b'{"type":"item.started","item":{"type":"reasoning"}}\n')
+        now[0] = 100
+        self.assertFalse(busy.expired())
+
+    def test_native_work_prompt_prefers_native_tools_without_contradiction(self):
+        from dataclasses import replace
+        request = CodexCLIProviderTests.request()
+        with patch.object(codex_cli.native_execution, "instructions", return_value="NATIVE AGENT EXECUTION\n"):
+            native = codex_cli._prompt(replace(request, native_execution="work"), False)
+            inspect = codex_cli._prompt(replace(request, native_execution="inspect"), False)
+        self.assertIn("directly with your own tools", native)
+        self.assertNotIn("whenever the supplied schema supports them", native)
+        self.assertIn("NATIVE AGENT EXECUTION", native)
+        self.assertIn("whenever the supplied schema supports them", inspect)
 
 
 class CodexCLIProviderTests(unittest.TestCase):

@@ -40,6 +40,7 @@ from .filesystem_paths import filesystem_path
 from .models import ContextRequestError, HarnessError, ProviderOutcomeUnknown, ProviderWorkspaceContext, ResponseFormat
 from .pipeline_runs import _owner_is_alive, _process_token, inspect_project_authority, project_identity
 from .providers.base import STRICT_OUTPUT_SCHEMA_CONTRACT, _strict_output_schema
+from .prompt_refusal import prompt_was_refused
 from .redaction import CredentialRedactor
 from .runtime_integrity import mac, quarantine_marker
 from .goal_verification import (
@@ -277,7 +278,28 @@ for _workspace_tool, _arguments, _required in [
         swarm_work._context_tool_call_schema(_workspace_tool, _arguments, _required))
 
 
-def _agent_action_format(task: dict[str, Any]) -> ResponseFormat:
+# Nexus tools a native-work agent (Claude Code or Codex writing in the selected
+# project) already has natively. Offering them again buried the user's goal under
+# about 50K characters of tool plumbing per turn and steered agents to one Nexus
+# read per turn and whole-file rewrites. Replies naming them are still accepted:
+# decoding always uses the full AGENT_ACTION_FORMAT.
+NATIVE_COVERED_TOOLS = frozenset({
+    "list_tree", "read_file", "search_workspace", "glob_search", "grep_search",
+    "git_status", "git_diff", "git_log", "git_show", "git_blame", "code_navigation",
+    "language_server", "read_notebook", "edit_notebook", "edit_file", "read_local_skill",
+    "tool_config", "tool_search", "sleep", "run_command", "write_file", "web_search",
+    "list_archive", "read_archive", "extract_archive",
+    # Native agents get a preview command to run inside their own turn instead.
+    "preview_web_page",
+})
+# Private agent-copy tools matter only when agents work in private copies; a
+# facilitator agent works in the shared project.
+FACILITATOR_UNUSED_TOOLS = frozenset({
+    "workspace_catalog", "workspace_read", "workspace_edit", "workspace_snapshot", "workspace_verify",
+})
+
+
+def _agent_action_format(task: dict[str, Any], native_work: bool | str = False) -> ResponseFormat:
     """Advertise only tools available to this task's actual review authority.
 
     Keep the durable superset decoder for older conversations: an unavailable
@@ -289,17 +311,45 @@ def _agent_action_format(task: dict[str, Any]) -> ResponseFormat:
     schema = copy.deepcopy(AGENT_ACTION_FORMAT.schema)
     variants = schema["properties"]["tool_calls"]["items"]["anyOf"]
     variants[:] = [one for one in variants if
-                   one["properties"]["name"]["enum"] != ["read_proposed_change"]]
+                   one["properties"]["name"]["enum"] != ["read_proposed_change"]
+                   and not (native_work and one["properties"]["name"]["enum"][0] in NATIVE_COVERED_TOOLS)
+                   and not (native_work == "facilitator"
+                            and one["properties"]["name"]["enum"][0] in FACILITATOR_UNUSED_TOOLS)]
     return ResponseFormat(AGENT_ACTION_FORMAT.name, schema, strict=AGENT_ACTION_FORMAT.strict)
 
 
-def _advertised_tools(task: dict[str, Any], *, direct: bool = False) -> list[dict[str, Any]]:
+COMPLETION_CHECK_CONTRACT = "nexus-completion-check/v1"
+
+
+def _completion_check(root: Path) -> dict[str, str] | None:
+    """What a project's page shows when opened like the user will, for a done claim."""
+    try:
+        from . import goal_verification as verification, web_preview
+        preview = verification.page_preview(Path(root))
+    except Exception:
+        return None
+    if not preview or preview.get("unavailable") or not preview.get("pages"):
+        return None
+    disk = next((one for one in preview["pages"] if one.get("mode") == "file"), {})
+    screenshot = str(disk.get("screenshot") or "")
+    return {"contract": COMPLETION_CHECK_CONTRACT, "page": str(preview.get("page") or ""),
+            "verdict": web_preview.verdict(preview["pages"])[:1_200],
+            "screenshot": str(Path(root) / screenshot) if screenshot else ""}
+
+
+def _agent_model(agent: dict[str, Any]) -> str:
+    """The model the user picked for this board agent now ("" = its route default)."""
+    from .swarm import agent_model
+    return agent_model(str(agent.get("id") or ""), str(agent.get("who") or "")) or str(agent.get("model") or "")
+
+
+def _advertised_tools(task: dict[str, Any], *, direct: bool = False, native_work: bool | str = False) -> list[dict[str, Any]]:
     """Describe exactly the tool variants admitted by this task's action schema."""
     from .agent_tools import TOOL_DEFINITIONS
     known = {one["name"]: one for one in [*TOOL_DEFINITIONS,
         *(goal_tools.FACILITATOR_DEFINITIONS if direct else goal_tools.DEFINITIONS)]}
     result = []
-    for variant in _agent_action_format(task).schema["properties"]["tool_calls"]["items"]["anyOf"]:
+    for variant in _agent_action_format(task, native_work).schema["properties"]["tool_calls"]["items"]["anyOf"]:
         name = variant["properties"]["name"]["enum"][0]
         result.append({"name": name,
             "description": known.get(name, {}).get("description", f"Use {name} under the saved task permissions."),
@@ -790,12 +840,54 @@ AGENT_GIT_HISTORY_NOTE = (
 # stream); older ones are compacted, then reduced to a reference. The full
 # results stay in the goal record, so the agent can request them again.
 SHOWN_TOOL_RESULTS_BUDGET = 200_000
+# A provider that refuses one prompt under its usage policy (OpenAI's reasoning
+# filter) gets that turn again with the likely trigger left out: first the
+# failed tool results, then every earlier tool result. Then it is a real failure.
+PROMPT_REFUSAL_RETRIES = 2
+PROMPT_REFUSAL_SCHEMA_VERSION = 1
 _SHOWN_TOOL_RESULTS_MAX = 80
 
 
 # The facilitator prompt's "previous tool effects" take this share of the one
 # budget; the current turn's tool results get the rest.
 PREVIOUS_EFFECTS_BUDGET = 40_000
+
+
+def _failed_tool_result(one: dict[str, Any]) -> bool:
+    """A tool result that only reports a failure, in either shape tools use."""
+
+    if one.get("error"):
+        return True
+    result = one.get("result")
+    if not isinstance(result, dict):
+        return False
+    if result.get("error") or result.get("status") == "error":
+        return True
+    content = result.get("content")
+    return isinstance(content, str) and content.lstrip().startswith('{"error"')
+
+
+def _after_prompt_refusal(tool_results: list[dict[str, Any]], attempt: int) -> list[dict[str, Any]]:
+    """The tool results the next prompt may carry after ``attempt`` refusals.
+
+    A looping agent's failed calls are where refused prompts came from: their
+    arguments, echoed back in errors, read like the model's own reasoning.
+    """
+
+    if attempt >= 2:
+        return []
+    return [one for one in tool_results if not _failed_tool_result(one)]
+
+
+def _prompt_refusal_note(attempt: int) -> str:
+    return (
+        "\n\nPROVIDER REFUSAL RECOVERY\nYour provider refused the previous prompt for this step under its "
+        "usage policy. Nothing from that attempt ran or changed. Nexus left out "
+        + ("the earlier failed tool calls and their error text"
+           if attempt < 2 else "all earlier tool results for this task")
+        + ". Continue the task from the current project and conversation. To read a file, call read_file "
+          "with only its exact project-relative path in path."
+    )
 
 
 def _shown_tool_results(tool_results: list[dict[str, Any]], budget: int | None = None) -> list[Any]:
@@ -4583,6 +4675,8 @@ class GoalStore(goal_access.AccessStoreMixin):
         value["collaboration_contract_changed"] = collaboration["changed"]
         value["collaboration_contract_status"] = collaboration
         value["resume_recovery"] = self.resume_recovery(document)
+        from . import limit_resume
+        value["auto_resume"] = limit_resume.plan(document)
         from .collaboration_status import task_delivery
         for task in value.get('tasks', []):
             task['delivery_observation'] = task_delivery(document, task)
@@ -5304,6 +5398,28 @@ class GoalStore(goal_access.AccessStoreMixin):
                         }, run_id=goal_id)
         self._mutate(goal_id, change)
 
+    def record_prompt_refusal(self, goal_id: str, task: dict[str, Any], attempt: int, reason: str) -> None:
+        """Note that the provider refused this task's prompt, and what the retry leaves out."""
+
+        def change(document: dict[str, Any], db: sqlite3.Connection):
+            current = next(one for one in document["tasks"] if one["id"] == task["id"])
+            if current.get("lease_id") != task.get("lease_id"):
+                return
+            current["prompt_refusal"] = {
+                "schema_version": PROMPT_REFUSAL_SCHEMA_VERSION,
+                "attempts": int(attempt),
+                # Steps saved so far; their failed results (or all of them from
+                # the second refusal on) stay out of this task's later prompts.
+                "trimmed_steps": len(current.get("context_steps") or []),
+                "at_ms": _now(),
+            }
+            self._event(db, document, "provider_prompt_refused", task_id=current["id"],
+                        agent_id=str(current.get("assigned_agent_id") or ""), payload={
+                            "attempt": int(attempt), "max_attempts": PROMPT_REFUSAL_RETRIES,
+                            "reason": _short(" ".join(str(reason or "").split()), 600),
+                        })
+        self._mutate(goal_id, change)
+
     def record_provider_wait(self, goal_id, task, observation, effect_id):
         from .provider_wait import record
         def change(document, db):
@@ -5785,6 +5901,9 @@ class GoalStore(goal_access.AccessStoreMixin):
             "summary": summary, "recipient": delivery, "at_ms": _now(),
             "reply_requested": facilitator.enabled(document) and facilitator.reply_requested(action, delivery),
         }
+        check = action.get("_nexus_completion_check")
+        if isinstance(check, dict) and check.get("contract") == COMPLETION_CHECK_CONTRACT:
+            message["nexus_check"] = {key: _short(check.get(key), 1_200) for key in ("contract", "page", "verdict", "screenshot")}
         event = self._event(
             db, document, "provider_acknowledged", task_id=task["id"],
             agent_id=task["assigned_agent_id"], payload={
@@ -6435,11 +6554,14 @@ class GoalStore(goal_access.AccessStoreMixin):
 
     def recover_full_access_reviews(self, goal_id):
         def change(document, db):
+            # Nothing recovered is no change: writing anyway advanced every
+            # paused goal's revision on each start, which made every chat
+            # replay its whole goal history again.
             if self._scheduler_live(document) or _automatic_recovery_suppressed(document):
-                return False
-            return self._recover_full_access_reviews(document, db)
+                return _NO_MUTATION
+            return self._recover_full_access_reviews(document, db) or _NO_MUTATION
         document, recovered = self._mutate(goal_id, change)
-        return document, recovered
+        return document, bool(recovered)
 
     def apply_action(
         self, goal_id: str, task: dict[str, Any], action: dict[str, Any],
@@ -8909,6 +9031,24 @@ class LongHorizonRuntime:
             )
         return {"route": "end", "task_ids": []}
 
+    def _native_work(self, goal: dict[str, Any], task: dict[str, Any]) -> str:
+        """Where this turn's agent edits and runs with its own tools: "facilitator"
+        (the selected project), "isolated" (its private copy) or "" (no native work)."""
+        mode = "facilitator" if facilitator.enabled(goal) else             "isolated" if goal.get("agent_workspace_contract") == agent_workspaces.CONTRACT else ""
+        if not mode:
+            return ""
+        agent = next((one for one in goal["agents"] if one["id"] == task["assigned_agent_id"]), {})
+        route = str(agent.get("who") or "")
+        if not route or route.startswith("web:"):
+            return ""
+        try:
+            from .providers import ProviderRegistry
+            name = str(ProviderRegistry(self.config).provider_config(route).get("provider.name") or "")
+        except Exception:
+            return ""
+        return mode if name in {"codex-cli", "claude-cli"} and facilitator.native_profile(
+            goal, collaboration.can_write(goal, task), self.config) == "work" else ""
+
     def _agent_context(self, goal: dict[str, Any], task: dict[str, Any], extra_files: list[str] | None = None, *, workspace_root: Path | None = None, peer_messages=None) -> str:
         if task.get("closeout_packet"):
             files = swarm_work._file_snapshot(workspace_root or _execution_root(goal), list(extra_files or [])) if extra_files else "Use read_file to inspect the submitted snapshot."
@@ -8927,7 +9067,7 @@ class LongHorizonRuntime:
         if facilitator.enabled(goal):
             packet = self.store.peer_requests(goal, task) if peer_messages is None else peer_messages
             return peer_delivery.prompt(packet) + goal_messages.prompt(goal, task) + goal_inputs.evidence(goal) + facilitator.context(goal, task, root, ledger, evidence_by_task, files,
-                _advertised_tools(task, direct=True))
+                _advertised_tools(task, direct=True, native_work=self._native_work(goal, task)))
         contribution_packet = ""
         if goal.get("require_all_participants"):
             agents = {
@@ -9102,7 +9242,7 @@ class LongHorizonRuntime:
               "Nexus enforces this setting. Full access already authorizes the requested project work: proceed without asking again to edit, run commands, or continue without a reviewer. Use provider-native tools when available; Nexus tools supplement them. Ask only for missing task information or genuinely new authority outside the saved grant. A command permission block opens a card for the user; do not repeatedly retry it or treat conversational text as an engine grant."
             + "\n\nNEXUS TOOLBOX\n" + _canonical([
                 {"name": one["name"], "description": one["description"]}
-                for one in _advertised_tools(task)
+                for one in _advertised_tools(task, native_work=self._native_work(goal, task))
             ])
             + "\n\nSUCCESS CRITERIA\n- " + "\n- ".join(goal["success_criteria"])
             + "\n\nCURRENT CONCRETE TASK\n" + task["description"]
@@ -9243,6 +9383,7 @@ class LongHorizonRuntime:
         tool_results: list[dict[str, Any]] = []
         requested_files: list[str] = []
         stale_conversation_observations = False
+        refusal_attempts = 0
 
         admitted_effect = ""
         prepared_message_sequence = 0
@@ -9297,6 +9438,8 @@ class LongHorizonRuntime:
                     request_context += "\nPROJECT WRITE COORDINATION: " + operation_note
                 answer = chat_lab.ask_once(
                     self.config, agent["who"], request_text, context=request_context,
+                    model=_agent_model(agent),
+                    usage_session="goal:" + str(goal_id),
                     workspace_context=ProviderWorkspaceContext(project_id=str(goal["project"]["id"]),
                         project_path=str(goal["project"]["path"]), execution_path=str(root),
                         execution_mode="facilitator" if facilitator.enabled(goal) else "isolated",
@@ -9306,7 +9449,7 @@ class LongHorizonRuntime:
                     provider_attachments=provider_attachments,
                     **({"native_execution": native_profile,
                         "working_directory": str(root)} if agent_workspace or facilitator.enabled(goal) else {}),
-                    response_format=_agent_action_format(task),
+                    response_format=_agent_action_format(task, self._native_work(goal, task)),
                     conversation_key=conversation_key,
                     before_provider_dispatch=account_dispatch(phase, request_text, request_context),
                     after_provider_response=account_reply(phase),
@@ -9350,12 +9493,14 @@ class LongHorizonRuntime:
                 )
                 corrected = chat_lab.ask_once(
                     self.config, agent["who"], correction_prompt,
+                    model=_agent_model(agent),
+                    usage_session="goal:" + str(goal_id),
                     context=correction_context, provider_attachments=provider_attachments,
                     workspace_context=ProviderWorkspaceContext(project_id=str(goal["project"]["id"]),
                         project_path=str(goal["project"]["path"]), execution_path=str(root),
                         execution_mode="facilitator" if facilitator.enabled(goal) else "isolated"),
                     **({"native_execution": "inspect", "working_directory": str(root)} if agent_workspace or facilitator.enabled(goal) else {}),
-                    response_format=_agent_action_format(task),
+                    response_format=_agent_action_format(task, self._native_work(goal, task)),
                     conversation_key=conversation_key,
                     prefer_existing_conversation=False,
                     before_provider_dispatch=account_dispatch(
@@ -9629,7 +9774,8 @@ class LongHorizonRuntime:
                 return True
 
             requested_files.extend(one for one in task.get("trimmed_requested_files", []) if one not in requested_files)
-            for prior_step in task.get("context_steps", []):
+            refusal = task.get("prompt_refusal") if isinstance(task.get("prompt_refusal"), dict) else {}
+            for step_index, prior_step in enumerate(task.get("context_steps", [])):
                 requested_files.extend(
                     one for one in prior_step.get("requested_files", []) if one not in requested_files
                 )
@@ -9651,6 +9797,10 @@ class LongHorizonRuntime:
                         # would needlessly replay already settled project tools.
                         stale_conversation_observations = True
                         continue
+                    if step_index < int(refusal.get("trimmed_steps") or 0) and (
+                        int(refusal.get("attempts") or 0) >= 2 or _failed_tool_result(held)
+                    ):
+                        continue  # Left out after a provider refused a prompt carrying it.
                     tool_results.append({
                         "call_id": held.get("call_id"), "name": held.get("name"),
                         "result": held.get("result"), "error": held.get("error"),
@@ -9704,7 +9854,9 @@ class LongHorizonRuntime:
                             - (PREVIOUS_EFFECTS_BUDGET if facilitator.enabled(latest_goal) else 0)))
                     )
                 progress_notice = str((latest_task.get("context_progress") or {}).get("notice") or "")
-                if progress_notice:
+                if refusal_attempts:
+                    context += _prompt_refusal_note(refusal_attempts)
+                if progress_notice and refusal_attempts < 2:
                     # Advisory only: repetition never pauses the goal.
                     context += "\n\nNEXUS NOTICE (advisory; you decide what to do next)\n" + progress_notice
                 prompt = (
@@ -9735,7 +9887,19 @@ class LongHorizonRuntime:
                             "correction_attempt": int(recovery.get("attempts") or 0) + 1,
                             "max_attempts": action_protocol.MAX_CORRECTIONS,
                         }) + "\n" + action_protocol.RULES
-                action = ask_action(prompt, context, phase)
+                try:
+                    action = ask_action(prompt, context, phase)
+                except Exception as refused:
+                    if isinstance(refused, ProviderOutcomeUnknown) or dispatch_admission_failed \
+                            or phase == "protocol_correction" or refusal_attempts >= PROMPT_REFUSAL_RETRIES \
+                            or not prompt_was_refused(str(refused)):
+                        raise
+                    # The provider answered with a policy refusal of this prompt:
+                    # nothing ran, so asking again with a different prompt is safe.
+                    refusal_attempts += 1
+                    self.store.record_prompt_refusal(goal_id, task, refusal_attempts, str(refused))
+                    tool_results[:] = _after_prompt_refusal(tool_results, refusal_attempts)
+                    continue
                 try:
                     _validate_action_semantics(action, latest_task)
                 except action_protocol.ActionProtocolError as error:
@@ -9795,6 +9959,12 @@ class LongHorizonRuntime:
                 for one in action.get("changes", []) if isinstance(one, dict)
                 and str(one.get("path") or "").strip()
             }
+            if str(action.get("action") or "") == "complete":
+                # Evidence next to the claim, never a gate: what the user will
+                # see when they open the page, checked when the agent says done.
+                check = _completion_check(root)
+                if check:
+                    action["_nexus_completion_check"] = check
             if not self.store.record_action(goal_id, task, action, **({"phase": record_phase} if record_phase != "action" else {})):
                 return task, {
                     "action": "superseded",

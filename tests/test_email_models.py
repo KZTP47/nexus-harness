@@ -90,7 +90,15 @@ class EmailModelTests(unittest.TestCase):
             result = models.model_options(self.config, 'default', True)
         run.assert_not_called()
         values = {item['id'] for item in result}
-        self.assertTrue({'claude-fable-5-1', 'claude-fable-5', 'claude-opus-5', 'claude-sonnet-5', 'opus', 'sonnet', 'haiku', 'default'} <= values)
+        self.assertTrue({'claude-fable-5-1', 'claude-opus-5-5', 'claude-fable-5', 'claude-opus-5', 'claude-sonnet-5',
+                         'claude-haiku-4-5-20251001', 'opus', 'sonnet', 'haiku', 'default'} <= values)
+        self.assertEqual(len(values), len(result))
+
+    def test_codex_suggestions_include_current_gpt_family(self):
+        with patch.object(models, '_run_bounded') as run:
+            values = [item['id'] for item in models.model_options(self.config, 'default')]
+        run.assert_not_called()
+        self.assertEqual(['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna'], values[:3])
 
 
 if __name__ == '__main__':

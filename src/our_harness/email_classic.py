@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -88,7 +89,27 @@ try {
     if ($body.Length -gt 2000000) { throw 'An Outlook message exceeds the supported size. Move it from Inbox before retrying.' }
     $received = ''
     try { $received = [string]$mail.ReceivedTime.ToUniversalTime().ToString('o') } catch {}
-    $messages += @{entry_id=[string]$id; sender=$sender; subject=[string]$mail.Subject; body=$body; received_at=$received}
+    # Copies of the attachments go to Nexus's private staging folder; the mail is not changed.
+    $files = @()
+    if ($request.staging) {
+      $index = 0
+      foreach ($attachment in $mail.Attachments) {
+        $index++
+        if ($index -gt 20) { break }
+        $name = [string]$attachment.FileName
+        $size = 0
+        try { $size = [int64]$attachment.Size } catch {}
+        $cid = ''
+        try { $cid = [string]$attachment.PropertyAccessor.GetProperty('http://schemas.microsoft.com/mapi/proptag/0x3712001F') } catch {}
+        # 1 = a file, 5 = an attached Outlook item; links and OLE objects stay in Outlook.
+        if ($attachment.Type -ne 1 -and $attachment.Type -ne 5) { $files += @{name=$name; size=$size; omitted='A linked or embedded object; open it in Outlook.'}; continue }
+        if ($size -gt 15200000) { $files += @{name=$name; size=$size; omitted='Larger than the attachment size limit; open it in Outlook.'}; continue }
+        $target = Join-Path ([string]$request.staging) ([guid]::NewGuid().ToString('N'))
+        try { $attachment.SaveAsFile($target); $files += @{name=$name; size=$size; path=$target; content_id=$cid} }
+        catch { $files += @{name=$name; size=$size; omitted='Outlook could not copy this file.'} }
+      }
+    }
+    $messages += @{entry_id=[string]$id; sender=$sender; subject=[string]$mail.Subject; body=$body; received_at=$received; attachments=@($files)}
   }
   @{messages=@($messages); missing=@($missing)} | ConvertTo-Json -Depth 8 -Compress
 } catch {
@@ -147,10 +168,12 @@ def _fingerprint(value):
 
 
 class EmailClassic:
-    def __init__(self, root, *, transport=None):
+    def __init__(self, root, *, transport=None, attachments_dir=None):
         self.root = Path(root).resolve() / 'classic-outlook'
         self.path = self.root / 'connections.json'
         self.transport = transport or _transport
+        # Where mail attachments are handed to the mail store (None: text only).
+        self.attachments_dir = Path(attachments_dir) if attachments_dir else None
         with _LOCK_GUARD:
             self.lock = _LOCKS.setdefault(str(self.root), threading.RLock())
 
@@ -246,7 +269,17 @@ class EmailClassic:
             queued = set(queue)
             queue.extend(x for x in dict.fromkeys(ids) if x not in seen and x not in queued)
             selected = queue[:BATCH_SIZE]
-            result = self.transport('messages', dict(identity, ids=selected)) if selected else {'messages': [], 'missing': []}
+            staging = None
+            if self.attachments_dir and selected:
+                staging = self.attachments_dir / ('classic-' + uuid.uuid4().hex)
+                staging.mkdir(parents=True, exist_ok=True)
+            try:
+                result = self.transport('messages', dict(identity, ids=selected, **({'staging': str(staging)} if staging else {}))) if selected else {'messages': [], 'missing': []}
+                files = {id(message): self._hand_over(message.get('attachments'), staging) for message in result.get('messages', [])
+                         if isinstance(message, dict)} if staging else {}
+            finally:
+                if staging:
+                    shutil.rmtree(staging, ignore_errors=True)
             messages = []
             returned = set()
             for message in result.get('messages', []):
@@ -259,7 +292,8 @@ class EmailClassic:
                 received_at = message.get('received_at')
                 messages.append(dict(source_id='classic:' + _fingerprint([identity['store_id'], entry_id]),
                     sender=message['sender'], subject=message['subject'], body=message['body'],
-                    received_at=received_at if isinstance(received_at, str) else ''))
+                    received_at=received_at if isinstance(received_at, str) else '',
+                    **({'attachments': files[id(message)]} if files.get(id(message)) else {})))
             missing = result.get('missing', [])
             if not isinstance(missing, list) or any(x not in selected for x in missing) or returned | set(missing) != set(selected):
                 raise HarnessError('Classic Outlook did not return the complete requested batch. Retry the connection.')
@@ -273,6 +307,31 @@ class EmailClassic:
             connection['pending'] = batch
             self._write(state)
             return {k: batch[k] for k in ('messages', 'cursor', 'warnings', 'has_more')}
+
+    def _hand_over(self, entries, staging):
+        """Move files Outlook saved into the mail store's incoming folder, named by checksum."""
+        from .email_attachments import MAX_FILE_BYTES, MAX_FILES
+        handed = []
+        for entry in (entries if isinstance(entries, list) else [])[:MAX_FILES]:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get('name') or '')[:500]
+            if entry.get('omitted') or not entry.get('path'):
+                handed.append({'name': name, 'omitted': str(entry.get('omitted') or 'Outlook could not copy this file.')[:300]})
+                continue
+            try:
+                path = Path(str(entry['path'])).resolve(strict=True)
+                if path.parent != staging.resolve() or path.stat().st_size > MAX_FILE_BYTES:
+                    raise OSError('outside staging or too large')
+                raw = path.read_bytes()
+                digest = hashlib.sha256(raw).hexdigest()
+                os.replace(path, self.attachments_dir / digest)
+            except OSError:
+                handed.append({'name': name, 'omitted': 'Outlook could not copy this file.'})
+                continue
+            content_id = str(entry.get('content_id') or '')[:300]
+            handed.append({'name': name, 'sha256': digest, 'content_id': content_id, 'inline': bool(content_id)})
+        return handed
 
     def close(self):
         """No Outlook process is owned or terminated by this adapter."""

@@ -396,7 +396,7 @@ def _default_model(config: LoadedConfig, kind: str) -> str:
     # stops loading at all - so connecting one assistant took every other route
     # down with it. Connecting Codex turned Claude off.
     return {
-        "claude-cli": "claude-sonnet-4-5",
+        "claude-cli": "claude-opus-5",
         "copilot-cli": "gpt-5",
         "gemini-cli": "gemini-2.5-pro",
         "codex-cli": "gpt-5-codex",

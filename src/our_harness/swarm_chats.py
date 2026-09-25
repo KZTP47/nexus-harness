@@ -759,10 +759,18 @@ def _filesystem_project_identity(path: str) -> dict[str, Any]:
             "directory_identity_version": PROJECT_DIRECTORY_IDENTITY_VERSION,
             "directory_identity_sha256": "",
         }
+    device = int(found.st_dev)
+    if os.name == "nt":
+        # Python 3.12+ reports a 64-bit st_dev on Windows where 3.11 reported
+        # the 32-bit volume serial held in its low half. Without this the
+        # same folder looked replaced whenever the Python runtime changed,
+        # and every saved chat for it paused. Existing bindings kept the
+        # 32-bit value, so they stay valid.
+        device &= 0xFFFFFFFF
     payload = {
         "directory_identity_version": PROJECT_DIRECTORY_IDENTITY_VERSION,
         "path_fingerprint_sha256": path_fingerprint,
-        "device": str(int(found.st_dev)),
+        "device": str(device),
         "file_id": str(file_id),
     }
     digest = hashlib.sha256(json.dumps(
@@ -1025,6 +1033,29 @@ def _route_binding_drifted(held: dict[str, Any], current: dict[str, Any]) -> boo
     )
 
 
+def _only_the_program_moved(
+    config: LoadedConfig, member: dict[str, Any], held: dict[str, Any], current: dict[str, Any],
+) -> bool:
+    """Same saved profile; only the effective executable/dispatch changed."""
+
+    if held.get("effective_dispatch_strength") != "verified" or any(
+        held.get(key) != current.get(key) for key in (
+            "route", "failure_context_version", "route_fingerprint_sha256",
+            "transport_contract",
+        )
+    ):
+        return False
+    if not str(current.get("effective_dispatch_fingerprint_sha256") or ""):
+        return False
+    try:
+        from .provider_reconnect import _require_available
+
+        _require_available(config, str(member.get("who") or ""))
+    except Exception:
+        return False  # Not installed right now: keep it reviewable.
+    return True
+
+
 def _refresh_route_bindings(
     config: LoadedConfig, registry: dict[str, Any], board: dict[str, Any], *,
     chat_id: str = "", observed: dict[str, dict[str, Any]] | None = None,
@@ -1092,6 +1123,17 @@ def _refresh_route_bindings(
                 # Unchanged saved profile: record (or upgrade to) the current
                 # identity version; the exact fingerprints prove it.
                 identities[member_id] = identity
+                changed = True
+                continue
+            if held_identity is None and _only_the_program_moved(config, member, held, current):
+                # A chat saved before identities were recorded, whose whole
+                # saved profile (kind, account slot, command, arguments...)
+                # still matches exactly: only the resolved executable changed,
+                # which is what every CLI auto-update does. Chats that have an
+                # identity already continue through this; so do these now.
+                identities[member_id] = identity
+                for key in _VERIFIED_CHAT_ROUTE_FIELDS:
+                    held[key] = current.get(key)
                 changed = True
                 continue
             if held.get("route") != current.get("route") or not _same_route_identity(

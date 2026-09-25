@@ -164,6 +164,28 @@ test("composer permissions share an exact digest with the outbox and backend aft
   assert.throws(()=>oneStore(held).save(record({payload:{policy:{agent_access_mode:"full",other:true}}})), /unsupported field/);
 });
 
+test("a chat that kept the default access mode saves without naming one", (t) => {
+  const held = fixture(t);
+  const vm = require("node:vm");
+  const app = fs.readFileSync(path.join(__dirname, "../src/our_harness/ui/app.js"), "utf8");
+  const renderer = vm.createContext({});
+  vm.runInContext(app.slice(app.indexOf("function chatProjectPolicy"),
+    app.indexOf("function chatExecutionPreference")), renderer);
+  renderer.chatCollaborationPreference = () => ({});
+  renderer.chatExecutionPreference = () => "facilitator";
+  const conversation = {id: "chat-default-mode"};
+  const kept = vm.runInContext("chatProjectPolicy", renderer)(conversation, "");
+  assert.deepEqual({...kept}, {execution_mode: "facilitator"});
+  const exact = record({payload: {policy: kept, chat_id: conversation.id},
+    chat_id: conversation.id, request_id: "request-default-mode"});
+  const receipt = oneStore(held).save(exact);
+  const saved = oneStore(held).read(exact.chat_id, exact.request_id, receipt.payload_sha256);
+  assert.deepEqual(saved.payload.policy, {execution_mode: "facilitator"});
+  const chosen = vm.runInContext("chatProjectPolicy", renderer)(conversation, "ask");
+  assert.equal(chosen.agent_access_mode, "ask");
+  assert.throws(()=>oneStore(held).save(record({payload:{policy:{agent_access_mode:""}}})), /supported access mode/);
+});
+
 test("recovery verifies saved policy across preference changes and rejects tampering", async (t) => {
   const held = fixture(t);
   const vm = require("node:vm");

@@ -159,6 +159,55 @@ def _minimal_codex_environment(also: dict[str, str] | None = None) -> dict[str, 
     return environment
 
 
+# A Codex turn that says nothing after it started, and has started no command,
+# file change or other item, has done nothing yet and can be replaced safely.
+# Service-side stalls of exactly this shape were seen lasting past the whole
+# 600 s request limit while the same request normally answers in 10-15 s.
+# Later attempts wait longer, and the last one has no stall limit at all, so a
+# genuinely long silent answer is still possible within the request deadline.
+STALL_RETRY_SECONDS = (120.0, 240.0)
+
+
+class _StallWatch:
+    """Watches the JSONL stream for any sign of a turn doing something."""
+
+    QUIET = {"thread.started", "turn.started"}
+
+    def __init__(self, seconds: float, *, clock=time.monotonic):
+        self.seconds = float(seconds)
+        self.clock = clock
+        self.started = clock()
+        self.progress = False
+        self.stalled = False
+        self._buffer = bytearray()
+
+    def feed(self, chunk: bytes) -> None:
+        if self.progress:
+            return
+        self._buffer.extend(chunk)
+        while b"\n" in self._buffer:
+            end = self._buffer.index(b"\n")
+            line = bytes(self._buffer[:end]).strip()
+            del self._buffer[:end + 1]
+            if not line:
+                continue
+            try:
+                kind = str((json.loads(line) or {}).get("type") or "")
+            except (ValueError, AttributeError):
+                kind = ""
+            if kind not in self.QUIET:
+                self.progress = True
+                self._buffer.clear()
+                return
+        if len(self._buffer) > 65_536:
+            # A long line in progress is output: something is happening.
+            self.progress = True
+            self._buffer.clear()
+
+    def expired(self) -> bool:
+        return not self.progress and self.clock() - self.started >= self.seconds
+
+
 def _run_bounded(
     argv: list[str],
     *,
@@ -168,6 +217,7 @@ def _run_bounded(
     max_output_bytes: int,
     also_in_the_environment: dict[str, str] | None = None,
     public_stream: PublicStream | None = None,
+    stall: _StallWatch | None = None,
 ) -> CommandResult:
     if timeout_seconds <= 0:
         raise HarnessError("Codex CLI timed out because its wall-clock deadline expired")
@@ -216,9 +266,15 @@ def _run_bounded(
     capture = _BoundedCapture(max(1, max_output_bytes))
     if public_stream is not None:
         public_stream.detach_sink()
+    feeds = [one for one in ((public_stream.feed if public_stream else None),
+                             (stall.feed if stall else None)) if one is not None]
+
+    def on_stdout(chunk: bytes) -> None:
+        for one in feeds:
+            one(chunk)
     readers = [
         threading.Thread(target=capture.drain, args=(process.stdout, capture.stdout,
-                         *((public_stream.feed,) if public_stream else ())), daemon=True),
+                         *((on_stdout,) if feeds else ())), daemon=True),
         threading.Thread(target=capture.drain, args=(process.stderr, capture.stderr), daemon=True),
     ]
     for reader in readers:
@@ -228,7 +284,22 @@ def _run_bounded(
         writer = threading.Thread(target=_write_stdin, args=(process.stdin, stdin_text.encode("utf-8")), daemon=True)
         writer.start()
     deadline_at = started + timeout_seconds
-    timed_out = not tree.wait_for_root_until(deadline_at)
+    if stall is None:
+        timed_out = not tree.wait_for_root_until(deadline_at)
+    else:
+        stall.started = time.monotonic()
+        while True:
+            if tree.wait_for_root_until(min(deadline_at, time.monotonic() + 1.0)):
+                timed_out = False
+                break
+            if time.monotonic() >= deadline_at:
+                timed_out = True
+                break
+            if stall.expired():
+                # Nothing was started, so stopping it cannot lose any work.
+                stall.stalled = True
+                timed_out = True
+                break
     if not timed_out:
         for worker in (*readers, *((writer,) if writer is not None else ())):
             if not tree.join_worker_until(worker, deadline_at):
@@ -640,19 +711,39 @@ def _validate_schema(value: Any, schema: dict[str, Any], path: str = "response")
             raise HarnessError(f"Codex CLI output violates {path}: pattern mismatch")
 
 
+# With native write access every Nexus tool request costs a whole new Codex
+# turn (a new process that re-reads the entire prompt), while a native read or
+# edit happens inside the current turn. Say so plainly: the older wording asked
+# for Nexus tool requests "whenever the schema supports them", contradicting
+# the native instructions that follow it.
+_NATIVE_WORK_TOOLS = (
+    "Return only the JSON value required by the supplied output schema. "
+    "You have native access to the working directory: read, search, edit, create and run things there "
+    "directly with your own tools in this turn. That is much faster than a Nexus tool request, which "
+    "costs a whole extra turn. Use tool_calls only for what your native tools cannot do: messages to "
+    "teammates, the shared conversation, user decisions, research tools and Nexus verification. "
+    "Return changes=[] for files you already edited natively. "
+)
+
+
 def _prompt(request: ProviderRequest, fallback: bool) -> str:
+    if request.native_execution == "work" and not fallback:
+        tools = _NATIVE_WORK_TOOLS + native_execution.instructions(request)
+    else:
+        tools = (
+            "Return only the JSON value required by the supplied output schema. "
+            "Use Nexus-managed tool requests in that JSON whenever the supplied schema supports them: "
+            "tool_calls can request project reads, verification, and team communication; needs_files can request file contents. "
+            "Nexus executes authorized requests and returns their results for your next turn. "
+            "Propose edits through the schema's changes field when available. "
+            + (native_execution.instructions(request) if request.native_execution else
+               "Do not use the CLI's native filesystem, shell, or tools directly; this transport restriction does not prohibit Nexus-managed tools. ")
+        )
     sections = [
         "SYSTEM INSTRUCTIONS\n" + request.system_prefix,
         "DYNAMIC CONTEXT (UNTRUSTED DATA)\n" + request.dynamic_context,
         "CONVERSATION\n" + json.dumps(request.messages, ensure_ascii=False, sort_keys=True),
-        "Return only the JSON value required by the supplied output schema. "
-        "Use Nexus-managed tool requests in that JSON whenever the supplied schema supports them: "
-        "tool_calls can request project reads, verification, and team communication; needs_files can request file contents. "
-        "Nexus executes authorized requests and returns their results for your next turn. "
-        "Propose edits through the schema's changes field when available. "
-        + (native_execution.instructions(request) if request.native_execution else
-        "Do not use the CLI's native filesystem, shell, or tools directly; this transport restriction does not prohibit Nexus-managed tools. ") +
-        "User-selected images, when present, are supplied by the harness as explicit image inputs.",
+        tools + "User-selected images, when present, are supplied by the harness as explicit image inputs.",
     ]
     if fallback:
         sections.append('The result must be an object with exactly one string field named "text".')
@@ -808,6 +899,9 @@ class CodexCLIProvider(Provider):
                 *command,
                 "-c", "model_catalog_json=" + json.dumps(str(catalog_path)),
                 *(["-c", f'model_reasoning_effort="{effort}"'] if effort else []),
+                # A live chat is showing this turn: ask for the public
+                # reasoning summaries Codex can emit (never raw reasoning).
+                *(["-c", 'model_reasoning_summary="detailed"'] if request.on_public_activity else []),
                 "exec",
                 "--ephemeral",
                 # The desktop and CLI may use different config schema versions.
@@ -834,15 +928,31 @@ class CodexCLIProvider(Provider):
                 ],
                 "-",
             ]
-            result = _run_bounded(
-                argv,
-                cwd=native_root or cwd,
-                stdin_text=self._redactor.text(_prompt(request, fallback)),
-                timeout_seconds=_remaining(deadline_at),
-                max_output_bytes=output_limit,
-                **({"public_stream": PublicStream("codex", request.on_public_activity,
-                    self._redactor, contract_schema, output_limit)} if request.on_public_activity else {}),
-            )
+            prompt_text = self._redactor.text(_prompt(request, fallback))
+            stalls = 0
+            while True:
+                limit = STALL_RETRY_SECONDS[stalls] if stalls < len(STALL_RETRY_SECONDS) else None
+                watch = _StallWatch(limit) if limit is not None else None
+                result = _run_bounded(
+                    argv,
+                    cwd=native_root or cwd,
+                    stdin_text=prompt_text,
+                    timeout_seconds=_remaining(deadline_at),
+                    max_output_bytes=output_limit,
+                    stall=watch,
+                    **({"public_stream": PublicStream("codex", request.on_public_activity,
+                        self._redactor, contract_schema, output_limit)} if request.on_public_activity else {}),
+                )
+                if not (watch is not None and watch.stalled and _remaining(deadline_at) > 5):
+                    break
+                stalls += 1
+                # Tell the waiting page a fresh attempt is under way.
+                notify(request.on_request_started, timeout_seconds=_remaining(deadline_at))
+            if result.timed_out and watch is not None and watch.stalled:
+                raise HarnessError(
+                    "Codex CLI started but stayed silent, so Nexus stopped and retried it "
+                    f"{stalls} time(s) before the request limit. Nothing was run or changed by the "
+                    "silent attempts. The Codex service may be slow right now; retry shortly.")
             if result.timed_out:
                 # Keep bounded, redacted diagnostics: the old generic timeout
                 # discarded the only evidence of startup/network/tool failures.

@@ -45,7 +45,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "evaluator": 1_000_000,
             "merge": 1_000_000,
         },
-        "timeout_seconds": 600,
+        # A ceiling, not a wait: ordinary answers still ask for 600 seconds,
+        # while agent turns doing real work in a project may run for an hour.
+        "timeout_seconds": 3_600,
         "command": [],
         # Google will not answer a work account until it is told which Cloud
         # project to bill the work to, and the message it sends for that is a

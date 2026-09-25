@@ -70,6 +70,10 @@ for (const input of ["pointer", "keyboard"]) {
           if (pathname === "/styles.css") return route.fulfill({contentType: "text/css", body: fs.readFileSync(path.join(ui, "styles.css"), "utf8")});
           if (pathname === "/email.css") return route.fulfill({contentType: "text/css", body: fs.readFileSync(path.join(ui, "email.css"), "utf8")});
           if (pathname === "/email.js") return route.fulfill({contentType: "application/javascript", body: fs.readFileSync(path.join(ui, "email.js"), "utf8")});
+          if (pathname === "/session-health.js") return route.fulfill({contentType: "application/javascript", body: fs.readFileSync(path.join(ui, "session-health.js"), "utf8")});
+          if (pathname === "/live-team.css") return route.fulfill({contentType: "text/css", body: fs.readFileSync(path.join(ui, "live-team.css"), "utf8")});
+          if (pathname === "/live-team.js") return route.fulfill({contentType: "application/javascript", body: fs.readFileSync(path.join(ui, "live-team.js"), "utf8")});
+          if (pathname === "/chat-orchestrator.js") return route.fulfill({contentType: "application/javascript", body: fs.readFileSync(path.join(ui, "chat-orchestrator.js"), "utf8")});
           if (pathname === "/app.js") {
             await scriptReady;
             return route.fulfill({contentType: "application/javascript", body: implementation});

@@ -20,7 +20,7 @@ test("native email save enforces origin, bounds, cancellation and safe extension
   });
   assert.throws(() => handler({}, "reply.eml", "hello"), /Only the Nexus/);
   assert.throws(() => handler({trusted: true}, "reply.eml", ""), /bytes/);
-  assert.throws(() => handler({trusted: true}, "reply.eml", "a".repeat(2_000_001)), /bytes/);
+  assert.throws(() => handler({trusted: true}, "reply.eml", "a".repeat(30_000_001)), /bytes/);
   assert.equal(handler({trusted: true}, "reply.eml", "hello").saved, false);
   assert.deepEqual(fs.readdirSync(root), []);
   choice = path.join(root, "selected.exe");

@@ -230,3 +230,62 @@ class ExactConfiguredCliChecks(unittest.TestCase):
         recipe = subscription_cli.recipe_for("copilot-cli")
         self.assertEqual(recipe.interactive_login_arguments, ("login",))
         self.assertEqual(recipe.signed_in_arguments, ())
+
+
+class RememberedCliVersionTests(unittest.TestCase):
+    """An unchanged CLI is not started again on every app start."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        patched = mock.patch.dict(os.environ, {"OUR_HARNESS_SWARM_RUN_DIR": str(self.root / "runtime")})
+        patched.start()
+        self.addCleanup(patched.stop)
+        from our_harness.providers import version_memory
+        self.memory = version_memory
+
+    def launcher(self) -> tuple[Path, Path]:
+        target = self.root / "npm" / "node_modules" / "tool" / "cli.js"
+        target.parent.mkdir(parents=True)
+        target.write_text("console.log('1.0.0')", encoding="utf-8")
+        shim = self.root / "npm" / "tool.cmd"
+        shim.write_text("@ECHO off\n" + r'"%dp0%\node_modules\tool\cli.js" %*' + "\n", encoding="utf-8")
+        return shim, target
+
+    def test_a_launcher_answer_is_reused_until_its_package_changes(self) -> None:
+        shim, target = self.launcher()
+        self.memory.remember("seen.json", ["key"], str(shim), [1, 0, 0])
+        self.assertEqual(self.memory.load("seen.json"), [(["key"], [1, 0, 0])])
+        # npm updating the package leaves the launcher itself untouched.
+        target.write_text("console.log('2.0.0') // updated", encoding="utf-8")
+        self.assertEqual(self.memory.load("seen.json"), [])
+
+    def test_an_executable_is_identified_by_its_own_file(self) -> None:
+        program = self.root / "tool.exe"
+        program.write_bytes(b"MZ one")
+        self.memory.remember("seen.json", ["exe"], str(program), {"state": "observed"})
+        self.assertEqual(len(self.memory.load("seen.json")), 1)
+        program.write_bytes(b"MZ two, a newer build")
+        self.assertEqual(self.memory.load("seen.json"), [])
+
+    def test_a_program_that_cannot_be_identified_is_never_remembered(self) -> None:
+        script = self.root / "tool"
+        script.write_text("#!/bin/sh\necho 1.0", encoding="utf-8")
+        self.memory.remember("seen.json", ["sh"], str(script), [1, 0])
+        empty = self.root / "empty.cmd"
+        empty.write_text("@ECHO off\r\necho nothing\r\n", encoding="utf-8")
+        self.memory.remember("seen.json", ["cmd"], str(empty), [1, 0])
+        self.assertEqual(self.memory.load("seen.json"), [])
+        (self.root / "runtime").mkdir(exist_ok=True)
+        (self.root / "runtime" / "seen.json").write_text("{damaged", encoding="utf-8")
+        self.assertEqual(self.memory.load("seen.json"), [])
+
+    def test_a_restart_reuses_the_version_instead_of_starting_the_cli(self) -> None:
+        shim, _target = self.launcher()
+        answered = CommandResult(["tool", "--version"], str(self.root), 0, "tool 3.4.5\n", "", 1)
+        with mock.patch.object(subscription_cli, "_run_bounded", return_value=answered) as ran:
+            self.assertEqual(subscription_cli._the_version_of(str(shim)), (3, 4, 5))
+            subscription_cli._tool_version_cache.clear()  # a new process
+            self.assertEqual(subscription_cli._the_version_of(str(shim)), (3, 4, 5))
+        self.assertEqual(ran.call_count, 1)

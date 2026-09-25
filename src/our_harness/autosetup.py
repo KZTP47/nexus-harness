@@ -140,7 +140,7 @@ PLANS: dict[str, Plan] = {
         label="Claude command line",
         route_name="claude",
         kind="claude-cli",
-        model="claude-sonnet-4-5",
+        model="claude-opus-5",
         command="claude",
         where_to_get_it="the Claude Code install page",
     ),
@@ -178,7 +178,7 @@ PLANS: dict[str, Plan] = {
         label="Anthropic",
         route_name="anthropic",
         kind="anthropic",
-        model="claude-sonnet-4-5",
+        model="claude-opus-5",
         endpoint="https://api.anthropic.com/v1",
         key_name="ANTHROPIC_API_KEY",
         where_to_get_it="console.anthropic.com",
@@ -231,6 +231,10 @@ def _run(parts: list[str], seconds: float) -> tuple[int, str]:
 
 
 def _answering(endpoint: str, seconds: float = 2.0) -> bool:
+    from .local_probe import loopback_refuses
+
+    if loopback_refuses(endpoint):
+        return False
     try:
         with urllib.request.urlopen(f"{endpoint.rstrip('/')}/api/tags", timeout=seconds) as answer:
             return 200 <= int(answer.status) < 500

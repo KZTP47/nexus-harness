@@ -2467,6 +2467,12 @@ def _blocking_remaining(items: list[str]) -> list[str]:
     ]
 
 
+def _member_model(member: dict[str, Any]) -> str:
+    """The model the user picked for this board agent now ("" = its route default)."""
+    from .swarm import agent_model
+    return agent_model(str(member.get("id") or ""), str(member.get("who") or "")) or str(member.get("model") or "")
+
+
 def _decode_with_one_web_repair(
     config: LoadedConfig,
     one: dict[str, Any],
@@ -2607,6 +2613,7 @@ def relay(
             provider_attachments=provider_files,
             conversation_key=conversation_key,
             prefer_existing_conversation=prefer_existing_conversation,
+            model=_member_model(lead),
         )
     except cancellation.ChatCancelled:
         raise
@@ -2675,6 +2682,7 @@ def relay(
             provider_attachments=provider_files,
             conversation_key=conversation_key,
             prefer_existing_conversation=prefer_existing_conversation,
+            model=_member_model(peer),
         )
     except cancellation.ChatCancelled:
         raise
@@ -2852,6 +2860,7 @@ def collaborate(
                 context=context, provider_attachments=provider_files,
                 conversation_key=conversation_key,
                 prefer_existing_conversation=prefer_existing_conversation,
+                model=_member_model(one),
             )
         except cancellation.ChatCancelled:
             raise
@@ -3154,6 +3163,7 @@ def collaborate(
                     response_format=DISCUSSION_FORMAT,
                     conversation_key=conversation_key,
                     prefer_existing_conversation=prefer_existing_conversation,
+                    model=_member_model(one),
                 )
             except cancellation.ChatCancelled:
                 raise
@@ -3443,6 +3453,7 @@ def collaborate(
                 provider_attachments=provider_files,
                 conversation_key=conversation_key,
                 prefer_existing_conversation=prefer_existing_conversation,
+                model=_member_model(reporter),
             )
         except cancellation.ChatCancelled:
             raise
@@ -12762,6 +12773,7 @@ def work_together(
                 response_format=PLAN_FORMAT,
                 conversation_key=conversation_key,
                 prefer_existing_conversation=prefer_existing_conversation,
+                model=_member_model(one),
             )
             _ack_shared(ledger, one)
             decoded = _decode_with_one_web_repair(
@@ -12948,6 +12960,7 @@ def work_together(
                     response_format=PLAN_REVIEW_FORMAT,
                     conversation_key=conversation_key,
                     prefer_existing_conversation=prefer_existing_conversation,
+                    model=_member_model(one),
                 )
                 _ack_shared(ledger, one)
                 value = _decode_with_one_web_repair(
@@ -13528,6 +13541,7 @@ def work_together(
                             response_format=EXECUTION_FORMAT,
                             conversation_key=conversation_key,
                             prefer_existing_conversation=prefer_existing_conversation,
+                            model=_member_model(executor),
                         )
                         _ack_shared(ledger, executor)
                         execution = _decode_with_one_web_repair(
@@ -13796,6 +13810,7 @@ def work_together(
                     response_format=WORK_VERIFICATION_FORMAT,
                     conversation_key=conversation_key,
                     prefer_existing_conversation=prefer_existing_conversation,
+                    model=_member_model(one),
                 )
                 _ack_shared(ledger, one)
                 value = _decode_with_one_web_repair(

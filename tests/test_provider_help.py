@@ -34,6 +34,11 @@ class ProviderHelpTests(unittest.TestCase):
         )
         self.reachable.start()
         self.addCleanup(self.reachable.stop)
+        # The fast loopback pre-check opens a real socket; leave the answer to
+        # the patched network call so no test depends on what this machine runs.
+        self.listening = mock.patch.object(provider_help, "loopback_refuses", return_value=False)
+        self.listening.start()
+        self.addCleanup(self.listening.stop)
         self.which = mock.patch.object(subscription_cli.shutil, "which", return_value=None)
         self.which.start()
         self.addCleanup(self.which.stop)
@@ -399,6 +404,62 @@ class CheckupEndpointTests(unittest.TestCase):
                 self.assertIn("headline", body["model_setup"])
             finally:
                 connection.close()
+
+
+class LoopbackProbeTests(unittest.TestCase):
+    """The shared pre-check that keeps a stopped local model from costing seconds."""
+
+    def setUp(self) -> None:
+        from our_harness import local_probe
+
+        self.probe = local_probe
+        local_probe.forget()
+        self.addCleanup(local_probe.forget)
+
+    @staticmethod
+    def free_port() -> int:
+        import socket
+
+        with socket.socket() as spare:
+            spare.bind(("127.0.0.1", 0))
+            return spare.getsockname()[1]
+
+    def test_a_stopped_local_service_is_refused_quickly(self) -> None:
+        import time
+
+        address = f"http://127.0.0.1:{self.free_port()}"
+        started = time.monotonic()
+        self.assertTrue(self.probe.loopback_refuses(address))
+        self.assertLess(time.monotonic() - started, 1.5)
+        # The real helper gives the same answer without waiting on urllib.
+        started = time.monotonic()
+        self.assertFalse(provider_help._reachable(address + "/api/tags"))
+        self.assertLess(time.monotonic() - started, 1.5)
+
+    def test_a_listening_local_service_is_left_to_the_real_request(self) -> None:
+        import socket
+
+        with socket.socket() as server:
+            server.bind(("127.0.0.1", 0))
+            server.listen()
+            self.assertFalse(self.probe.loopback_refuses(f"http://127.0.0.1:{server.getsockname()[1]}/api/tags"))
+
+    def test_remote_and_malformed_addresses_are_never_decided_here(self) -> None:
+        with mock.patch.object(self.probe.socket, "getaddrinfo") as lookup:
+            for address in ("https://api.example.invalid/v1", "http://10.1.2.3:11434", "", "not a url", "http://[bad"):
+                self.assertFalse(self.probe.loopback_refuses(address))
+        lookup.assert_not_called()
+
+    def test_one_screen_asks_once_and_a_later_look_asks_again(self) -> None:
+        now = [100.0]
+        with mock.patch.object(self.probe, "_listening", return_value=False) as asked:
+            for _ in range(3):
+                self.assertTrue(self.probe.loopback_refuses("http://localhost:11434", clock=lambda: now[0]))
+            self.assertEqual(asked.call_count, 1)
+            now[0] += self.probe.REMEMBER_SECONDS + 1
+            asked.return_value = True
+            self.assertFalse(self.probe.loopback_refuses("http://localhost:11434", clock=lambda: now[0]))
+            self.assertEqual(asked.call_count, 2)
 
 
 if __name__ == "__main__":

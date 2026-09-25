@@ -117,3 +117,19 @@
 .nexus-mail-toast-close:hover { background: rgba(255, 255, 255, .12); color: #fff; }
 @keyframes nexus-mail-toast-in { from { transform: translateY(110%); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
 @media (prefers-reduced-motion: reduce) { .nexus-mail-toast { animation-duration: 1ms; } }
+/* Pictures and files: with the incoming email, attached to a reply, or given with a request. */
+.email-files { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; margin: 10px 0; }
+.email-files:empty { display: none; }
+.email-file { display: flex; flex-direction: column; gap: 4px; min-width: 0; padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--deep); }
+.email-file-preview { display: block; width: 100%; max-height: 150px; object-fit: contain; border-radius: 6px; background: rgba(255,255,255,.04); cursor: zoom-in; }
+.email-file-preview.is-open { max-height: none; cursor: zoom-out; }
+.email-file:has(.email-file-preview.is-open) { grid-column: 1 / -1; }
+.email-file-name { font-weight: 600; overflow-wrap: anywhere; }
+.email-file-note { color: var(--muted); font-size: .85rem; overflow-wrap: anywhere; }
+.email-file-missing { border-style: dashed; }
+.email-file-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: auto; }
+.email-file-actions button { padding: 2px 10px; font-size: .85rem; }
+.email-attach-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 8px 0; }
+.email-attach-row input[type="file"] { display: none; }
+.email-drop-target { outline: 2px dashed var(--cyan); outline-offset: 2px; }
+.email-compose-files { color: var(--muted); overflow-wrap: anywhere; }

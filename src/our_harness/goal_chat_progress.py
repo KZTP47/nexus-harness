@@ -9,6 +9,7 @@ from typing import Any
 EVENT_TYPES = frozenset({
     "provider_dispatched", "provider_reply_received", "context_step_acknowledged",
     "context_tool_requested", "context_tool_result", "context_tool_failed",
+    "provider_prompt_refused",
 })
 
 TOOL_NAMES = {
@@ -67,6 +68,12 @@ def milestone(event: dict[str, Any], agent_name: str) -> tuple[str, str] | None:
         if payload.get("phase") in {"context_tools", "context_tools_resume", "requested_files"}:
             return f"Nexus sent the tool results and updated context to {agent_name}. Waiting for the next reply.", "waiting"
         return f"Nexus sent a request to {agent_name}. Waiting for a reply.", "waiting"
+    if kind == "provider_prompt_refused":
+        attempt = int(payload.get("attempt") or 1)
+        most = int(payload.get("max_attempts") or attempt)
+        return (f"{agent_name}'s provider refused that prompt under its usage policy. This is not a "
+                f"sign-in or connection problem, and nothing ran. Nexus left out the looping tool history "
+                f"and is asking again (retry {attempt} of {most})."), "retrying"
     if kind == "provider_reply_received":
         return f"{agent_name} returned a response. Nexus is checking it.", "received"
     if kind == "context_step_acknowledged":

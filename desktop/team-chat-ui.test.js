@@ -49,6 +49,35 @@ for (const view of ["compact", "maximized"]) {
     const steer = f.calls.find(one => one.body?.action === 'steer');
     assert.deepEqual(steer.body.payload.participant_ids, [f.agent.id]);
   });
+  test(`${view}: Work asks before the slow goal inventory read and asks only once`, async () => {
+    const f = fixture(view);
+    f.inventory = []; f.context.longGoals = [];
+    const asked = [];
+    f.context.confirmProjectWork = (agent, words, mode, alreadyConfirmed = false) => {
+      asked.push({alreadyConfirmed, callsBefore: f.calls.length});
+      return {allowed: true, confirmed: true};
+    };
+    await f.send("work");
+    assert.deepEqual(asked.map(one => one.alreadyConfirmed), [false, true]);
+    assert.equal(asked[0].callsBefore, 0, "The question comes before any request");
+    assert.equal(f.calls[0].url, "/api/long-horizon/goals");
+    assert.equal(f.calls.filter(one => one.url === "start").length, 1);
+  });
+  test(`${view}: declining the early Work question sends nothing`, async () => {
+    const f = fixture(view);
+    f.inventory = []; f.context.longGoals = [];
+    f.context.confirmProjectWork = () => ({allowed: false, confirmed: false});
+    await f.send("work");
+    assert.deepEqual(f.calls, []);
+  });
+  test(`${view}: Work into a chat that already shows a goal is not asked early`, async () => {
+    const f = fixture(view);
+    const asked = [];
+    f.context.confirmProjectWork = (...args) => { asked.push(args[3] || false); return {allowed: true, confirmed: true}; };
+    await f.send("work");
+    assert.equal(asked.includes(true), false);
+    assert.equal(f.calls[0].url, "/api/long-horizon/goals");
+  });
   test(`${view}: singleton ordinary chat stays direct and actual collaboration remains blocked`, async () => {
     const f = fixture(view); f.conversation.pair = [f.agent.id];
     f.inventory = []; f.context.longGoals = [];

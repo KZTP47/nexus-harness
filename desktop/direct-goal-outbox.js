@@ -145,10 +145,14 @@ function normalizedPayload(raw) {
   const policy = {};
   if (Object.hasOwn(raw, "policy")) {
     exactKeys(raw.policy, new Set(["agent_access_mode", "execution_mode", "collaboration"]), "Direct-goal permissions");
-    if (!["read_only", "ask", "full"].includes(raw.policy.agent_access_mode)) {
-      throw fail("NEXUS_OUTBOX_INVALID", "Direct-goal permissions must name a supported access mode.");
+    // An omitted mode is the user keeping the default; the server applies it.
+    policy.policy = {};
+    if (Object.hasOwn(raw.policy, "agent_access_mode")) {
+      if (!["read_only", "ask", "full"].includes(raw.policy.agent_access_mode)) {
+        throw fail("NEXUS_OUTBOX_INVALID", "Direct-goal permissions must name a supported access mode.");
+      }
+      policy.policy.agent_access_mode = raw.policy.agent_access_mode;
     }
-    policy.policy = {agent_access_mode: raw.policy.agent_access_mode};
     if (Object.hasOwn(raw.policy, "execution_mode")) {
       if (!["isolated", "facilitator"].includes(raw.policy.execution_mode)) {
         throw fail("NEXUS_OUTBOX_INVALID", "Direct-goal permissions must name a supported execution mode.");

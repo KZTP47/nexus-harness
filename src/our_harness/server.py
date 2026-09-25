@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import copy
 import json
 import hashlib
@@ -22,7 +23,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import files
 from pathlib import Path
-from typing import Any, Iterator, TYPE_CHECKING
+from typing import Any, Callable, Iterator, TYPE_CHECKING
 
 from . import bundle
 from . import cancellation
@@ -269,6 +270,30 @@ def _a_name_for_a_local_route(server: str, model: str) -> str:
 _CHAT_ACTIVITY_ID = re.compile(r"^[A-Za-z0-9_-]{8,80}$")
 
 
+def _public_activity_row(event: dict[str, Any]) -> dict[str, Any]:
+    """The bounded part of one PublicStream event that a chat page shows."""
+
+    def text(value: object, limit: int) -> str:
+        return str(value if value is not None else "")[:limit]
+    row = {
+        "id": text(event.get("id"), 200),
+        "kind": text(event.get("kind"), 40),
+        "status": text(event.get("status"), 40),
+        "name": text(event.get("name"), 120),
+        "route": text(event.get("route"), 100),
+        "provider": text(event.get("provider"), 40),
+        "text": text(event.get("text"), 4000),
+    }
+    for key in ("arguments", "result"):
+        value = event.get(key)
+        if value not in (None, "", {}, []):
+            try:
+                row[key] = json.dumps(value, ensure_ascii=False, default=str)[:2000]
+            except (TypeError, ValueError):
+                row[key] = text(value, 2000)
+    return row
+
+
 class ChatActivities:
     """Small process-local progress feed for long board-chat requests."""
 
@@ -331,6 +356,33 @@ class ChatActivities:
             previous["turns"] = [*previous.get("turns", []), kept][-16:]
             self.records[wanted] = previous
 
+    # Live, allow-listed provider activity (thinking summaries, tool calls,
+    # file edits, interim messages). Bounded per chat and per event; a newer
+    # state of the same item replaces the older one.
+    ACTIVITY_KEEP = 60
+
+    def add_activity(self, activity_id: object, event: object) -> None:
+        wanted = self._id(activity_id)
+        if not wanted or not isinstance(event, dict):
+            return
+        kept = _public_activity_row(event)
+        now = time.time()
+        with self.lock:
+            previous = self.records.get(wanted, {})
+            previous["activity"] = wanted
+            previous.setdefault("state", "working")
+            previous.setdefault("stage", "Agents are working")
+            previous.setdefault("detail", "Live activity from the agents appears below.")
+            previous.setdefault("started_at", now)
+            previous["updated_at"] = now
+            rows = [one for one in previous.get("provider_activity", [])
+                    if one.get("id") != kept["id"] or not kept["id"]]
+            kept["at"] = now
+            previous["provider_activity"] = [*rows, kept][-self.ACTIVITY_KEEP:]
+            self.records[wanted] = previous
+            while len(self.records) > self.limit:
+                self.records.pop(next(iter(self.records)))
+
     def read(self, activity_id: object) -> dict[str, Any]:
         wanted = self._id(activity_id)
         if not wanted:
@@ -361,6 +413,26 @@ class HarnessHTTPServer(ThreadingHTTPServer):
         self.started_id = secrets.token_urlsafe(8)
         from .email_service import EmailService
         self.email = EmailService(self)
+        from .session_health import SessionHealthMonitor
+        # Watches every configured CLI sign-in. Constructed for every server so
+        # the UI can always read it; only serve_ui starts its background work.
+        self.session_health = SessionHealthMonitor(
+            lambda: self.config,
+            settings_path=swarm_runs._base().parent / "session-health.json",
+        )
+        self.session_health.on_recovered(self._session_recovered)
+        # Goals paused by a provider usage limit resume after it resets.
+        self._limit_attempts: dict[str, int] = {}
+        self._limit_seen: dict[str, int] = {}
+        self._limit_resume_stop = threading.Event()
+        from .agent_runtime.manager import RuntimeManager
+        # Agent Runtime v3: persistent, streaming agent sessions ("Live team").
+        self.live_teams = RuntimeManager(
+            root=swarm_runs._base().parent / "agent-runtime-v3",
+            board=lambda: self.swarm_standing().get("board", {}),
+            config=lambda: self.config,
+            project_root=lambda: self.config.project_root,
+        )
         self.events = EventBus(redactor=CredentialRedactor(config))
         self._swarm_runs: swarm_runs.SwarmRunStore | None = None
         self._swarm_communication_runs: swarm_runs.SwarmRunStore | None = None
@@ -559,7 +631,7 @@ class HarnessHTTPServer(ThreadingHTTPServer):
                     self._long_horizon = None
                     self._long_horizon_recovering = old_long_horizon
                 old_long_horizon.close()
-            with self.authority_lock:
+            with self._store_builds_settled(), self.authority_lock:
                 # An automatic start may have won the first live-worker check.
                 # close stops new starts, but a blocked provider may still be
                 # draining. Its config/checkpointer must remain owned until done.
@@ -570,6 +642,7 @@ class HarnessHTTPServer(ThreadingHTTPServer):
                     )
                 self._long_horizon_recovering = None
                 if reset_project_state:
+                    self._reset_stores_epoch()
                     self._pipeline_store = None
                     self._swarm_runs = None
                     self._swarm_communication_runs = None
@@ -605,34 +678,80 @@ class HarnessHTTPServer(ThreadingHTTPServer):
                 self._swarm_known_routes_revision = 0
         return config
 
+    def _lazy_store(self, attribute: str, build: Callable[[LoadedConfig], Any]) -> Any:
+        """Open one cached store without holding ``authority_lock`` while it opens.
+
+        Opening a run store verifies every saved run's integrity, which takes
+        seconds on a long-used install. Doing that under ``authority_lock``
+        made every other request that merely reads the config - including the
+        chat list a user just opened - wait for it. Each store still opens
+        once; a settings or authority reset during the open is detected by the
+        store epoch and the store is opened again for the current state.
+        """
+
+        locks = self.__dict__.setdefault("_store_build_locks", {})
+        lock = locks.setdefault(attribute, threading.Lock())
+        while True:
+            with self.authority_lock:
+                held = getattr(self, attribute)
+                if held is not None:
+                    return held
+            with lock:
+                with self.authority_lock:
+                    held = getattr(self, attribute)
+                    if held is not None:
+                        return held
+                    config = self.config
+                    epoch = getattr(self, "_store_epoch", 0)
+                built = build(config)
+                with self.authority_lock:
+                    if getattr(self, "_store_epoch", 0) == epoch and self.config is config:
+                        if getattr(self, attribute) is None:
+                            setattr(self, attribute, built)
+                        return getattr(self, attribute)
+
+    def _reset_stores_epoch(self) -> None:
+        """Caller holds ``authority_lock``; stores opened before this are stale."""
+
+        self._store_epoch = getattr(self, "_store_epoch", 0) + 1
+
+    _LAZY_STORES = ("_pipeline_store", "_swarm_communication_runs", "_swarm_goal_queue", "_swarm_runs")
+
+    @contextmanager
+    def _store_builds_settled(self) -> Iterator[None]:
+        """Wait for every store that is opening, and hold new opens off.
+
+        A project move or authority repair must not overtake a store that is
+        still opening for the old project: that store is handed to the caller
+        who asked for it, and only then is the cache cleared. Take this before
+        ``authority_lock``, the same order every store open uses.
+        """
+
+        locks = self.__dict__.setdefault("_store_build_locks", {})
+        held = [locks.setdefault(name, threading.Lock()) for name in self._LAZY_STORES]
+        for lock in held:
+            lock.acquire()
+        try:
+            yield
+        finally:
+            for lock in reversed(held):
+                lock.release()
+
     @property
     def pipeline_store(self) -> pipeline_runtime.PipelineRunStore:
-        with self.authority_lock:
-            held = self._pipeline_store
-            if held is None:
-                held = pipeline_runtime.PipelineRunStore(self.config)
-                self._pipeline_store = held
-            return held
+        return self._lazy_store("_pipeline_store", pipeline_runtime.PipelineRunStore)
 
     @property
     def swarm_runs(self) -> swarm_runs.SwarmRunStore:
-        with self.authority_lock:
-            held = self._swarm_runs
-            if held is None:
-                held = swarm_runs.SwarmRunStore(self.config)
-                self._swarm_runs = held
-            return held
+        return self._lazy_store("_swarm_runs", swarm_runs.SwarmRunStore)
 
     @property
     def swarm_communication_runs(self) -> swarm_runs.SwarmRunStore:
         """Durable provider/chat effects that carry no project-work authority."""
 
-        with self.authority_lock:
-            held = self._swarm_communication_runs
-            if held is None:
-                held = swarm_runs.SwarmRunStore.for_communication(self.config)
-                self._swarm_communication_runs = held
-            return held
+        return self._lazy_store(
+            "_swarm_communication_runs", swarm_runs.SwarmRunStore.for_communication,
+        )
 
     def find_swarm_run(
         self, identity: str,
@@ -704,26 +823,23 @@ class HarnessHTTPServer(ThreadingHTTPServer):
 
     @property
     def swarm_runner(self) -> swarm_lab.Running:
-        with self.authority_lock:
-            held = self._swarm_runner
-            if held is None:
-                # Avoid recursively taking authority_lock via the property.
-                store = self._swarm_runs
-                if store is None:
-                    store = swarm_runs.SwarmRunStore(self.config)
-                    self._swarm_runs = store
-                held = swarm_lab.Running(store)
-                self._swarm_runner = held
-            return held
+        while True:
+            with self.authority_lock:
+                held = self._swarm_runner
+                if held is not None:
+                    return held
+            # Opened outside authority_lock; see _lazy_store.
+            store = self.swarm_runs
+            with self.authority_lock:
+                if self._swarm_runner is not None:
+                    return self._swarm_runner
+                if self._swarm_runs is store:
+                    self._swarm_runner = swarm_lab.Running(store)
+                    return self._swarm_runner
 
     @property
     def swarm_goal_queue(self) -> swarm_goal_queue.SwarmGoalQueueStore:
-        with self.authority_lock:
-            held = self._swarm_goal_queue
-            if held is None:
-                held = swarm_goal_queue.SwarmGoalQueueStore(self.config)
-                self._swarm_goal_queue = held
-            return held
+        return self._lazy_store("_swarm_goal_queue", swarm_goal_queue.SwarmGoalQueueStore)
 
     @property
     def long_horizon(self) -> long_horizon.LongHorizonRuntime:
@@ -742,7 +858,8 @@ class HarnessHTTPServer(ThreadingHTTPServer):
                     # Recovery starts the scheduler watcher, which calls back
                     # into authority-protected legacy ownership. Holding that
                     # lock here deadlocks the watcher and every board/chat read.
-                    held.recover_all()
+                    with chat_lab.remembered_route_contexts():
+                        held.recover_all()
                 except BaseException:
                     # close may return while a provider is still draining. Keep
                     # ownership visible so retry/settings cannot orphan it.
@@ -961,6 +1078,12 @@ class HarnessHTTPServer(ThreadingHTTPServer):
             board = copy.deepcopy(self.swarm_standing()["board"])
             communication_runs = self.swarm_communication_runs
             store = self.long_horizon.store
+        from . import goal_chat_projection
+
+        # Goals whose chat holds everything they have to say, per transcript.
+        # Recorded after every goal here is done, because another goal's
+        # replay into the same chat changes the bytes the receipt names.
+        settled: dict[tuple[str, str], list[dict[str, Any]]] = {}
         for goal in chat_goals:
             chat_id = str(goal.get("conversation_id") or "")
             try:
@@ -977,6 +1100,11 @@ class HarnessHTTPServer(ThreadingHTTPServer):
                         conversation.get("transcript_route") or ""
                     )
                     filed_as = str(conversation.get("filed_as") or "")
+                    if goal_chat_projection.already_projected(
+                        config, transcript_route, goal, filed_as=filed_as,
+                    ):
+                        settled.setdefault((transcript_route, filed_as), []).append(goal)
+                        continue
                     public_dialogue_archived = HarnessHTTPServer._project_long_horizon_dialogue(
                         self, goal, conversation, config=config, store=store,
                     )
@@ -1051,6 +1179,7 @@ class HarnessHTTPServer(ThreadingHTTPServer):
                     )
                     if status_projection.get("binding_missing"):
                         continue
+                    settled.setdefault((transcript_route, filed_as), []).append(goal)
             except HarnessError as exc:
                 # A normal chat turn owns this exact transcript briefly.
                 # Its next goal poll will reconcile the status; unrelated
@@ -1058,6 +1187,10 @@ class HarnessHTTPServer(ThreadingHTTPServer):
                 if "already working on another request" in str(exc):
                     continue
                 raise
+        for (transcript_route, filed_as), done in settled.items():
+            goal_chat_projection.remember_projected(
+                config, transcript_route, done, filed_as=filed_as,
+            )
 
     @staticmethod
     def require_long_horizon_chat_binding(
@@ -2985,7 +3118,99 @@ class HarnessHTTPServer(ThreadingHTTPServer):
         root = self._board_project_path(board, project_id)
         return self.require_no_long_horizon_path(root)
 
+    def _session_recovered(self, routes: list[str]) -> None:
+        """A sign-in works again: forget the refusals and let waiting work go."""
+
+        for route in routes:
+            chat_lab._write_down_that_it_would_not(self.config, route, "")
+        with self.authority_lock:
+            # Readiness is re-read on the next board refresh.
+            self._swarm_known_routes_revision = 0
+        try:
+            self.email.provider_recovered(routes)
+        finally:
+            self._resume_provider_paused_goals(routes)
+
+    def _resume_provider_paused_goals(self, routes: list[str]) -> list[str]:
+        """Resume goals that paused only because one of these routes failed.
+
+        The same resume the goal card's Resume button performs, for goals whose
+        pause note says required provider work failed and whose team uses one
+        of the routes that works again. Anything else stays for the user.
+        """
+
+        wanted = set(routes)
+        resumed: list[str] = []
+        try:
+            goals = self.long_horizon.store.list(100)
+        except Exception:
+            return resumed
+        for goal in goals:
+            if goal.get("status") != "paused" or not str(goal.get("note") or "").startswith(
+                    "Required provider work failed"):
+                continue
+            if not wanted & {str(one.get("who") or one.get("route") or "") for one in goal.get("agents") or []}:
+                continue
+            if self._resume_paused_goal(goal):
+                resumed.append(str(goal.get("goal_id") or ""))
+        return resumed
+
+    def _resume_paused_goal(self, goal: dict[str, Any]) -> bool:
+        """The goal card's Resume, performed by Nexus for a provider-only pause."""
+        goal_id = str(goal.get("goal_id") or "")
+        try:
+            self.require_project_execution_authority(Path(str(goal.get("project", {}).get("path") or "")))
+            with self.project_admission_lock, self.swarm_lock:
+                runtime = self.long_horizon
+                if goal.get("require_all_participants") is True:
+                    projects = self.swarm_standing().get("board", {}).get("projects", [])
+                    selected = next((one for one in projects if isinstance(one, dict)
+                                     and one.get("id") == goal.get("project", {}).get("id")), None)
+                    if selected is None:
+                        return False
+                    runtime.resume(goal_id, project_verification_settings=selected)
+                else:
+                    runtime.resume(goal_id)
+            return True
+        except Exception:
+            return False
+
+    def resume_limited_goals(self, now: float | None = None) -> list[str]:
+        """Resume goals paused only by a provider usage limit whose reset time has passed."""
+        from . import limit_resume
+        now_ms = int((time.time() if now is None else now) * 1000)
+        resumed: list[str] = []
+        try:
+            goals = self.long_horizon.store.list(100)
+        except Exception:
+            return resumed
+        for goal in goals:
+            goal_id = str(goal.get("goal_id") or "")
+            attempt = self._limit_attempts.get(goal_id, 0)
+            planned = limit_resume.plan(goal, attempt=attempt)
+            if not planned or planned["gives_up"] or now_ms < planned["at_ms"]:
+                continue
+            if self._limit_seen.get(goal_id) == planned["paused_ms"]:
+                continue
+            self._limit_seen[goal_id] = planned["paused_ms"]
+            self._limit_attempts[goal_id] = attempt + 1
+            if self._resume_paused_goal(goal):
+                resumed.append(goal_id)
+        return resumed
+
+    def start_limit_resume(self, every: float = 60.0) -> None:
+        def watch() -> None:
+            while not self._limit_resume_stop.wait(every):
+                try:
+                    self.resume_limited_goals()
+                except Exception:
+                    pass
+        threading.Thread(target=watch, name="nexus-limit-resume", daemon=True).start()
+
     def server_close(self) -> None:
+        self._limit_resume_stop.set()
+        self.live_teams.close_all()
+        self.session_health.close()
         self.email.close()
         with self._long_horizon_lifecycle_lock:
             with self.authority_lock:
@@ -3333,7 +3558,9 @@ class HarnessHandler(BaseHTTPRequestHandler):
 
         swarm_lab._set_board_qa_request_capability("")  # noqa: SLF001
         try:
-            super().handle_one_request()
+            # One request resolves the same few agent routes many times.
+            with chat_lab.remembered_route_contexts():
+                super().handle_one_request()
         finally:
             swarm_lab._set_board_qa_request_capability("")  # noqa: SLF001
 
@@ -3583,19 +3810,24 @@ class HarnessHandler(BaseHTTPRequestHandler):
         """One plain-language answer to 'is this project ready to use?'."""
 
         config = self.server.config
-        doctor = run_doctor(config)
-        detections = [item.to_dict() for item in detect_project(config.project_root)]
-        suite = self._qa_suite()
-        commands = {
-            kind: list(config.get(f"project.{kind}_commands") or [])
-            or combined_commands(detect_project(config.project_root), kind)
-            for kind in ("test", "lint", "build")
-        }
-        # The legacy workflow uses the default route. Explicit trusted agents
-        # are a deliberate workflow choice, so every one of their effective
-        # routes must be ready; an unrelated healthy provider must never turn
-        # this step green.
-        route_readiness = effective_route_readiness(config)
+        # The doctor and the route readiness each wait on CLIs or local
+        # services; they are independent, so ask both at once.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            doctor_answer = pool.submit(run_doctor, config)
+            readiness_answer = pool.submit(effective_route_readiness, config)
+            detections = [item.to_dict() for item in detect_project(config.project_root)]
+            suite = self._qa_suite()
+            commands = {
+                kind: list(config.get(f"project.{kind}_commands") or [])
+                or combined_commands(detect_project(config.project_root), kind)
+                for kind in ("test", "lint", "build")
+            }
+            doctor = doctor_answer.result()
+            # The legacy workflow uses the default route. Explicit trusted agents
+            # are a deliberate workflow choice, so every one of their effective
+            # routes must be ready; an unrelated healthy provider must never turn
+            # this step green.
+            route_readiness = readiness_answer.result()
         provider_ready = bool(route_readiness) and all(item["ready"] for item in route_readiness)
         first_request_routes = [item["route"] for item in route_readiness if item.get("ready_for_first_request")]
         route_problem = "; ".join(
@@ -3815,11 +4047,54 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 self._static("app.js", "text/javascript; charset=utf-8")
             elif parsed.path == "/email.js":
                 self._static("email.js", "text/javascript; charset=utf-8")
+            elif parsed.path == "/session-health.js":
+                self._static("session-health.js", "text/javascript; charset=utf-8")
+            elif parsed.path == "/live-team.js":
+                self._static("live-team.js", "text/javascript; charset=utf-8")
+            elif parsed.path == "/chat-orchestrator.js":
+                self._static("chat-orchestrator.js", "text/javascript; charset=utf-8")
+            elif parsed.path == "/live-team.css":
+                self._static("live-team.css", "text/css; charset=utf-8")
             elif parsed.path == "/email.css":
                 self._static("email.css", "text/css; charset=utf-8")
             elif parsed.path == "/api/email":
                 self._require_token()
                 self._json(self.server.email.snapshot())
+            elif parsed.path == "/api/live-team":
+                self._require_token()
+                manager = self.server.live_teams
+                self._json({"agents": manager.available_agents(), "saved": manager.saved(),
+                            "chats": manager.chat_modes(), "settings": manager.settings(),
+                            "project": str(self.server.config.project_root),
+                            "running": [team.snapshot() for team in manager.teams.values() if team.state != "closed"]})
+            elif parsed.path == "/api/session-usage":
+                self._require_token()
+                from . import session_usage
+                query = urllib.parse.parse_qs(parsed.query)
+                wanted = [one for one in query.get("session", []) if one][:10]
+                self._json({"sessions": [session_usage.summary(one) for one in wanted]})
+            elif parsed.path == "/api/live-team/chat":
+                self._require_token()
+                query = urllib.parse.parse_qs(parsed.query)
+                self._json(self.server.live_teams.chat(query.get("chat", [""])[0]))
+            elif parsed.path == "/api/live-team/team":
+                self._require_token()
+                query = urllib.parse.parse_qs(parsed.query)
+                team = self.server.live_teams.team(query.get("team", [""])[0])
+                try:
+                    after = int(query.get("after", ["0"])[0])
+                except ValueError:
+                    after = 0
+                self._json({"team": team.snapshot(), "events": team.events(after)})
+            elif parsed.path == "/api/session-health":
+                # In-memory; every open page polls it to show sign-in problems.
+                self._require_token()
+                query = urllib.parse.parse_qs(parsed.query)
+                try:
+                    after = int(query["after"][0]) if "after" in query else None
+                except ValueError:
+                    after = None
+                self._json(self.server.session_health.snapshot(after))
             elif parsed.path == "/api/email/notifications":
                 # Cheap in-memory read that every open page polls, whatever
                 # tab it shows; it never opens or creates the mail store.
@@ -3955,6 +4230,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     stage = "Starting the request"
                     detail = "Nexus is preparing the agent connection."
                     turns = []
+                    live_rows: dict[str, dict[str, Any]] = {}
                     for event in projection["events"]:
                         payload = event.get("payload")
                         if event.get("kind") == "progress" and isinstance(payload, dict):
@@ -3962,6 +4238,14 @@ class HarnessHandler(BaseHTTPRequestHandler):
                             detail = str(payload.get("detail") or detail)
                         elif event.get("kind") == "agent_turn" and isinstance(payload, dict):
                             turns.append(payload)
+                        elif event.get("kind") == "provider_activity" and isinstance(payload, dict):
+                            key = str(payload.get("id") or len(live_rows))
+                            live_rows.pop(key, None)
+                            live_rows[key] = payload
+                    if not live_rows:
+                        # Rows recorded before the durable run existed.
+                        live_rows = {str(i): one for i, one in enumerate(
+                            self.server.chat_activities.read(identity).get("provider_activity", []))}
                     state = {
                         "accepted": "waiting", "running": "working",
                         "stopping": "stopping", "complete": "complete",
@@ -3970,6 +4254,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     projection.update({
                         "activity": identity, "state": state,
                         "stage": stage, "detail": detail, "turns": turns,
+                        "provider_activity": list(live_rows.values())[-ChatActivities.ACTIVITY_KEEP:],
                     })
                     self._json(projection)
                 except (HarnessError, ValueError):
@@ -4582,10 +4867,14 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     self._json({"result": self.server.qa_result, "running": self.server.qa_lock.locked()})
                 else:
                     refresh = query.get("refresh", [""])[0] == "1"
-                    advice = setup_advice(self.server.config, refresh=refresh)
-                    authority = self.server.project_authority_status()
+                    # Model advice probes CLIs too; let it run beside the checkup.
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                        advice_answer = pool.submit(setup_advice, self.server.config, refresh=refresh)
+                        authority = self.server.project_authority_status()
+                        partial = self._checkup()
+                        advice = advice_answer.result()
                     self._json({
-                        **self._checkup(advice), "model_setup": advice,
+                        **partial, "model_setup": advice,
                         "cannot_run": str(authority.get("reason") or ""),
                         "authority": authority,
                     })
@@ -4990,13 +5279,14 @@ class HarnessHandler(BaseHTTPRequestHandler):
                         raise HarnessError(
                             "A board run is active; stop it before repairing authority."
                         )
-                    with self.server.authority_lock:
+                    with self.server._store_builds_settled(), self.server.authority_lock:
                         authority_id = pipeline_runtime.repair_project_authority(
                             self.server.config.project_root,
                             str(body.get("fingerprint") or ""),
                         )
                         # Discard only cached execution objects, and only after
                         # the descriptor and user-local registration both land.
+                        self.server._reset_stores_epoch()
                         self.server._pipeline_store = None
                         self.server._swarm_runs = None
                         self.server._swarm_runner = None
@@ -5547,6 +5837,17 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     activity.add_turn(activity_id, turn)
                     if run_id and run_store is not None:
                         run_store.event(run_id, "agent_turn", turn)
+
+                def live_provider_activity(event):
+                    # Runs on a provider's observer thread; never raises.
+                    try:
+                        activity.add_activity(activity_id, event)
+                        if run_id and run_store is not None:
+                            run_store.event(run_id, "provider_activity", _public_activity_row(event))
+                    except Exception:
+                        pass
+                activity_scope = chat_lab.streaming_public_activity(
+                    live_provider_activity if activity_id else None)
                 agent_id = str(body.get("agent") or "")
                 chat_id = str(body.get("chat") or "")
                 chat_key = chat_id or agent_id
@@ -5644,6 +5945,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                         raise cleanup_error
 
                 try:
+                    activity_scope.__enter__()
                     # Validate every message before accepting a durable run or
                     # taking a conversation lease. Reusing this checked value
                     # also keeps auto-routed file work from becoming the
@@ -6005,6 +6307,8 @@ class HarnessHandler(BaseHTTPRequestHandler):
                             one.who,
                             objective_text,
                             filed_as=filed_as,
+                            model=one.model,
+                            usage_session=("chat:" + str(conversation.get("id") or "")) if conversation else "",
                             context=swarm_work.board_context(
                                 board_payload, agent_id, peer_id, project_id,
                                 participant_ids=(
@@ -6186,6 +6490,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                         ) from exc
                     raise
                 finally:
+                    activity_scope.__exit__(None, None, None)
                     release_chat_ownership()
                     if response_to_deliver is not None:
                         # Socket delivery is deliberately outside the execution
@@ -6246,6 +6551,52 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     "needs_your_say": done.needs_your_say,
                     **connection,
                 })
+            elif self.path == "/api/live-team":
+                manager = self.server.live_teams
+                action = str(body.get("action") or "")
+                if action == "create":
+                    self._json({"team": manager.create(body)})
+                elif action == "reopen":
+                    self._json({"team": manager.reopen(str(body.get("team") or ""), str(body.get("text") or ""),
+                                                        str(body.get("to") or ""), body.get("attachments"))})
+                elif action == "say":
+                    self._json({"outcomes": manager.say(str(body.get("team") or ""), str(body.get("text") or ""),
+                                                        str(body.get("to") or ""), body.get("attachments"))})
+                elif action == "browser":
+                    self._json({"settings": manager.set_browser(body.get("mode"), body.get("team"))})
+                elif action == "answer":
+                    manager.team(str(body.get("team") or "")).answer(str(body.get("question") or ""),
+                                                                    str(body.get("answer") or ""))
+                    self._json({"answered": True})
+                elif action == "interrupt":
+                    manager.team(str(body.get("team") or "")).interrupt(str(body.get("agent") or ""))
+                    self._json({"interrupted": True})
+                elif action == "close":
+                    manager.close(str(body.get("team") or ""))
+                    self._json({"closed": True})
+                elif action == "chat_mode":
+                    self._json({"chat": manager.set_chat_mode(body.get("chat"), body.get("mode"))})
+                elif action == "chat_new_team":
+                    self._json({"chat": manager.forget_chat_team(body.get("chat"))})
+                else:
+                    raise HarnessError("Unknown live team action.")
+            elif self.path == "/api/session-health":
+                monitor = self.server.session_health
+                action = str(body.get("action") or "")
+                key = str(body.get("session") or "")[:200]
+                if action == "open_sign_in":
+                    self._json(monitor.open_sign_in(key))
+                elif action == "check_now":
+                    monitor.check_now(key)
+                    self._json({"checking": True})
+                elif action == "manual":
+                    monitor.manual(key, bool(body.get("manual", True)))
+                    self._json(monitor.snapshot())
+                elif action == "settings":
+                    monitor.save_settings(body)
+                    self._json(monitor.snapshot())
+                else:
+                    raise HarnessError("Unknown session action.")
             elif self.path == "/api/team/login":
                 # This is intentionally a separate, explicit press from adding
                 # a route. Connecting settings must never pop up an account
@@ -7609,6 +7960,8 @@ def serve_ui(
     if not 0 <= port <= 65535:
         raise HarnessError("The UI port must be between 0 and 65535")
     server = HarnessHTTPServer((host, port), config)
+    server.session_health.start()
+    server.start_limit_resume()
     url = loopback_url(host, server.server_port) + "/"
     print(f"Harness UI: {url}")
     # A desktop shell reads this exact line to find the port it was given.

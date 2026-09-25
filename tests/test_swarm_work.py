@@ -550,6 +550,30 @@ class SwarmWorkTests(unittest.TestCase):
         self.assertEqual(len(effects), 2)
         self.assertNotEqual(effects[0], effects[1])
 
+    def test_format_repair_never_reruns_native_tools(self) -> None:
+        # The repair only reshapes the answer; with native tools on it could
+        # repeat the edits and commands of the turn it corrects.
+        seen: list[str] = []
+        responses = iter([ProviderResponse("not json"), ProviderResponse('{"done":true}')])
+
+        class Provider:
+            structured_retry_is_safe = True
+
+            def complete(self, request):
+                seen.append(request.native_execution)
+                return next(responses)
+
+        request = ProviderRequest(
+            system_prefix="", dynamic_context="", messages=[{"role": "user", "content": "work"}], model="",
+            native_execution="work", response_format=ResponseFormat("repair-native", {
+                "type": "object", "properties": {"done": {"type": "boolean"}},
+                "required": ["done"], "additionalProperties": False,
+            }),
+        )
+        result = chat._complete_with_one_schema_repair(Provider(), request, chat.CredentialRedactor(self.config))
+        self.assertEqual(result.text, '{"done":true}')
+        self.assertEqual(seen, ["work", ""])
+
     def test_ask_once_records_dispatch_only_after_provider_capacity_admission(self) -> None:
         order: list[str] = []
 

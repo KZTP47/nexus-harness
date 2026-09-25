@@ -152,6 +152,8 @@ class EmailConnectorsTests(unittest.TestCase):
         def graph(method,url,headers,body):
             self.calls.append((method,url,headers,body))
             parsed=urllib.parse.urlsplit(url)
+            if parsed.path.endswith('/attachments'):
+                return {'value':[]}
             if parsed.path.startswith('/v1.0/me/messages/'):
                 self.assertEqual(set(urllib.parse.parse_qs(parsed.query)['$select'][0].split(',')),
                                  {'id','from','replyTo','subject','body','internetMessageId','conversationId','receivedDateTime'})
@@ -321,7 +323,7 @@ class EmailConnectorsTests(unittest.TestCase):
         self.assertEqual(len(calls),2)
         self.assertIn('fresh',page['cursor'])
 
-    def test_graph_html_fallback_is_readable_and_attachment_free(self):
+    def test_graph_html_fallback_is_readable_and_body_never_carries_attachments(self):
         connection=self.connect()
         requested=[]
         def transport(method,url,headers,body):
@@ -335,8 +337,11 @@ class EmailConnectorsTests(unittest.TestCase):
         self.assertIn('Thanks & regards',message['body'])
         for unwanted in ('steal','hidden-style','tracker','NOT_IMPORTED','<p>'):
             self.assertNotIn(unwanted,message['body'])
-        self.assertEqual(len(requested),2)
-        self.assertTrue(all('$value' not in url and '/attachments' not in url for url in requested))
+        # The message, then its attachment listing; nothing listed, so nothing downloaded.
+        self.assertEqual(len(requested),3)
+        self.assertTrue(urllib.parse.urlsplit(requested[2]).path.endswith('/html-mail/attachments'))
+        self.assertTrue(all('$value' not in url for url in requested))
+        self.assertNotIn('attachments',message)
 
     def test_gmail_html_only_ignores_attachment_ids_and_inline_attachment_data(self):
         from our_harness.email_connectors import _gmail_body

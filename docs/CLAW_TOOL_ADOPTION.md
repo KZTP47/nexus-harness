@@ -47,6 +47,7 @@ not a claim that Claw's Rust CLI, process IDs or configuration files are install
 | grep_search | `grep_search` | Literal/regex/case options; bounded process and results |
 | WebFetch | `fetch_url` | Existing public URL validation, source links and paging |
 | WebSearch | `web_search` | Public search service; reports access challenges instead of invented results |
+| (Nexus) page preview | `preview_web_page` | Opens a project page in the bundled Chromium from disk and from a 127.0.0.1 server; errors, failed loads, blank check, screenshots in `.harness/previews`; also added to "no checks" verification as evidence, never a gate |
 | TodoWrite | `keep_a_list`, shared task ledger | Existing observable run progress |
 | Skill | `read_local_skill`, `load_skill`, `github_skills` | Local/remote reference reading; no implicit execution authority |
 | Agent | `delegate` action and goal scheduler | Existing configured providers and authenticated task leases |

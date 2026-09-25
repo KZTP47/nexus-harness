@@ -80,6 +80,24 @@ def _transport(method, url, headers, body):
         raise EmailEngineError('EmailEngine could not be reached or returned an invalid response. Check service health and connection settings.') from None
 
 
+def _download_transport(method, url, headers, body):
+    """One attachment's bytes; the JSON transport never carries binary content."""
+    from .email_attachments import MAX_FILE_BYTES
+    request = urllib.request.Request(url, data=body, headers=headers, method=method)
+    try:
+        with urllib.request.build_opener(_NoRedirect()).open(request, timeout=60) as response:
+            raw = response.read(MAX_FILE_BYTES + 1)
+            if len(raw) > MAX_FILE_BYTES:
+                raise EmailEngineError('An attachment exceeds the supported size.')
+            return response.status, raw
+    except urllib.error.HTTPError as exc:
+        return exc.code, b''
+    except EmailEngineError:
+        raise
+    except Exception:
+        raise EmailEngineError('EmailEngine could not return an attachment.') from None
+
+
 def _identifier(value):
     if not isinstance(value, str) or not value or len(value) > 1024 or any(ord(c) < 32 for c in value):
         raise EmailEngineError('A valid EmailEngine account or message identifier is required.')
@@ -134,12 +152,37 @@ class _PlainText(HTMLParser):
 
 
 class EmailEngineClient:
-    def __init__(self, base_url, token, *, transport=None):
+    def __init__(self, base_url, token, *, transport=None, download=None):
         self.base_url = validate_base_url(base_url)
         if not isinstance(token, str) or not token.strip() or any(ord(c) < 33 or ord(c) > 126 for c in token):
             raise EmailEngineError('An EmailEngine API access token is required.')
         self._token = token
         self._transport = transport or _transport
+        self._download = download or _download_transport
+
+    def _attachments(self, prefix, item):
+        """Download the files EmailEngine lists for one message, bounded per file."""
+        from .email_attachments import MAX_FILE_BYTES, MAX_FILES
+        listed = item.get('attachments') if isinstance(item.get('attachments'), list) else []
+        found = []
+        for entry in listed[:MAX_FILES]:
+            if not isinstance(entry, dict) or not isinstance(entry.get('id'), str):
+                continue
+            size = entry.get('encodedSize') if isinstance(entry.get('encodedSize'), int) else 0
+            base = {'name': str(entry.get('filename') or ''), 'type': str(entry.get('contentType') or ''),
+                    'inline': entry.get('inline') is True, 'content_id': str(entry.get('contentId') or ''), 'size': size}
+            if size and size * 3 // 4 > MAX_FILE_BYTES:
+                found.append({**base, 'omitted': 'Larger than the attachment size limit; open it in the mailbox.'})
+                continue
+            try:
+                status, raw = self._download('GET', self.base_url + prefix + '/attachment/' + _identifier(entry['id']),
+                                             {'Authorization': 'Bearer ' + self._token}, None)
+                if not isinstance(status, int) or not 200 <= status < 300 or not isinstance(raw, bytes) or not raw:
+                    raise EmailEngineError('download failed')
+                found.append({**base, 'raw': raw})
+            except EmailEngineError:
+                found.append({**base, 'omitted': 'The file could not be downloaded; open it in the mailbox.'})
+        return found
 
     def _clean(self, value):
         if isinstance(value, str):
@@ -334,10 +377,12 @@ class EmailEngineClient:
             if not isinstance(reply_to, list) or len(reply_to) > 1 or any(not isinstance(addr, dict) or not _address(addr.get('address')) for addr in reply_to):
                 failed_messages.append({'source_id': source_id, 'error': 'This email has multiple or unsupported Reply-To recipients. Review it in the mailbox; no draft was generated.'})
                 continue
+            attachments = self._attachments(prefix, item)
             flags = item.get('flags') if isinstance(item.get('flags'), list) else []
             labels = item.get('labels') if isinstance(item.get('labels'), list) else []
             messages.append({'source_id': source_id, 'sender': sender_address,
-                             'subject': _header(item.get('subject', '')), 'body': body or '(This email has no readable text. Attachments have not been imported.)',
+                             'subject': _header(item.get('subject', '')), 'body': body or ('' if attachments else '(This email has no readable text.)'),
+                             **({'attachments': attachments} if attachments else {}),
                              'received_at': received, 'reply_to': reply_to[0]['address'] if reply_to else '',
                              'internet_message_id': _header(item.get('messageId', '')),
                              'thread_id': _header(item.get('threadId', '')), 'references': ' '.join(_header(value) for value in references)[:8192],
@@ -351,7 +396,7 @@ class EmailEngineClient:
         return {'messages': messages, 'cursor': json.dumps(state, separators=(',', ':')),
                 'has_more': bool(next_cursor), 'warnings': list(dict.fromkeys(warnings)), 'failed_messages': failed_messages}
 
-    def submit_reply(self, account_id, source_id, text, submission_id):
+    def submit_reply(self, account_id, source_id, text, submission_id, attachments=None):
         prefix = '/v1/account/' + _identifier(account_id)
         _identifier(source_id)
         _identifier(submission_id)
@@ -362,7 +407,8 @@ class EmailEngineClient:
         if not self.health()['supports_idempotency']:
             raise EmailEngineError('EmailEngine 2.52.0 or newer is required for safe reply submission.')
         result = self._request('POST', prefix + '/submit',
-                               payload={'text': text, 'reference': {'message': source_id, 'action': 'reply', 'ignoreMissing': False}},
+                               payload={'text': text, 'reference': {'message': source_id, 'action': 'reply', 'ignoreMissing': False},
+                                        **({'attachments': list(attachments)} if attachments else {})},
                                headers={'Idempotency-Key': submission_id})
         if not result.get('queueId') or (result.get('reference') or {}).get('success') is False:
             raise EmailEngineError('EmailEngine submission outcome is unresolved. Do not submit another reply; reconcile this approval.')

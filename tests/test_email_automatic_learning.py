@@ -314,6 +314,45 @@ class EmailAutomaticLearningTests(unittest.TestCase):
         self.review()
         self.assertNotIn('Keep a formal professional tone.', self.generation_context()['approved_preferences'])
 
+    def outcome(self, draft):
+        return next(o for o in self.studio.snapshot()['automatic_learning_outcomes'] if o['draft_id'] == draft['id'])
+
+    def test_outcome_reflects_deleted_preferences_after_restart(self):
+        draft = self.revise(self.review())
+        self.assertEqual(self.outcome(draft)['status'], 'learned')
+        self.studio.dispatch('memory_save', {'account_id': self.account['id'], 'memory_id': self.memories()[0]['id'],
+                                             'text': 'Use a formal professional tone.'})
+        self.assertEqual(self.outcome(draft)['status'], 'learned', 'Editing keeps what was learned')
+        self.studio.dispatch('memory_delete', {'account_id': self.account['id'], 'memory_id': self.memories()[0]['id']})
+        self.assertEqual(self.outcome(draft)['status'], 'preferences_removed')
+        self.assertFalse(self.outcome(draft)['retry_available'], 'A retry cannot revive a forgotten preference')
+        self.studio = EmailStudio(self.config, provider_call=self.provider)
+        self.assertEqual(self.outcome(draft)['status'], 'preferences_removed')
+
+    def test_outcome_reports_replacement_by_later_request_not_deletion(self):
+        first = self.revise(self.review())
+        second = self.revise(self.review(), 'Use a casual tone.')
+        self.assertEqual(self.outcome(first)['status'], 'superseded')
+        self.assertTrue(self.outcome(first)['retry_available'])
+        self.assertEqual(self.outcome(second)['status'], 'learned')
+
+    def test_deleting_one_recipient_leaves_other_outcomes_learned(self):
+        client = self.revise(self.review())
+        family = self.revise(self.review('family@synthetic.test'), 'Use a warm affectionate tone.')
+        target = next(m for m in self.memories() if m['recipient'] == 'client@synthetic.test')
+        self.studio.dispatch('memory_delete', {'account_id': self.account['id'], 'memory_id': target['id']})
+        self.assertEqual(self.outcome(client)['status'], 'preferences_removed')
+        self.assertEqual(self.outcome(family)['status'], 'learned')
+
+    def test_typed_manual_preference_keeps_user_origin_after_edit(self):
+        # The UI labels a card by its learned origin; a typed preference is never "from a draft".
+        saved = self.studio.dispatch('memory_save', {'account_id': self.account['id'], 'text': 'Sign off with Best.'})['memory']
+        self.assertEqual(saved['authority'], 'user')
+        self.studio.dispatch('memory_save', {'account_id': self.account['id'], 'memory_id': saved['id'],
+                                             'text': 'Sign off with Kind regards.'})
+        edited = self.studio.snapshot()['memories'][0]
+        self.assertEqual((edited['learned_authority'], edited['revision']), ('user', 2))
+
     def test_other_mailbox_cannot_edit_or_delete_automatic_memory(self):
         self.revise(self.review())
         other = self.new_account('second-writer@synthetic.test')

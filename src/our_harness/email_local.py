@@ -21,12 +21,14 @@ class LocalMail:
         family = 'classic' if kind == 'classic_outlook' else 'browser'
         with self._lock:
             if family not in self._adapters:
+                # Both hand mail attachments to the store through its incoming folder.
+                incoming = self.root / 'attachments' / 'incoming'
                 if family == 'classic':
                     from .email_classic import EmailClassic
-                    self._adapters[family] = EmailClassic(self.root / 'classic')
+                    self._adapters[family] = EmailClassic(self.root / 'classic', attachments_dir=incoming)
                 else:
                     from .email_browser import EmailBrowser
-                    self._adapters[family] = EmailBrowser(self.root / 'browser')
+                    self._adapters[family] = EmailBrowser(self.root / 'browser', attachments_dir=incoming)
             return self._adapters[family]
 
     def observe(self, connection):

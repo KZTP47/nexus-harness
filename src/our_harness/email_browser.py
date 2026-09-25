@@ -16,9 +16,11 @@ from .models import HarnessError
 class EmailBrowser:
     MODE_CONTRACT = 'browser-mode/v1'
 
-    def __init__(self, root):
+    def __init__(self, root, attachments_dir=None):
         self.root = Path(root).resolve() / 'browser-mail'
         self.root.mkdir(parents=True, exist_ok=True)
+        # The worker saves mail pictures and files here, named by checksum (None: text only).
+        self.attachments_dir = Path(attachments_dir).resolve() if attachments_dir else None
         self._process = None
         self._reader = None
         self._lock = threading.RLock()
@@ -170,7 +172,7 @@ class EmailBrowser:
             raise HarnessError('Browser mail returned an invalid mailbox identity.')
         if data.get('email') and email and data['email'].lower() != email.lower():
             raise HarnessError('The browser is signed into a different mailbox. Create a new connection for that account.')
-        if command not in ('sync', 'send', 'prepare'):
+        if command not in ('sync', 'send', 'prepare', 'attachments'):
             if result.get('state') == 'connected' and not email:
                 raise HarnessError('Browser mail could not verify the signed-in mailbox identity.')
             if email:
@@ -202,7 +204,28 @@ class EmailBrowser:
             status = self._call('status', data)
             if status.get('state') != 'connected':
                 raise HarnessError('Sign into your mail in the Nexus browser, then check the connection again.')
-            return self._call('sync', data, cursor=cursor)
+            extra = {}
+            if self.attachments_dir:
+                self.attachments_dir.mkdir(parents=True, exist_ok=True)
+                extra['attachments_dir'] = str(self.attachments_dir)
+            return self._call('sync', data, cursor=cursor, **extra)
+
+    def fetch_attachments(self, connection_id, incoming):
+        """Reopen one stored message and save its pictures and files into the incoming folder."""
+        if not self.attachments_dir:
+            raise HarnessError('This browser connection cannot read attachments.')
+        with self._lock:
+            data = self._binding(connection_id)
+            if not data.get('email'):
+                raise HarnessError('Verify this mailbox identity before reading its attachments.')
+            permitted = ('source_id', 'sender', 'subject', 'body', 'browser_reference')
+            source = {key: incoming[key] for key in permitted if key in incoming}
+            self.attachments_dir.mkdir(parents=True, exist_ok=True)
+            result = self._call('attachments', data, incoming=source, attachments_dir=str(self.attachments_dir))
+            files = result.get('attachments') if isinstance(result, dict) else None
+            if not isinstance(files, list):
+                raise HarnessError('Browser mail returned no attachment list.')
+            return files
 
     def prepare_reply(self, connection_id, incoming, body, submission_id):
         """Verify/recover mailbox readiness without opening a composer or sending."""
@@ -215,7 +238,7 @@ class EmailBrowser:
             source = {key: incoming[key] for key in permitted if key in incoming}
             return self._call('prepare', data, incoming=source, body=body, submission_id=submission_id)
 
-    def submit_reply(self, connection_id, incoming, body, submission_id):
+    def submit_reply(self, connection_id, incoming, body, submission_id, attachments=None):
         """Transport an already-approved reply; never infer approval or retry send.
 
         The studio persists the submission intent before invoking this boundary.
@@ -236,6 +259,13 @@ class EmailBrowser:
                 for key in ('source_id', 'sender', 'subject', 'body'):
                     if not isinstance(source.get(key), str):
                         raise HarnessError('The source email is missing browser reply metadata.')
+                files = []
+                for item in attachments or []:
+                    path = Path(str(item.get('path') or ''))
+                    if not path.is_file() or not item.get('name'):
+                        raise HarnessError('A file approved for this reply is missing. Remove it or attach it again.')
+                    files.append({'path': str(path), 'name': str(item['name']), 'type': str(item.get('type') or ''),
+                                  'size': path.stat().st_size, 'sha256': str(item.get('sha256') or '')})
                 data = self._binding(connection_id)
                 if not data.get('email'):
                     raise HarnessError('Verify the browser mailbox identity before sending a reply.')
@@ -244,7 +274,8 @@ class EmailBrowser:
                 # A separate status request would reject recoverable sessions.
             except HarnessError as exc:
                 return {'status': 'not_sent', 'error': str(exc)}
-            result = self._call('send', data, incoming=source, body=body, submission_id=submission_id)
+            result = self._call('send', data, incoming=source, body=body, submission_id=submission_id,
+                                **({'attachments': files} if files else {}))
             if result.get('status') not in ('sent', 'not_sent', 'unknown'):
                 return {'status': 'unknown', 'message': 'Browser send did not return a confirmed outcome. Check Sent Items before taking further action.'}
             return result

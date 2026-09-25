@@ -17,6 +17,7 @@ import urllib.request
 from typing import Any
 
 from ..config import LoadedConfig
+from ..local_probe import loopback_refuses
 from ..models import HarnessError
 from .registry import ProviderRegistry
 from . import subscription_cli
@@ -163,13 +164,15 @@ def connection_status(
 
     if kind == "ollama":
         endpoint = str(settings.get("endpoint") or "").rstrip("/")
-        try:
-            with urllib.request.urlopen(
-                f"{endpoint}/api/tags", timeout=min(timeout_seconds, 2.0)
-            ) as response:
-                ready = response.status == 200
-        except (urllib.error.URLError, TimeoutError, ssl.SSLError, ValueError):
-            ready = False
+        ready = False
+        if not loopback_refuses(endpoint):
+            try:
+                with urllib.request.urlopen(
+                    f"{endpoint}/api/tags", timeout=min(timeout_seconds, 2.0)
+                ) as response:
+                    ready = response.status == 200
+            except (urllib.error.URLError, TimeoutError, ssl.SSLError, ValueError):
+                ready = False
         return _with_route({
             "installed": ready,
             "authentication": "not-required",

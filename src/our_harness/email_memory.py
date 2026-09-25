@@ -213,6 +213,20 @@ class EmailMemory:
             return [json.loads(row[0]) for row in db.execute(
                 "SELECT record FROM preferences WHERE account=? AND status='active' ORDER BY rowid", (str(account_id),))]
 
+    def learned_sources(self, account_id):
+        """{(source_draft_id, source_revision): {statuses}} for every kept revision.
+
+        Deleted preferences leave no revisions, so a source missing here had
+        everything it taught forgotten.
+        """
+        sources = {}
+        with self._db() as db:
+            for row in db.execute('SELECT status,record FROM preferences WHERE account=?', (str(account_id),)):
+                record = json.loads(row['record'])
+                key = (record.get('source_draft_id'), record.get('source_revision'))
+                sources.setdefault(key, set()).add(row['status'])
+        return sources
+
     def preference_history(self, account_id, preference_id):
         with self._db() as db:
             return [json.loads(row[0]) for row in db.execute(

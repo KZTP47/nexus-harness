@@ -389,6 +389,7 @@ RECIPES: dict[str, CliRecipe] = {
 _connection_cache_lock = threading.Lock()
 _connection_cache: dict[tuple[str, str, int], tuple[float, dict[str, Any]]] = {}
 CONNECTION_STATUS_CACHE_SECONDS = 60.0
+_TOOL_VERSIONS_FILE = "tool-versions-seen.json"
 _tool_version_cache_lock = threading.Lock()
 _tool_version_cache: dict[tuple[object, ...], tuple[float, tuple[int, ...]]] = {}
 
@@ -1161,7 +1162,9 @@ class SubscriptionCLIProvider(Provider):
                     # Use normal Claude allow rules; managed/user denials still
                     # apply, and no skip-permissions or unsupported auto mode is
                     # required for older configured models.
-                    argv.extend(["--allowedTools", "Bash,WebFetch,WebSearch"])
+                    # Claude Code on Windows runs shell commands through its
+                    # PowerShell tool; the user's denials cover both tools.
+                    argv.extend(["--allowedTools", "Bash,PowerShell,WebFetch,WebSearch"])
                     # The user's explicit command denials become real Claude
                     # permission rules; deny rules win over the allow above.
                     rules, unenforceable = native_execution.claude_deny_rules(
@@ -1749,6 +1752,16 @@ def _the_version_of(program: str) -> tuple[int, ...]:
         age = time.monotonic() - remembered[0]
         if age < (300.0 if remembered[1] else 5.0):
             return remembered[1]
+    # An answer from an earlier run, for provably the same program (see
+    # version_memory), saves starting the CLI on every app start.
+    from . import version_memory
+
+    for key, value in version_memory.load(_TOOL_VERSIONS_FILE):
+        if key == [str(part) for part in signature] and isinstance(value, list) and value:
+            version = tuple(int(one) for one in value)
+            with _tool_version_cache_lock:
+                _tool_version_cache[signature] = (time.monotonic(), version)
+            return version
     try:
         done = _run_bounded(
             [program, "--version"], cwd=Path.cwd(), stdin_text=None,
@@ -1766,6 +1779,10 @@ def _the_version_of(program: str) -> tuple[int, ...]:
         if len(_tool_version_cache) >= 128:
             _tool_version_cache.pop(next(iter(_tool_version_cache)), None)
         _tool_version_cache[signature] = (time.monotonic(), version)
+    if version and len(signature) == 5:
+        version_memory.remember(
+            _TOOL_VERSIONS_FILE, [str(part) for part in signature], str(signature[0]), list(version),
+        )
     return version
 
 

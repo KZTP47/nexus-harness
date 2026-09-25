@@ -48,6 +48,27 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
+## pypdf and Pillow (Mail attachments)
+
+The private Windows runtime includes `pypdf` 6.19.0 and `Pillow` 12.3.0, used
+only by the Mail tab to read attached pictures and documents
+(src/our_harness/email_attachments.py). pypdf extracts the text of attached
+PDFs; Pillow shrinks large photos and converts BMP/TIFF pictures so the AI
+provider can read them. Both are installed unmodified from their published
+wheels, pinned in requirements-runtime.lock.
+
+- pypdf, Copyright (c) 2006-2008 Mathieu Fenniak and contributors, BSD 3-Clause
+  License. Source and license: <https://github.com/py-pdf/pypdf> and
+  <https://github.com/py-pdf/pypdf/blob/6.19.0/LICENSE>.
+- Pillow, Copyright (c) 1997-2011 Secret Labs AB, (c) 1995-2011 Fredrik Lundh
+  and contributors, (c) 2010 Jeffrey A. Clark and contributors, under the
+  MIT-CMU (HPND) license. Source and license: <https://github.com/python-pillow/Pillow>
+  and <https://github.com/python-pillow/Pillow/blob/12.3.0/LICENSE>. The wheel
+  bundles its image codec libraries with their own notices in the package.
+
+Each package's complete license file ships inside its `.dist-info` folder in
+the runtime's site-packages.
+
 ## Bundled Node.js and Playwright verification runtime
 
 The Windows installer includes Node.js 22.18.0, Playwright 1.62.1,

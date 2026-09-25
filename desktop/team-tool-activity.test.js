@@ -125,7 +125,10 @@ test("public updates and recorded tools render inline with safe expandable outpu
     await page.evaluate(()=>renderReasoning());
     assert.equal(await page.locator('#compact .chat-tool-body').isVisible(), false);
     assert.equal(await page.locator('#large .chat-tool-body').isVisible(), false);
-    assert.match(await page.locator('#compact summary').innerText(), /Reasoning summary/);
+    // The collapsed row names the thinking and previews it as plain text.
+    assert.match(await page.locator('#compact summary').innerText(), /Thinking/);
+    assert.match(await page.locator('#compact .chat-reasoning-preview').innerText(), /inspect the existing API/);
+    assert.equal(await page.locator('#compact img').count(), 0);
     await page.locator('#compact summary').click();
     await page.waitForFunction(() => expandedChatToolActivity.has('summary-one'));
     assert.match(await page.locator('#compact .chat-tool-body').innerText(), /visible only to you/);

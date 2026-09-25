@@ -318,7 +318,7 @@ class RunningTests(unittest.TestCase):
         args = json.loads(answer.text)
         self.assertEqual(args[args.index("--tools") + 1], "default")
         self.assertEqual(args[args.index("--permission-mode") + 1], "acceptEdits")
-        self.assertEqual(args[args.index("--allowedTools") + 1], "Bash,WebFetch,WebSearch")
+        self.assertEqual(args[args.index("--allowedTools") + 1], "Bash,PowerShell,WebFetch,WebSearch")
         self.assertFalse(any("skip-permissions" in word or "bypass" in word for word in args))
         self.assertTrue(candidate.is_dir())
 

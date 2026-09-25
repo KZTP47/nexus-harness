@@ -150,6 +150,11 @@ See [LONG_HORIZON_GOALS.md](docs/LONG_HORIZON_GOALS.md) for the goal engine,
 [AGENT_BOARD.md](docs/AGENT_BOARD.md) for the board model, and
 [TALK_TO_THEM.md](docs/TALK_TO_THEM.md) for conversations and collaboration.
 
+The **Live team** tab is a newer way to run several agents at once. Each agent
+keeps one live session for the whole job, the agents message each other and
+share a task board directly, and you see their thinking, commands and writing
+as they happen. See [LIVE_TEAM.md](docs/LIVE_TEAM.md).
+
 ### visual test automation
 
 The visual automation workspace turns a runbook into an executable graph. Drag
@@ -1149,6 +1154,7 @@ Cloning a repository never gives that repository the right to run code.
 | [LOOK_IT_UP.md](docs/LOOK_IT_UP.md) | Where is it, what uses it, what is it - in your own code |
 | [WHAT_IT_KNOWS.md](docs/WHAT_IT_KNOWS.md) | The notes the harness keeps about you and your project |
 | [YOUR_TEAM.md](docs/YOUR_TEAM.md) | The assistants on your machine, and how to make them work together |
+| [LIVE_TEAM.md](docs/LIVE_TEAM.md) | Several agents working at once in live sessions, talking to each other |
 | [WHAT_WE_COULD_ADD.md](docs/WHAT_WE_COULD_ADD.md) | What two other harnesses have that this one does not, and what each is worth |
 | [CONFIGURATION.md](docs/CONFIGURATION.md) | Every setting and where it may come from |
 | [SECURITY.md](docs/SECURITY.md) | What is fenced off, and how |

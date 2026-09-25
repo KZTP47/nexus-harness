@@ -8,7 +8,7 @@ import time
 
 from . import goal_dialogue
 from .models import HarnessError
-from .provider_activity import FINGERPRINT, TEXT_LIMIT, SUMMARY_CONTRACT
+from .provider_activity import FINGERPRINT, TEXT_LIMIT, SUMMARY_CONTRACTS
 
 
 def recorder(store, goal_id: str, task: dict):
@@ -26,7 +26,7 @@ def recorder(store, goal_id: str, task: dict):
                 or activity.get("kind") not in {"message", "tool", "notice", "reasoning_summary"} \
                 or not isinstance(activity.get("id"), str) or not 0 < len(activity["id"]) <= 200:
             raise HarnessError("Unsupported public provider activity contract")
-        if activity["kind"] == "reasoning_summary" and activity.get("summary_contract") != SUMMARY_CONTRACT:
+        if activity["kind"] == "reasoning_summary" and activity.get("summary_contract") not in SUMMARY_CONTRACTS:
             raise HarnessError("Unsupported public reasoning summary")
         if activity["kind"] == "tool" and (activity.get("status") not in {"requested", "finished", "failed"}
                 or not isinstance(activity.get("name"), str)):
